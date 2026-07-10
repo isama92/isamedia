@@ -123,26 +123,42 @@ impl JellyfinApp {
         }
     }
 
+    /// Credentials from the config file only; secrets stay empty here and are
+    /// filled from the keyring inside the connect task (keyring access is
+    /// blocking and must stay off the render thread).
     fn credentials(&self) -> Credentials {
         let config = self.config.lock().unwrap();
         let jf = &config.jellyfin;
         Credentials {
             host: jf.host.clone(),
             username: jf.username.clone(),
-            password: jf.password.clone(),
+            password: String::new(),
             device: jf.device.clone(),
             device_id: jf.device_id.clone(),
             version: VERSION.to_string(),
-            token: jf.token.clone(),
+            token: String::new(),
             user_id: jf.user_id.clone(),
         }
     }
 
-    fn spawn_connect(&mut self, creds: Credentials) {
+    fn spawn_connect(&mut self, mut creds: Credentials, use_stored_secrets: bool) {
         self.auth_gen += 1;
         let auth_gen = self.auth_gen;
         let sender = self.sender.clone();
         tokio::spawn(async move {
+            if use_stored_secrets {
+                let secrets = tokio::task::spawn_blocking(|| {
+                    (
+                        crate::secrets::get(crate::secrets::JELLYFIN_TOKEN),
+                        crate::secrets::get(crate::secrets::JELLYFIN_PASSWORD),
+                    )
+                })
+                .await;
+                if let Ok((token, password)) = secrets {
+                    creds.token = token.unwrap_or_default();
+                    creds.password = password.unwrap_or_default();
+                }
+            }
             let result = Client::connect(creds).await;
             sender.send(Msg::AuthDone { auth_gen, result });
         });
@@ -152,21 +168,47 @@ impl JellyfinApp {
         LoginForm::from_config(&self.config.lock().unwrap().jellyfin)
     }
 
-    /// Persist whatever the successful client used back into the config, so
-    /// tokens survive restarts and form input becomes the stored credentials.
+    /// Persist a successful login: non-secrets into the config file, the
+    /// token (and, for form logins, the password) into the OS keyring.
     fn persist_auth(&self, client: &Client, from_form: Option<(&str, &str, &str)>) {
-        let mut config = self.config.lock().unwrap();
-        let jf = &mut config.jellyfin;
-        if let Some((host, username, password)) = from_form {
-            jf.host = host.to_string();
-            jf.username = username.to_string();
-            jf.password = password.to_string();
+        {
+            let mut config = self.config.lock().unwrap();
+            let jf = &mut config.jellyfin;
+            if let Some((host, username, _)) = from_form {
+                jf.host = host.to_string();
+                jf.username = username.to_string();
+            }
+            jf.user_id = client.user_id.clone();
+            if let Err(err) = config.save(&self.config_path) {
+                tracing::warn!(%err, "failed to persist config");
+            }
         }
-        jf.token = client.token.clone();
-        jf.user_id = client.user_id.clone();
-        if let Err(err) = config.save(&self.config_path) {
-            tracing::warn!(%err, "failed to persist credentials");
-        }
+
+        let token = client.token.clone();
+        let form_password = from_form.map(|(_, _, password)| password.to_string());
+        let sender = self.sender.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Err(err) = crate::secrets::set(crate::secrets::JELLYFIN_TOKEN, &token) {
+                sender.send(Msg::KeyringError(format!(
+                    "failed to store token in system keyring (you will have to log in again next start): {err}"
+                )));
+                return;
+            }
+            let Some(password) = form_password else {
+                return;
+            };
+            // An empty password field means "don't keep one around".
+            let result = if password.is_empty() {
+                crate::secrets::delete(crate::secrets::JELLYFIN_PASSWORD)
+            } else {
+                crate::secrets::set(crate::secrets::JELLYFIN_PASSWORD, &password)
+            };
+            if let Err(err) = result {
+                sender.send(Msg::KeyringError(format!(
+                    "failed to store password in system keyring: {err}"
+                )));
+            }
+        });
     }
 
     /// Drop the stored token and return to the login form; used when the
@@ -174,12 +216,16 @@ impl JellyfinApp {
     fn on_session_expired(&mut self) {
         {
             let mut config = self.config.lock().unwrap();
-            config.jellyfin.token.clear();
             config.jellyfin.user_id.clear();
             if let Err(err) = config.save(&self.config_path) {
-                tracing::warn!(%err, "failed to persist cleared token");
+                tracing::warn!(%err, "failed to persist cleared session");
             }
         }
+        tokio::task::spawn_blocking(|| {
+            if let Err(err) = crate::secrets::delete(crate::secrets::JELLYFIN_TOKEN) {
+                tracing::warn!(%err, "failed to delete expired token from keyring");
+            }
+        });
         self.auth_gen += 1;
         let mut form = self.login_form();
         form.error = Some("session expired, please log in again".into());
@@ -233,7 +279,7 @@ impl MediaApp for JellyfinApp {
             let creds = self.credentials();
             if !creds.host.is_empty() && !creds.username.is_empty() {
                 self.screen = Screen::Connecting;
-                self.spawn_connect(creds);
+                self.spawn_connect(creds, true);
             } else {
                 self.screen = Screen::Login(self.login_form());
             }
@@ -295,10 +341,9 @@ impl MediaApp for JellyfinApp {
                     creds.host = host;
                     creds.username = username;
                     creds.password = password;
-                    // Force a fresh username/password auth for form submissions.
-                    creds.token = String::new();
+                    // Fresh username/password auth: no stored token or user id.
                     creds.user_id = String::new();
-                    self.spawn_connect(creds);
+                    self.spawn_connect(creds, false);
                 }
                 None
             }
@@ -357,6 +402,12 @@ impl MediaApp for JellyfinApp {
                     return; // event from a player that was replaced
                 }
                 self.on_player_event(event);
+            }
+            Msg::KeyringError(message) => {
+                tracing::warn!(message, "keyring problem");
+                if let Screen::Browse(browse) = &mut self.screen {
+                    browse.error = Some(message);
+                }
             }
         }
     }

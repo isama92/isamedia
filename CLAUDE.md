@@ -9,8 +9,10 @@ doesn't apply to a change, but don't silently break the patterns.
 ## Stack
 
 - `ratatui` for rendering, `tokio` (multi-thread runtime) for async work.
-- `reqwest` (rustls, no native-tls) for HTTP; `serde`/`serde_json` for API
-  payloads, `toml`/`serde_yaml` for config.
+- `reqwest` for HTTP (rustls on unix, native-tls/schannel on Windows);
+  `serde`/`serde_json` for API payloads, `toml` for config.
+- `keyring` for secrets (Secret Service on Linux, Credential Manager on
+  Windows); see the Security rules.
 - `thiserror` for library-style error enums, `anyhow` only at outer
   boundaries (`main.rs`, `config.rs`, CLI).
 - `tracing` (+ `tracing-subscriber`, `tracing-appender`) for all logging.
@@ -134,11 +136,13 @@ is I/O-bound on network calls, not compute-bound).
 
 ## Security
 
-- Credentials live only in the config file at `Config::default_path()`,
-  written with `0600` permissions. The file holds host, username, password,
-  and token in plaintext (jfsh parity), so `0600` is the only protection:
-  don't widen it, and don't copy secrets into env vars, cache files, or temp
-  files.
+- Secrets (session token, optional password) live only in the OS keyring via
+  `src/secrets.rs` (service `isamedia`) — never in the config file, env vars,
+  cache files, or temp files. The config file at `Config::default_path()`
+  holds only non-secrets (host, username, device_id, user_id) and is still
+  written `0600`; don't widen that, and don't add secret fields back to it.
+- Keyring calls are blocking (a D-Bus round trip on Linux): always run them
+  through `tokio::task::spawn_blocking`, never on the render thread.
 - Never log tokens, passwords, or the `Authorization` header, including a
   credential embedded in a URL (a Jellyfin `api_key` on a stream URL would
   otherwise land in the mpv IPC debug log). Check `tracing` calls near auth,

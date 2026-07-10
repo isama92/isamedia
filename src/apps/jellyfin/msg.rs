@@ -22,4 +22,6 @@ pub enum Msg {
         player_gen: u64,
         event: crate::player::PlayerEvent,
     },
+    /// A background keyring write/delete failed; surfaced on the error line.
+    KeyringError(String),
 }
