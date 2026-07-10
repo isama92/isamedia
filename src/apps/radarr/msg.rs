@@ -17,11 +17,12 @@ pub enum Msg {
         fetch_gen: u64,
         result: Result<Vec<Movie>, Error>,
     },
-    /// Results of an add-flow lookup (movie/lookup); shares `fetch_gen` with
-    /// the list fetch since only one is ever in flight at a time.
+    /// Results of an add-flow lookup (movie/lookup), as raw JSON so the whole
+    /// object can be forwarded to the add. Its own generation, so a lookup
+    /// abandoned by leaving the add screen can't surface on the list.
     LookupLoaded {
-        fetch_gen: u64,
-        result: Result<Vec<Movie>, Error>,
+        add_lookup_gen: u64,
+        result: Result<Vec<serde_json::Value>, Error>,
     },
     /// Root folders + quality profiles for the add wizard, fetched on its
     /// own generation so a lookup can't invalidate it.
@@ -30,10 +31,12 @@ pub enum Msg {
         result: Result<(Vec<RootFolder>, Vec<QualityProfile>), Error>,
     },
     /// A movie was added; on success the created movie (with its new id) is
-    /// what the detail opens on. Boxed to keep the enum's variants a similar
-    /// size (a bare `Movie` dwarfs the others).
+    /// what the detail opens on. Its own generation, bumped when the user
+    /// leaves the add screen, so a committed add never yanks them back. Boxed
+    /// to keep the enum's variants a similar size (a bare `Movie` dwarfs the
+    /// others).
     MovieAdded {
-        fetch_gen: u64,
+        add_gen: u64,
         result: Result<Box<Movie>, Error>,
     },
     /// Queue polls run on their own generation: a background 10s poll must

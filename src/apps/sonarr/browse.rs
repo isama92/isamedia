@@ -146,12 +146,23 @@ pub struct Browse {
     add_search: TextInput,
     add_search_focused: bool,
     add_results: Vec<Series>,
+    /// The raw lookup JSON behind `add_results`, index-aligned; the add
+    /// forwards the whole object (POST /series needs titleSlug/images/seasons
+    /// the typed model drops).
+    add_results_raw: Vec<serde_json::Value>,
     add_cursor: usize,
     root_folders: Vec<RootFolder>,
     quality_profiles: Vec<QualityProfile>,
-    /// Generation of the latest add-prerequisites fetch, independent of list
-    /// fetches so a lookup can never invalidate it.
+    /// Generations for the three add-flow async paths, each independent so
+    /// one can't invalidate another: the lookup (bumped when the user leaves
+    /// the screen, so an abandoned lookup can't surface on the list), the
+    /// prerequisites, and the add POST (bumped on leave, so a committed add
+    /// never yanks the user back).
+    add_lookup_gen: u64,
     add_prereq_gen: u64,
+    add_gen: u64,
+    /// An add POST is in flight; blocks a second submit until it lands.
+    add_submitting: bool,
     add_flow: Option<AddFlow>,
 
     /// Full-screen scrollable overview on the show level.
@@ -208,10 +219,14 @@ impl Browse {
             add_search: TextInput::default(),
             add_search_focused: false,
             add_results: Vec::new(),
+            add_results_raw: Vec::new(),
             add_cursor: 0,
             root_folders: Vec::new(),
             quality_profiles: Vec::new(),
+            add_lookup_gen: 0,
             add_prereq_gen: 0,
+            add_gen: 0,
+            add_submitting: false,
             add_flow: None,
             overview_fullscreen: false,
             overview_scroll: 0,
@@ -351,6 +366,12 @@ impl Browse {
     ) -> bool {
         if fetch_gen != self.fetch_gen {
             return false; // stale response from a superseded fetch
+        }
+        // A list refresh landing while the user is on the add screen must not
+        // touch its loading/error/list state (the lookup owns those); still
+        // honour a 401 so a revoked key is caught immediately.
+        if matches!(self.level, Level::Add) {
+            return matches!(result, Err(crate::sonarr::Error::Unauthorized));
         }
         self.loading = false;
         match result {
@@ -506,21 +527,32 @@ impl Browse {
         false
     }
 
-    /// Add-flow lookup results. Same contract as `on_series_loaded`; shares
-    /// `fetch_gen`, so a superseded lookup is dropped.
+    /// Add-flow lookup results. Checked against `add_lookup_gen`, so a lookup
+    /// the user abandoned by leaving the add screen is dropped instead of
+    /// surfacing an error on the list. Keeps the raw JSON index-aligned with
+    /// the typed list the rows render from.
     #[must_use]
     pub fn on_lookup_loaded(
         &mut self,
-        fetch_gen: u64,
-        result: Result<Vec<Series>, crate::sonarr::Error>,
+        add_lookup_gen: u64,
+        result: Result<Vec<serde_json::Value>, crate::sonarr::Error>,
     ) -> bool {
-        if fetch_gen != self.fetch_gen {
-            return false; // stale response from a superseded lookup
+        if add_lookup_gen != self.add_lookup_gen {
+            return false; // stale response from a superseded/abandoned lookup
         }
         self.loading = false;
         match result {
-            Ok(list) => {
-                self.add_results = list;
+            Ok(values) => {
+                self.add_results.clear();
+                self.add_results_raw.clear();
+                // Series deserializes any object (all fields default), so
+                // typed and raw stay aligned.
+                for value in values {
+                    if let Ok(series) = serde_json::from_value::<Series>(value.clone()) {
+                        self.add_results.push(series);
+                        self.add_results_raw.push(value);
+                    }
+                }
                 self.add_cursor = 0;
             }
             Err(crate::sonarr::Error::Unauthorized) => return true,
@@ -552,18 +584,21 @@ impl Browse {
         false
     }
 
-    /// The add finished. Same contract as `on_series_loaded`; on success we
-    /// jump straight to the created series' show page and refetch the library
-    /// so it is present when the user pops back.
+    /// The add finished. Checked against `add_gen`, which is bumped when the
+    /// user leaves the add screen, so a committed add that lands after they
+    /// moved on is dropped rather than yanking them to the new show. On
+    /// success we jump to the created series' show page and refetch the
+    /// library so it is present when the user pops back.
     #[must_use]
     pub fn on_series_added(
         &mut self,
-        fetch_gen: u64,
+        add_gen: u64,
         result: Result<Box<Series>, crate::sonarr::Error>,
     ) -> bool {
-        if fetch_gen != self.fetch_gen {
-            return false; // superseded: the user moved on meanwhile
+        if add_gen != self.add_gen {
+            return false; // superseded: the user left the add screen meanwhile
         }
+        self.add_submitting = false;
         if matches!(result, Err(crate::sonarr::Error::Unauthorized)) {
             return true;
         }
@@ -574,6 +609,7 @@ impl Browse {
                 self.overview_scroll = 0;
                 self.level = Level::Show { series: *series };
                 self.add_results.clear();
+                self.add_results_raw.clear();
                 self.add_search.clear();
                 self.add_search_focused = false;
                 self.fetch_series();
@@ -581,6 +617,8 @@ impl Browse {
                 // Set AFTER the refetch, which clears the notice row.
                 self.notice = Some("series added".into());
             }
+            // The add failed (e.g. already in the library); stay on the
+            // results so the user can pick something else.
             Err(err) => self.error = Some(err.to_string()),
         }
         false
@@ -727,9 +765,17 @@ impl Browse {
             }
             Level::Add => {
                 self.add_results.clear();
+                self.add_results_raw.clear();
                 self.add_search.clear();
                 self.add_search_focused = false;
                 self.add_flow = None;
+                self.add_submitting = false;
+                // Supersede any in-flight lookup and add so a late result
+                // can't surface an error on, or navigate away from, the list.
+                self.add_lookup_gen = self.gen_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                self.add_gen = self.gen_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                self.loading = false;
+                self.error = None;
                 true
             }
         }
@@ -820,50 +866,66 @@ impl Browse {
         self.add_search_focused = true;
         self.add_search.focused = true;
         self.add_results.clear();
+        self.add_results_raw.clear();
         self.add_cursor = 0;
         self.add_flow = None;
+        self.add_submitting = false;
+        self.loading = false;
         self.error = None;
         self.notice = None;
-        self.fetch_add_options();
+        // Root folders and quality profiles rarely change; only fetch when we
+        // don't already have them (`r` forces a refetch).
+        if self.root_folders.is_empty() || self.quality_profiles.is_empty() {
+            self.fetch_add_options();
+        }
     }
 
     /// Fetch the root folders and quality profiles the wizard picks from, on
-    /// their own generation so a lookup can't invalidate them.
+    /// their own generation so a lookup can't invalidate them. The two GETs
+    /// are independent, so they run concurrently.
     fn fetch_add_options(&mut self) {
         self.add_prereq_gen = self.gen_counter.fetch_add(1, Ordering::Relaxed) + 1;
         let prereq_gen = self.add_prereq_gen;
         let client = self.client.clone();
         let sender = self.sender.clone();
         tokio::spawn(async move {
-            let result: Result<_, crate::sonarr::Error> = async {
-                let folders = client.get_root_folders().await?;
-                let profiles = client.get_quality_profiles().await?;
-                Ok((folders, profiles))
-            }
-            .await;
+            let result = tokio::try_join!(client.get_root_folders(), client.get_quality_profiles());
             sender.send(Msg::AddOptionsLoaded { prereq_gen, result });
         });
     }
 
     /// Run a lookup for the add screen; an empty term just clears the list.
+    /// Uses `add_lookup_gen`, independent of list fetches, so leaving the
+    /// screen can cancel it without touching a list fetch in flight.
     fn fetch_lookup(&mut self, term: String) {
         if term.trim().is_empty() {
             self.add_results.clear();
+            self.add_results_raw.clear();
             self.add_cursor = 0;
             return;
         }
-        let fetch_gen = self.begin_fetch();
+        self.loading = true;
+        self.error = None;
+        self.add_lookup_gen = self.gen_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        let add_lookup_gen = self.add_lookup_gen;
         let client = self.client.clone();
         let sender = self.sender.clone();
         tokio::spawn(async move {
             let result = client.lookup_series(&term).await;
-            sender.send(Msg::LookupLoaded { fetch_gen, result });
+            sender.send(Msg::LookupLoaded {
+                add_lookup_gen,
+                result,
+            });
         });
     }
 
     /// Open the add wizard for the highlighted result; refuses if the
     /// prerequisites haven't loaded (or none are configured).
     fn start_add_flow(&mut self) {
+        if self.add_submitting {
+            self.notice = Some("an add is already in progress".into());
+            return;
+        }
         if self.add_cursor >= self.add_results.len() {
             return;
         }
@@ -883,32 +945,27 @@ impl Browse {
         });
     }
 
-    /// Options for the wizard's current step; the count clamps the cursor and
-    /// the labels are what `draw_menu` renders.
-    fn add_step_menu(&self) -> (String, Vec<String>) {
+    /// Title and option labels for the wizard's current step; the labels
+    /// borrow from the prerequisite lists (rebuilt cheaply per draw, no
+    /// allocation) and their count clamps the cursor.
+    fn add_step_menu(&self) -> (&'static str, Vec<&str>) {
         let Some(flow) = &self.add_flow else {
-            return (String::new(), Vec::new());
+            return ("", Vec::new());
         };
         match flow.step {
             AddStep::RootFolder => (
-                "Root folder".to_string(),
-                self.root_folders.iter().map(|f| f.path.clone()).collect(),
+                "Root folder",
+                self.root_folders.iter().map(|f| f.path.as_str()).collect(),
             ),
             AddStep::QualityProfile => (
-                "Quality profile".to_string(),
+                "Quality profile",
                 self.quality_profiles
                     .iter()
-                    .map(|p| p.name.clone())
+                    .map(|p| p.name.as_str())
                     .collect(),
             ),
-            AddStep::Monitored => (
-                "Monitor this show?".to_string(),
-                vec!["Yes".to_string(), "No".to_string()],
-            ),
-            AddStep::Download => (
-                "Search & download now?".to_string(),
-                vec!["Yes".to_string(), "No".to_string()],
-            ),
+            AddStep::Monitored => ("Monitor this show?", vec!["Yes", "No"]),
+            AddStep::Download => ("Search & download now?", vec!["Yes", "No"]),
         }
     }
 
@@ -965,34 +1022,54 @@ impl Browse {
         }
     }
 
-    /// Build the add payload from the finished wizard and POST it.
+    /// Forward the finished wizard's lookup object, augmented with the user's
+    /// choices, to POST /series. The whole object is forwarded (not a subset)
+    /// because Sonarr requires fields the typed model drops (titleSlug,
+    /// images, the seasons array).
     fn commit_add(&mut self) {
         let Some(flow) = self.add_flow.take() else {
             return;
         };
-        let Some(series) = self.add_results.get(flow.result).cloned() else {
+        // Both required choices must have resolved; if a prerequisite list
+        // was empty under the cursor the payload would carry nulls.
+        let (Some(root_folder), Some(quality_profile_id)) =
+            (flow.root_folder.as_ref(), flow.quality_profile_id)
+        else {
+            self.notice = Some("add cancelled: no root folder or quality profile".into());
+            return;
+        };
+        let Some(mut body) = self.add_results_raw.get(flow.result).cloned() else {
             return;
         };
         let monitor = if flow.monitored { "all" } else { "none" };
-        let body = serde_json::json!({
-            "tvdbId": series.tvdb_id,
-            "title": series.title,
-            "qualityProfileId": flow.quality_profile_id,
-            "rootFolderPath": flow.root_folder,
-            "monitored": flow.monitored,
-            "seasonFolder": true,
-            "seriesType": "standard",
-            "addOptions": {
-                "searchForMissingEpisodes": flow.search,
-                "monitor": monitor,
-            },
-        });
-        let fetch_gen = self.begin_fetch();
+        if let Some(object) = body.as_object_mut() {
+            object.insert(
+                "qualityProfileId".into(),
+                serde_json::json!(quality_profile_id),
+            );
+            object.insert("rootFolderPath".into(), serde_json::json!(root_folder));
+            object.insert("monitored".into(), serde_json::json!(flow.monitored));
+            object.insert("seasonFolder".into(), serde_json::json!(true));
+            object.insert("seriesType".into(), serde_json::json!("standard"));
+            object.insert(
+                "addOptions".into(),
+                serde_json::json!({
+                    "searchForMissingEpisodes": flow.search,
+                    "monitor": monitor,
+                }),
+            );
+        }
+        self.add_submitting = true;
+        self.loading = true;
+        self.error = None;
+        self.notice = Some("adding...".into());
+        self.add_gen = self.gen_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        let add_gen = self.add_gen;
         let client = self.client.clone();
         let sender = self.sender.clone();
         tokio::spawn(async move {
             let result = client.add_series(&body).await.map(Box::new);
-            sender.send(Msg::SeriesAdded { fetch_gen, result });
+            sender.send(Msg::SeriesAdded { add_gen, result });
         });
     }
 
@@ -1347,10 +1424,9 @@ impl Browse {
             prompt::draw_confirm(frame, area, question);
         }
         if self.add_flow.is_some() {
-            let (title, options) = self.add_step_menu();
-            let labels: Vec<&str> = options.iter().map(String::as_str).collect();
             let cursor = self.add_flow.as_ref().map(|flow| flow.cursor).unwrap_or(0);
-            prompt::draw_menu(frame, area, &title, &labels, cursor);
+            let (title, labels) = self.add_step_menu();
+            prompt::draw_menu(frame, area, title, &labels, cursor);
         }
     }
 
