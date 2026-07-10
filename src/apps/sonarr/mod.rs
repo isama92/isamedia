@@ -95,7 +95,7 @@ impl SonarrApp {
     fn persist_auth(&self, client: &Client, form_key: Option<String>) {
         {
             let mut config = self.config.lock().unwrap();
-            config.sonarr.host = client.host.clone();
+            config.sonarr.host = client.host().to_string();
             if let Err(err) = config.save(&self.config_path) {
                 tracing::warn!(%err, "failed to persist config");
             }
@@ -135,7 +135,7 @@ impl SonarrApp {
                     _ => None,
                 };
                 self.persist_auth(&client, form_key);
-                let plain_http = crate::net::is_plain_http(&client.host);
+                let plain_http = crate::net::is_plain_http(client.host());
                 let mut browse = Browse::new(client, self.sender.clone(), self.browse_gen.clone());
                 if plain_http {
                     // The setup form warns about this too, but auto-connect
