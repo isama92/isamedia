@@ -162,6 +162,17 @@ impl Client {
         Ok(())
     }
 
+    /// Toggle a movie's monitored flag via the bulk editor endpoint, which
+    /// takes only the ids and the changed field: the `Movie` model is
+    /// deserialize-only, so we can't PUT the whole resource back.
+    pub async fn set_movie_monitored(&self, movie_id: i64, monitored: bool) -> Result<(), Error> {
+        let body = serde_json::json!({ "movieIds": [movie_id], "monitored": monitored });
+        self.transport
+            .send(Method::PUT, "/api/v3/movie/editor", &[], Some(&body), None)
+            .await?;
+        Ok(())
+    }
+
     /// Past grab/import/delete events of one movie, for the "grabbed before"
     /// marker in interactive search results. Unlike Sonarr's paginated
     /// /history, Radarr's /history/movie returns a plain array.

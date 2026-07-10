@@ -18,6 +18,17 @@ pub const SYMBOL_LEGEND: [(&str, &str); 3] = [
     (GLYPH_GRABBED, "grabbed before"),
 ];
 
+/// The word a row/header shows for an item's monitored flag. Kept here as the
+/// single source so Radarr movies, Sonarr series/seasons/episodes all read the
+/// same, matching the existing Sonarr season label.
+pub fn monitored_label(monitored: bool) -> &'static str {
+    if monitored {
+        "monitored"
+    } else {
+        "unmonitored"
+    }
+}
+
 /// Percent done, clamped; a queue item reporting no size counts as 0%.
 pub fn queue_progress(item: &QueueItem) -> u8 {
     if item.size <= 0.0 {
@@ -213,6 +224,12 @@ mod tests {
                 name: Some(name.into()),
             },
         })
+    }
+
+    #[test]
+    fn monitored_label_words() {
+        assert_eq!(monitored_label(true), "monitored");
+        assert_eq!(monitored_label(false), "unmonitored");
     }
 
     #[test]
