@@ -9,7 +9,7 @@ pub mod models;
 use reqwest::Method;
 
 pub use crate::arr::Error;
-pub use models::{Episode, HistoryRecord, QueueItem, Release, Series};
+pub use models::{Episode, HistoryRecord, QualityProfile, QueueItem, Release, RootFolder, Series};
 
 use crate::arr::models::Page;
 
@@ -59,6 +59,36 @@ impl Client {
         self.transport
             .get_queue(&[("includeEpisode", "true")])
             .await
+    }
+
+    /// Look up series to add, by free text or by `tvdb:<id>`; the server
+    /// parses the prefix itself, so id searches need no special handling.
+    /// Hits are shaped like library series but have id 0.
+    pub async fn lookup_series(&self, term: &str) -> Result<Vec<Series>, Error> {
+        self.transport
+            .request(
+                Method::GET,
+                "/api/v3/series/lookup",
+                &[("term", term)],
+                None,
+            )
+            .await
+    }
+
+    /// Add a series from a built payload and return the created series (with
+    /// its new id), so the UI can open its detail straight away.
+    pub async fn add_series(&self, body: &serde_json::Value) -> Result<Series, Error> {
+        self.transport
+            .send_json(Method::POST, "/api/v3/series", &[], Some(body), None)
+            .await
+    }
+
+    pub async fn get_root_folders(&self) -> Result<Vec<RootFolder>, Error> {
+        self.transport.get_root_folders().await
+    }
+
+    pub async fn get_quality_profiles(&self) -> Result<Vec<QualityProfile>, Error> {
+        self.transport.get_quality_profiles().await
     }
 
     pub async fn search_releases(&self, episode_id: i64) -> Result<Vec<Release>, Error> {

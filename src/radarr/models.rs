@@ -6,13 +6,17 @@
 use serde::Deserialize;
 
 pub use crate::arr::models::{
-    HistoryRecord, Language, MediaInfo, QualityWrapper, QueueItem, Release,
+    HistoryRecord, Language, MediaInfo, QualityProfile, QualityWrapper, QueueItem, Release,
+    RootFolder,
 };
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Movie {
     pub id: i64,
+    /// TMDb id: the identity the add endpoint keys on. Populated on lookup
+    /// results (whose `id` is 0 until added) and on library movies alike.
+    pub tmdb_id: Option<i64>,
     pub title: Option<String>,
     pub sort_title: Option<String>,
     pub overview: Option<String>,
@@ -169,5 +173,25 @@ mod tests {
         let ratings = movie.ratings.as_ref().unwrap();
         assert!(ratings.tmdb.is_none());
         assert!((ratings.imdb.as_ref().unwrap().value - 6.1).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn deserializes_lookup_result_without_id() {
+        // A movie/lookup hit for something not yet in the library: id 0,
+        // but the tmdbId the add endpoint needs is present.
+        let raw = r#"{
+            "title": "Dune: Part Two",
+            "year": 2024,
+            "tmdbId": 693134,
+            "overview": "Paul Atreides unites with the Fremen.",
+            "runtime": 167,
+            "hasFile": false,
+            "movieFileId": 0,
+            "ratings": { "tmdb": { "value": 8.2 } }
+        }"#;
+        let movie: Movie = serde_json::from_str(raw).unwrap();
+        assert_eq!(movie.id, 0);
+        assert_eq!(movie.tmdb_id, Some(693134));
+        assert_eq!(movie.year, Some(2024));
     }
 }

@@ -90,6 +90,33 @@ pub fn episode_code(season_number: i32, episode_number: i32) -> String {
     format!("S{season_number:02}E{episode_number:02}")
 }
 
+/// "2023 • 8.8 • 2 seasons" — the meta line under add-search result rows;
+/// pieces the server doesn't know are skipped and specials (season 0) are
+/// not counted. The Radarr counterpart is `radarr::display::movie_meta`.
+pub fn series_meta(series: &Series) -> String {
+    let mut parts = Vec::new();
+    if let Some(year) = series.year {
+        parts.push(year.to_string());
+    }
+    if let Some(ratings) = &series.ratings
+        && ratings.value > 0.0
+    {
+        parts.push(format!("{:.1}", ratings.value));
+    }
+    let seasons = series
+        .seasons
+        .iter()
+        .filter(|season| season.season_number > 0)
+        .count();
+    if seasons > 0 {
+        parts.push(format!(
+            "{seasons} season{}",
+            if seasons == 1 { "" } else { "s" }
+        ));
+    }
+    parts.join(" • ")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SeriesSort {
     TitleAz,
@@ -234,6 +261,42 @@ mod tests {
         };
         assert_eq!(season_label(&season), "Season 1      10/12 • monitored");
         assert_eq!(episode_code(1, 5), "S01E05");
+    }
+
+    #[test]
+    fn series_meta_line() {
+        use crate::sonarr::models::Ratings;
+
+        let season = |number| Season {
+            season_number: number,
+            ..Season::default()
+        };
+        let full = Series {
+            year: Some(2023),
+            ratings: Some(Ratings { value: 8.8 }),
+            // Season 0 (specials) is not counted.
+            seasons: vec![season(0), season(1), season(2)],
+            ..Series::default()
+        };
+        assert_eq!(series_meta(&full), "2023 • 8.8 • 2 seasons");
+
+        let single = Series {
+            year: Some(2020),
+            seasons: vec![season(1)],
+            ..Series::default()
+        };
+        assert_eq!(series_meta(&single), "2020 • 1 season");
+
+        // Zero rating is skipped, like the Radarr helper.
+        let unrated = Series {
+            year: Some(2019),
+            ratings: Some(Ratings { value: 0.0 }),
+            seasons: vec![season(1)],
+            ..Series::default()
+        };
+        assert_eq!(series_meta(&unrated), "2019 • 1 season");
+
+        assert_eq!(series_meta(&Series::default()), "");
     }
 
     #[test]
