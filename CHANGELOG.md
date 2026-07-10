@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1](https://github.com/isama92/isamedia/compare/v0.1.0...v0.1.1) - 2026-07-10
+
+### Fixed
+
+- add form commits the shown item, not one swapped in by a late lookup ([#1](https://github.com/isama92/isamedia/pull/1))
+
 ## [0.1.0] - 2026-07-10
 
 ### Added
