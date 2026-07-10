@@ -27,11 +27,14 @@ const REPORT_FLUSH_GRACE: Duration = Duration::from_secs(5);
 
 /// Worst-case time the supervisor needs after being told to stop: wait for mpv
 /// to obey `quit` (`QUIT_GRACE`), then flush the final report
-/// (`REPORT_FLUSH_GRACE`), plus a small margin. The shell's shutdown drain
-/// waits at least this long so it never abandons the supervisor mid-flush,
-/// which would leak the IPC socket and lose the final Stopped report. Kept in
-/// sync with the two budgets by `shutdown_budget_covers_supervisor`.
-pub(crate) const SHUTDOWN_BUDGET: Duration = Duration::from_secs(11);
+/// (`REPORT_FLUSH_GRACE`), plus a 1s margin. The shell's shutdown drain waits
+/// at least this long so it never abandons the supervisor mid-flush, which
+/// would leak the IPC socket and lose the final Stopped report. Derived from
+/// the two budgets so it stays correct if either changes;
+/// `shutdown_budget_covers_supervisor` guards the invariant regardless.
+pub(crate) const SHUTDOWN_BUDGET: Duration = QUIT_GRACE
+    .saturating_add(REPORT_FLUSH_GRACE)
+    .saturating_add(Duration::from_secs(1));
 
 static OLD_MPV: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
 

@@ -525,12 +525,14 @@ impl Browse {
     }
 
     /// Re-fetch the current view after a local state change (watched toggle,
-    /// playback end) WITHOUT discarding the scroll position. A paginated
-    /// library reloads every page already scrolled through in one request, so
-    /// the cursor still points at the same item (`apply_filter` only clamps
-    /// the cursor when it is out of range, and the reloaded list is the same
-    /// length). Other views never paginate, so `fetch` already keeps the
-    /// cursor, and a drilled-in series rebuilds its seasons in place.
+    /// playback end) WITHOUT discarding the scroll position of a paginated
+    /// library. It reloads every page already scrolled through in one request,
+    /// so the reloaded list is the same length and the cursor still points at
+    /// the same item (`apply_filter` only clamps the cursor when it is out of
+    /// range). Every other view delegates to `fetch` with its existing refresh
+    /// behaviour unchanged: a drilled-in series rebuilds its seasons in place,
+    /// while the flat tabs reload the whole list (and may re-clamp the cursor
+    /// if the item set shifted).
     fn refetch_in_place(&mut self) {
         if self.tab == Tab::Libraries
             && self.current_series.is_none()

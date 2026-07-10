@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -192,6 +193,10 @@ impl Config {
 /// secrets go through here, but the files still name your server, account
 /// and watched shows; create them 0600 from the start rather than chmodding
 /// after the fact, so they are never world-readable even briefly.
+/// Distinguishes concurrent temp files written by this process (see
+/// `write_owner_only`).
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 fn write_owner_only(path: &Path, raw: &str) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)
@@ -206,13 +211,23 @@ fn write_owner_only(path: &Path, raw: &str) -> Result<()> {
     // the target's volume (rename stays atomic) and lands with the temp's 0600
     // mode, which is why there is no post-write chmod: the old file is replaced
     // wholesale, so a pre-existing looser file is tightened for free with no
-    // world-readable window. The pid tag keeps a leftover temp from a crashed
-    // run from colliding with a live write.
+    // world-readable window.
+    //
+    // This buys atomicity, not full durability: a reader always sees either the
+    // old complete file or the new one, but we do not fsync the parent
+    // directory after the rename, so a power loss immediately after can leave
+    // the previous complete file in place. That is stale, never corrupt.
+    //
+    // The temp name is tagged with the pid and a per-process counter so a
+    // leftover temp from a crashed run, or a hypothetical concurrent write to
+    // the same target, can never collide (today saves are serialised by the
+    // config mutex, so the counter is only future-proofing).
     let mut tmp_name = path
         .file_name()
         .map(|name| name.to_os_string())
         .unwrap_or_default();
-    tmp_name.push(format!(".{}.tmp", std::process::id()));
+    let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    tmp_name.push(format!(".{}.{seq}.tmp", std::process::id()));
     let tmp = path.with_file_name(tmp_name);
 
     if let Err(err) = write_tmp_owner_only(&tmp, raw) {
