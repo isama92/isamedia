@@ -62,6 +62,13 @@ fn init_logging(
         options.mode(0o600);
     }
     let file = options.open(path)?;
+    // mode() only applies on creation; also tighten a log file that already
+    // existed with looser permissions (through the handle, no path race).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
     let (writer, guard) = tracing_appender::non_blocking(file);
     tracing_subscriber::fmt()
         .json()

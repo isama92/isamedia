@@ -15,23 +15,64 @@ pub type IpcStream = tokio::net::windows::named_pipe::NamedPipeClient;
 
 /// Where the mpv IPC endpoint lives for this session; must be unique per
 /// player instance so replace-while-playing never collides.
-pub fn socket_path(unique: u128) -> String {
+///
+/// Anyone who can connect to this socket can run arbitrary mpv commands
+/// (including `run`), so it must never sit in a directory other local users
+/// can reach.
+pub fn socket_path(unique: u128) -> io::Result<String> {
     #[cfg(unix)]
     {
-        // Anyone who can connect to this socket can run arbitrary mpv
-        // commands (including `run`), so prefer the per-user 0700
-        // $XDG_RUNTIME_DIR over world-readable /tmp, where only the umask
-        // stands between the socket and other local users.
-        let dir = directories::BaseDirs::new()
+        // Prefer the per-user 0700 $XDG_RUNTIME_DIR. is_dir() guards against
+        // a stale variable (tmux/ssh session outliving logind, sudo) that
+        // would otherwise hang the connect poll on a socket mpv can't create.
+        let runtime_dir = directories::BaseDirs::new()
             .and_then(|dirs| dirs.runtime_dir().map(std::path::Path::to_path_buf))
-            .unwrap_or_else(std::env::temp_dir);
-        dir.join(format!("isamedia-mpv-{unique}"))
+            .filter(|dir| dir.is_dir());
+        let dir = match runtime_dir {
+            Some(dir) => dir,
+            None => {
+                // No logind session (cron, container, plain ssh): fall back
+                // to a fresh private subdirectory of the temp dir. create()
+                // (not create_dir_all) fails if the path already exists, so
+                // a squatter's pre-made directory is rejected, never reused.
+                let dir = std::env::temp_dir().join(format!("isamedia-mpv-dir-{unique}"));
+                let mut builder = std::fs::DirBuilder::new();
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+                builder.create(&dir)?;
+                dir
+            }
+        };
+        Ok(dir
+            .join(format!("isamedia-mpv-{unique}"))
             .to_string_lossy()
-            .into_owned()
+            .into_owned())
     }
     #[cfg(windows)]
     {
-        format!(r"\\.\pipe\isamedia-mpv-{unique}")
+        Ok(format!(r"\\.\pipe\isamedia-mpv-{unique}"))
+    }
+}
+
+/// Remove the socket file and, when it was placed in a fallback directory
+/// created by `socket_path`, that directory too.
+pub fn cleanup_socket(socket: &str) {
+    #[cfg(unix)]
+    {
+        let path = std::path::Path::new(socket);
+        let _ = std::fs::remove_file(path);
+        if let Some(parent) = path.parent()
+            && parent
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("isamedia-mpv-dir-"))
+        {
+            let _ = std::fs::remove_dir(parent);
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = socket; // named pipes disappear with their owner
     }
 }
 

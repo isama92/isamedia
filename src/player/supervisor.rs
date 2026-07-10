@@ -98,7 +98,15 @@ pub(super) async fn run(
         .map(|d| d.as_nanos())
         .unwrap_or(0)
         ^ (std::process::id() as u128);
-    let socket = ipc::socket_path(unique);
+    let socket = match ipc::socket_path(unique) {
+        Ok(socket) => socket,
+        Err(err) => {
+            emit(PlayerEvent::Failed(format!(
+                "failed to prepare mpv IPC socket directory: {err}"
+            )));
+            return;
+        }
+    };
 
     let mut child = match tokio::process::Command::new("mpv")
         .arg("--idle")
@@ -125,7 +133,7 @@ pub(super) async fn run(
                 "failed to connect to mpv IPC socket: {err}"
             )));
             let _ = child.kill().await;
-            cleanup_socket(&socket);
+            ipc::cleanup_socket(&socket);
             return;
         }
     };
@@ -141,7 +149,7 @@ pub(super) async fn run(
     if let Err(err) = ipc.send(&ipc::observe_property_cmd(1, "time-pos")).await {
         emit(PlayerEvent::Failed(format!("mpv IPC write failed: {err}")));
         let _ = child.kill().await;
-        cleanup_socket(&socket);
+        ipc::cleanup_socket(&socket);
         return;
     }
     let _ = ipc.send(&ipc::observe_property_cmd(2, "duration")).await;
@@ -346,18 +354,7 @@ pub(super) async fn run(
 
     let _ = child.kill().await;
     let _ = child.wait().await;
-    cleanup_socket(&socket);
-}
-
-fn cleanup_socket(socket: &str) {
-    #[cfg(unix)]
-    {
-        let _ = std::fs::remove_file(socket);
-    }
-    #[cfg(windows)]
-    {
-        let _ = socket; // named pipes disappear with their owner
-    }
+    ipc::cleanup_socket(&socket);
 }
 
 #[cfg(test)]
