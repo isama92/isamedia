@@ -74,6 +74,9 @@ pub struct Browse {
     show_full_help: bool,
     loading: bool,
     pub error: Option<String>,
+    /// One-line advisory (e.g. plain-http nudge after auto-login), shown in
+    /// the error row when there is no error; cleared on the next fetch.
+    pub notice: Option<String>,
     fetch_gen: u64,
     spinner_frame: usize,
     /// Terminal height from the last draw, for jfsh-style page jumps.
@@ -98,6 +101,7 @@ impl Browse {
             show_full_help: false,
             loading: false,
             error: None,
+            notice: None,
             fetch_gen: 0,
             spinner_frame: 0,
             last_height: 24,
@@ -125,6 +129,10 @@ impl Browse {
     pub fn fetch(&mut self) {
         self.loading = true;
         self.error = None;
+        // The connect-time notice has been seen once the user navigates.
+        if self.fetch_gen > 0 {
+            self.notice = None;
+        }
         self.fetch_gen += 1;
         let fetch_gen = self.fetch_gen;
         let client = self.client.clone();
@@ -344,12 +352,12 @@ impl Browse {
 
     pub fn draw(&mut self, frame: &mut Frame, area: Rect) {
         self.last_height = area.height;
-        let has_error = self.error.is_some();
+        let has_message = self.error.is_some() || self.notice.is_some();
         let show_search = self.tab == Tab::Search && self.current_series.is_none();
         let help_height = if self.show_full_help { 8 } else { 1 };
 
         let rows = Layout::vertical([
-            Constraint::Length(if has_error { 1 } else { 0 }),
+            Constraint::Length(if has_message { 1 } else { 0 }),
             Constraint::Length(2), // tab row + spacer
             Constraint::Length(if show_search { 2 } else { 0 }),
             Constraint::Length(if self.filter_active { 2 } else { 0 }),
@@ -361,6 +369,8 @@ impl Browse {
         if let Some(error) = &self.error {
             Line::styled(format!("Error: {error}"), theme::error())
                 .render(rows[0], frame.buffer_mut());
+        } else if let Some(notice) = &self.notice {
+            Line::styled(notice.clone(), theme::accent()).render(rows[0], frame.buffer_mut());
         }
         self.draw_tabs(frame, rows[1]);
         if show_search {
