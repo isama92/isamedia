@@ -206,7 +206,7 @@ impl Client {
             "/UserItems/Resume",
             &[
                 ("userId", self.user_id.as_str()),
-                ("fields", "MediaStreams"),
+                ("fields", "MediaStreams,DateCreated"),
             ],
         )
         .await
@@ -232,7 +232,7 @@ impl Client {
             &[
                 ("recursive", "true"),
                 ("includeItemTypes", "Movie,Series"),
-                ("fields", "MediaStreams"),
+                ("fields", "MediaStreams,DateCreated"),
                 ("limit", "100"),
                 ("sortBy", "DateCreated"),
                 ("sortOrder", "Descending"),
@@ -248,7 +248,7 @@ impl Client {
                 ("searchTerm", query),
                 ("recursive", "true"),
                 ("includeItemTypes", "Movie,Series"),
-                ("fields", "MediaStreams"),
+                ("fields", "MediaStreams,DateCreated"),
                 ("limit", "100"),
             ],
         )
@@ -277,7 +277,7 @@ impl Client {
             ("limit", limit.as_str()),
             ("sortBy", query.sort_by),
             ("sortOrder", query.sort_order),
-            ("fields", "MediaStreams"),
+            ("fields", "MediaStreams,DateCreated,ChildCount"),
         ];
         if let Some(types) = query.include_item_types {
             params.push(("includeItemTypes", types));
