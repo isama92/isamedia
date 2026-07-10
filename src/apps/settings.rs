@@ -12,9 +12,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 
 use crate::app::{AppId, MediaApp, ShellRequest};
-use crate::config::Config;
+use crate::config::{Config, TrackPreference};
 use crate::event::AppSender;
 use crate::ui::form::{Field, Form, FormEvent};
+use crate::ui::picker::{Picker, PickerEvent, PickerItem};
 use crate::ui::theme::{self, Theme};
 
 /// Stable field ids for the backend credentials form; values are read by id so
@@ -44,13 +45,28 @@ struct Editing {
     cursor: usize,
 }
 
-/// The overlay currently open on top of the settings list. Choice (Theme/
-/// Accent) and Backend (a credentials form) are mutually exclusive.
+/// The overlay currently open on top of the settings list. The variants are
+/// mutually exclusive; the Jellyfin row opens a submenu (credentials or
+/// language) while Radarr/Sonarr open their credentials form directly.
 #[allow(clippy::large_enum_variant)] // one instance per app; boxing buys nothing
 enum Editor {
     None,
     Choice(Editing),
     Backend(BackendEditor),
+    /// The Jellyfin submenu: 0 = Credentials, 1 = Language.
+    JellyfinMenu {
+        cursor: usize,
+    },
+    Language(LanguageEditor),
+}
+
+/// The Jellyfin language page: a row per track kind, each opening a
+/// filterable picker over the ISO 639-2 table.
+struct LanguageEditor {
+    /// 0 = audio, 1 = subtitles.
+    cursor: usize,
+    /// The open picker, modal over the page.
+    picker: Option<Picker>,
 }
 
 /// Result of a submitted backend form, reported back from the connect task.
@@ -118,8 +134,9 @@ impl SettingsApp {
         }
     }
 
-    /// Open the editor for the selected row: a choice list for Theme/Accent, a
-    /// credentials form for a backend.
+    /// Open the editor for the selected row: a choice list for Theme/Accent,
+    /// the submenu for Jellyfin (which has more than credentials to edit), a
+    /// credentials form for the other backends.
     fn open(&mut self, setting: Setting) {
         match setting {
             Setting::Theme | Setting::Accent => {
@@ -128,10 +145,42 @@ impl SettingsApp {
                     cursor: current_choice_index(setting),
                 });
             }
-            Setting::Jellyfin | Setting::Radarr | Setting::Sonarr => {
+            Setting::Jellyfin => self.editor = Editor::JellyfinMenu { cursor: 0 },
+            Setting::Radarr | Setting::Sonarr => {
                 let editor = BackendEditor::from_config(setting, &self.config.lock().unwrap());
                 self.editor = Editor::Backend(editor);
             }
+        }
+    }
+
+    /// Where closing a backend form lands: back in the submenu it was opened
+    /// from for Jellyfin, the settings list for the direct-entry backends.
+    fn close_backend(&mut self, backend: Setting) {
+        self.editor = if backend == Setting::Jellyfin {
+            Editor::JellyfinMenu { cursor: 0 }
+        } else {
+            Editor::None
+        };
+        self.clamp_cursor();
+    }
+
+    /// Persist a picker choice for a language row. Synchronous like the
+    /// Theme/Accent apply: no server round trip, so no generation counter.
+    fn apply_language(&mut self, row: usize, key: &str) {
+        let value = match key {
+            "unset" => None,
+            "default" => Some(TrackPreference::Default),
+            "off" => Some(TrackPreference::Off),
+            code => Some(TrackPreference::Language(code.to_string())),
+        };
+        let mut config = self.config.lock().unwrap();
+        if row == 0 {
+            config.jellyfin.audio_language = value;
+        } else {
+            config.jellyfin.subtitle_language = value;
+        }
+        if let Err(err) = config.save(&self.config_path) {
+            tracing::warn!(%err, "failed to persist language preference");
         }
     }
 
@@ -232,6 +281,87 @@ impl SettingsApp {
             let result = validate_and_persist(request, config, config_path).await;
             sender.send(Msg::SaveDone { save_gen, result });
         });
+    }
+
+    fn draw_jellyfin_menu(&self, cursor: usize, area: Rect, buf: &mut Buffer) {
+        let (host, audio, subtitles) = {
+            let config = self.config.lock().unwrap();
+            let jf = &config.jellyfin;
+            (
+                jf.host.clone(),
+                preference_label(jf.audio_language.as_ref()),
+                preference_label(jf.subtitle_language.as_ref()),
+            )
+        };
+        let host_summary = if host.is_empty() {
+            "not configured".to_string()
+        } else {
+            host
+        };
+        Line::styled("  Jellyfin", theme::selected())
+            .render(Rect::new(area.x, area.y, area.width, 1), buf);
+        let rows = [
+            menu_row(cursor == 0, "Credentials", &host_summary),
+            menu_row(
+                cursor == 1,
+                "Language",
+                &format!("audio: {audio}   subs: {subtitles}"),
+            ),
+        ];
+        for (i, row) in rows.into_iter().enumerate() {
+            let y = area.y + 2 + i as u16;
+            if y < area.y + area.height {
+                row.render(Rect::new(area.x, y, area.width, 1), buf);
+            }
+        }
+        if area.height > 4 {
+            Line::styled("  enter: open   esc: back", theme::dim()).render(
+                Rect::new(area.x, area.y + area.height - 1, area.width, 1),
+                buf,
+            );
+        }
+    }
+
+    fn draw_language(&self, editor: &LanguageEditor, frame: &mut Frame, area: Rect) {
+        let (audio, subtitles) = {
+            let config = self.config.lock().unwrap();
+            let jf = &config.jellyfin;
+            (
+                preference_label(jf.audio_language.as_ref()),
+                preference_label(jf.subtitle_language.as_ref()),
+            )
+        };
+        // The page rows first (buffer borrow), then the picker modal on top
+        // (needs &mut Frame) — the two frame borrows never overlap.
+        {
+            let buf = frame.buffer_mut();
+            Line::styled("  Jellyfin language", theme::selected())
+                .render(Rect::new(area.x, area.y, area.width, 1), buf);
+            let rows = [
+                menu_row(editor.cursor == 0, "Audio", &audio),
+                menu_row(editor.cursor == 1, "Subtitles", &subtitles),
+            ];
+            for (i, row) in rows.into_iter().enumerate() {
+                let y = area.y + 2 + i as u16;
+                if y < area.y + area.height {
+                    row.render(Rect::new(area.x, y, area.width, 1), buf);
+                }
+            }
+            if area.height > 4 {
+                Line::styled("  enter: change   esc: back", theme::dim()).render(
+                    Rect::new(area.x, area.y + area.height - 1, area.width, 1),
+                    buf,
+                );
+            }
+        }
+        if let Some(picker) = &editor.picker {
+            let title = if editor.cursor == 0 {
+                "Preferred audio language"
+            } else {
+                "Preferred subtitles language"
+            };
+            picker.draw(frame, area, title);
+        }
     }
 
     fn draw_list(&self, area: Rect, buf: &mut Buffer) {
@@ -531,6 +661,65 @@ fn current_choice_index(setting: Setting) -> usize {
     }
 }
 
+/// The picker for a language row, with the special choices pinned above the
+/// filterable ISO 639-2 list. Sentinel keys can't collide with language
+/// codes ("unset"/"default"/"off" are not ISO 639-2 codes).
+fn language_picker(row: usize) -> Picker {
+    let special = if row == 0 {
+        PickerItem::new("default", "Default track")
+    } else {
+        PickerItem::new("off", "None (off)")
+    };
+    let pinned = vec![PickerItem::new("unset", "No preference"), special];
+    let items = crate::lang::LANGUAGES
+        .iter()
+        .map(|lang| PickerItem::new(lang.code, format!("{} ({})", lang.name, lang.code)))
+        .collect();
+    Picker::new(pinned, items)
+}
+
+/// The picker key for a stored preference, to seed the cursor on open.
+/// Language codes are canonicalised so a hand-edited config holding a /T or
+/// 639-1 form ("deu", "it") still pre-highlights the right row; every write
+/// path already stores the /B form.
+fn preference_key(pref: Option<&TrackPreference>) -> String {
+    match pref {
+        None => "unset".into(),
+        Some(TrackPreference::Default) => "default".into(),
+        Some(TrackPreference::Off) => "off".into(),
+        Some(TrackPreference::Language(code)) => crate::lang::canonical(code),
+    }
+}
+
+/// Row summary for a stored preference: "Italian (ita)", "off", ...
+fn preference_label(pref: Option<&TrackPreference>) -> String {
+    match pref {
+        None => "no preference".into(),
+        Some(TrackPreference::Default) => "default track".into(),
+        Some(TrackPreference::Off) => "off".into(),
+        Some(TrackPreference::Language(code)) => match crate::lang::name(code) {
+            Some(name) => format!("{name} ({code})"),
+            None => code.clone(),
+        },
+    }
+}
+
+/// A `Label   summary` row for the submenu and language pages, in the same
+/// shape as the settings-list rows.
+fn menu_row(selected: bool, label: &str, summary: &str) -> Line<'static> {
+    let style = if selected {
+        theme::selected()
+    } else {
+        Style::new().fg(theme::fg())
+    };
+    let marker = if selected { "> " } else { "  " };
+    Line::from(vec![
+        Span::styled(format!("  {marker}"), style),
+        Span::styled(format!("{label:<12}"), style),
+        Span::styled(summary.to_string(), theme::dim()),
+    ])
+}
+
 /// The credential's label: the password for Jellyfin, the API key for the *arr.
 fn secret_label(backend: Setting) -> &'static str {
     match backend {
@@ -665,17 +854,107 @@ impl MediaApp for SettingsApp {
             return None;
         }
 
+        // The Jellyfin submenu: two fixed entries, Credentials and Language.
+        if let Editor::JellyfinMenu { cursor } = self.editor {
+            match key.code {
+                // Two entries: Up and Down both land on the other one.
+                KeyCode::Up | KeyCode::Down => {
+                    self.editor = Editor::JellyfinMenu { cursor: cursor ^ 1 };
+                }
+                KeyCode::Enter if cursor == 0 => {
+                    let editor =
+                        BackendEditor::from_config(Setting::Jellyfin, &self.config.lock().unwrap());
+                    self.editor = Editor::Backend(editor);
+                }
+                KeyCode::Enter => {
+                    self.editor = Editor::Language(LanguageEditor {
+                        cursor: 0,
+                        picker: None,
+                    });
+                }
+                KeyCode::Esc | KeyCode::Backspace => self.editor = Editor::None,
+                KeyCode::Char('q') if key.modifiers.is_empty() => {
+                    return Some(ShellRequest::Quit);
+                }
+                _ => {}
+            }
+            return None;
+        }
+
+        // The language page: rows when no picker is open, else the picker.
+        // Outcomes that need `&mut self` are collected first, so the borrow
+        // on the editor has ended by the time they run (the same dance as
+        // the backend form below).
+        if let Editor::Language(editor) = &mut self.editor {
+            let mut chosen = None;
+            let mut close = false;
+            if let Some(picker) = &mut editor.picker {
+                match picker.on_key(key) {
+                    PickerEvent::Chosen(choice) => {
+                        chosen = Some((editor.cursor, choice));
+                        editor.picker = None;
+                    }
+                    PickerEvent::Cancel => editor.picker = None,
+                    PickerEvent::Consumed => {}
+                }
+            } else {
+                match key.code {
+                    // Two rows: Up and Down both land on the other one.
+                    KeyCode::Up | KeyCode::Down => editor.cursor ^= 1,
+                    KeyCode::Enter => {
+                        let row = editor.cursor;
+                        let current = {
+                            let config = self.config.lock().unwrap();
+                            let jf = &config.jellyfin;
+                            let pref = if row == 0 {
+                                jf.audio_language.as_ref()
+                            } else {
+                                jf.subtitle_language.as_ref()
+                            };
+                            preference_key(pref)
+                        };
+                        let mut picker = language_picker(row);
+                        picker.select(&current);
+                        editor.picker = Some(picker);
+                    }
+                    KeyCode::Esc | KeyCode::Backspace => close = true,
+                    KeyCode::Char('q') if key.modifiers.is_empty() => {
+                        return Some(ShellRequest::Quit);
+                    }
+                    _ => {}
+                }
+            }
+            if let Some((row, choice)) = chosen {
+                self.apply_language(row, &choice);
+            }
+            if close {
+                self.editor = Editor::JellyfinMenu { cursor: 1 };
+            }
+            return None;
+        }
+
         // Backend credentials form: decide the outcome while the form is
         // borrowed, then act once the borrow has ended.
         if let Editor::Backend(editor) = &mut self.editor {
-            // Mid-connect: only Esc cancels (the in-flight result is dropped by
-            // the save_gen guard in on_event); every other key is ignored.
+            let backend = editor.backend;
+            // Mid-connect: only Esc/Backspace cancel (the in-flight result is
+            // dropped by the save_gen guard in on_event); every other key is
+            // ignored.
             if editor.busy {
-                if key.code == KeyCode::Esc {
+                if matches!(key.code, KeyCode::Esc | KeyCode::Backspace) {
                     self.save_gen += 1;
-                    self.editor = Editor::None;
+                    self.close_backend(backend);
                 }
                 return None;
+            }
+            // On the Save/Cancel rows 'q' can't be input, so it keeps its
+            // app-wide quit meaning (on a field it types into the value).
+            // Backspace there is handled by the form itself as Cancel.
+            if key.code == KeyCode::Char('q')
+                && key.modifiers.is_empty()
+                && editor.form.action_row_focused()
+            {
+                return Some(ShellRequest::Quit);
             }
             let outcome = match editor.form.on_key(key) {
                 // Save gates on validity: an invalid form stays open with the
@@ -699,7 +978,7 @@ impl MediaApp for SettingsApp {
             match outcome {
                 BackendOutcome::Cancel => {
                     self.save_gen += 1;
-                    self.editor = Editor::None;
+                    self.close_backend(backend);
                 }
                 BackendOutcome::Submit => self.submit_backend(),
                 BackendOutcome::Ignore => {}
@@ -739,13 +1018,14 @@ impl MediaApp for SettingsApp {
                 // A Jellyfin save minted a fresh token in the keyring; signal
                 // the running Jellyfin tab to adopt it instead of dropping to a
                 // re-login. (*arr keys are stateless, so they need no signal.)
-                if let Editor::Backend(editor) = &self.editor
-                    && editor.backend == Setting::Jellyfin
-                {
+                let backend = match &self.editor {
+                    Editor::Backend(editor) => editor.backend,
+                    _ => return,
+                };
+                if backend == Setting::Jellyfin {
                     self.jellyfin_reauth.fetch_add(1, Ordering::Relaxed);
                 }
-                self.editor = Editor::None;
-                self.clamp_cursor();
+                self.close_backend(backend);
             }
             Err(message) => {
                 if let Editor::Backend(editor) = &mut self.editor {
@@ -771,6 +1051,10 @@ impl MediaApp for SettingsApp {
             Editor::None => self.draw_list(body, frame.buffer_mut()),
             Editor::Choice(editing) => draw_editor(editing, body, frame.buffer_mut()),
             Editor::Backend(editor) => editor.draw(frame, body),
+            Editor::JellyfinMenu { cursor } => {
+                self.draw_jellyfin_menu(*cursor, body, frame.buffer_mut())
+            }
+            Editor::Language(editor) => self.draw_language(editor, frame, body),
         }
     }
 }
@@ -822,6 +1106,19 @@ mod tests {
                     Editor::Backend(BackendEditor::from_config(backend, &Config::default()));
                 terminal.draw(|f| settings.draw(f, f.area())).unwrap();
             }
+            // The Jellyfin submenu and the language page, picker closed and open.
+            settings.editor = Editor::JellyfinMenu { cursor: 1 };
+            terminal.draw(|f| settings.draw(f, f.area())).unwrap();
+            settings.editor = Editor::Language(LanguageEditor {
+                cursor: 0,
+                picker: None,
+            });
+            terminal.draw(|f| settings.draw(f, f.area())).unwrap();
+            settings.editor = Editor::Language(LanguageEditor {
+                cursor: 1,
+                picker: Some(language_picker(1)),
+            });
+            terminal.draw(|f| settings.draw(f, f.area())).unwrap();
             settings.editor = Editor::None;
         }
     }
@@ -865,7 +1162,18 @@ mod tests {
     #[test]
     fn opening_a_backend_shows_the_form_and_esc_cancels() {
         let mut settings = app();
+        // Jellyfin opens the submenu, not the form; Enter on Credentials
+        // opens the form.
         settings.open(Setting::Jellyfin);
+        assert!(matches!(
+            settings.editor,
+            Editor::JellyfinMenu { cursor: 0 }
+        ));
+        let text = draw_to_text(&mut settings);
+        for label in ["Credentials", "Language"] {
+            assert!(text.contains(label), "missing {label} in:\n{text}");
+        }
+        settings.on_key(KeyEvent::from(KeyCode::Enter));
         assert!(matches!(settings.editor, Editor::Backend(_)));
 
         // The Jellyfin form shows host, username and password fields plus the
@@ -875,8 +1183,16 @@ mod tests {
             assert!(text.contains(label), "missing {label} in:\n{text}");
         }
 
-        // The *arr forms show an API key field and omit the username row.
+        // Esc backs out one level at a time: form -> submenu -> list.
+        settings.on_key(KeyEvent::from(KeyCode::Esc));
+        assert!(matches!(settings.editor, Editor::JellyfinMenu { .. }));
+        settings.on_key(KeyEvent::from(KeyCode::Esc));
+        assert!(matches!(settings.editor, Editor::None));
+
+        // The *arr rows keep opening their form directly, without a username
+        // row, and Esc returns straight to the list.
         settings.open(Setting::Radarr);
+        assert!(matches!(settings.editor, Editor::Backend(_)));
         let text = draw_to_text(&mut settings);
         assert!(text.contains("API key"), "missing API key in:\n{text}");
         assert!(
@@ -891,8 +1207,10 @@ mod tests {
     #[test]
     fn save_with_empty_host_shows_error() {
         let mut settings = app();
-        // Default config has an empty Jellyfin host.
+        // Default config has an empty Jellyfin host. Enter the credentials
+        // form through the submenu.
         settings.open(Setting::Jellyfin);
+        settings.on_key(KeyEvent::from(KeyCode::Enter));
         // Walk Host -> Username -> Password -> Save, then confirm.
         for _ in 0..3 {
             settings.on_key(KeyEvent::from(KeyCode::Down));
@@ -943,17 +1261,20 @@ mod tests {
         );
 
         // A successful Jellyfin save bumps the counter so the Jellyfin tab picks
-        // up the fresh token instead of forcing a re-login.
+        // up the fresh token instead of forcing a re-login, and lands back in
+        // the submenu the form was opened from.
         settings.open(Setting::Jellyfin);
+        settings.on_key(KeyEvent::from(KeyCode::Enter));
         let save_gen = settings.save_gen;
         settings.on_event(Box::new(Msg::SaveDone {
             save_gen,
             result: Ok(()),
         }));
         assert_eq!(reauth.load(Ordering::Relaxed), 1);
+        assert!(matches!(settings.editor, Editor::JellyfinMenu { .. }));
 
         // An *arr save must not signal it: API-key auth is stateless, so the
-        // running tab keeps working.
+        // running tab keeps working. Its form closes back to the list.
         settings.open(Setting::Radarr);
         let save_gen = settings.save_gen;
         settings.on_event(Box::new(Msg::SaveDone {
@@ -961,5 +1282,200 @@ mod tests {
             result: Ok(()),
         }));
         assert_eq!(reauth.load(Ordering::Relaxed), 1);
+        assert!(matches!(settings.editor, Editor::None));
+    }
+
+    /// An app whose config saves land in a scratch file that is cleaned up.
+    fn app_with_temp_config(name: &str) -> (SettingsApp, PathBuf) {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let path =
+            std::env::temp_dir().join(format!("isamedia-{name}-{}.toml", std::process::id()));
+        let settings = SettingsApp::new(
+            Arc::new(Mutex::new(Config::default())),
+            path.clone(),
+            AppSender::new("settings", tx),
+            Arc::new(AtomicU64::new(0)),
+        );
+        (settings, path)
+    }
+
+    #[test]
+    fn language_page_persists_picker_choices() {
+        let (mut settings, path) = app_with_temp_config("lang-pick");
+        settings.open(Setting::Jellyfin);
+        settings.on_key(KeyEvent::from(KeyCode::Down)); // Credentials -> Language
+        settings.on_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(settings.editor, Editor::Language(_)));
+
+        // Audio row: filter down to Italian and choose it.
+        settings.on_key(KeyEvent::from(KeyCode::Enter));
+        for c in "italia".chars() {
+            settings.on_key(KeyEvent::from(KeyCode::Char(c)));
+        }
+        settings.on_key(KeyEvent::from(KeyCode::Down)); // skip "No preference"
+        settings.on_key(KeyEvent::from(KeyCode::Down)); // skip "Default track"
+        settings.on_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(
+            settings.config.lock().unwrap().jellyfin.audio_language,
+            Some(TrackPreference::Language("ita".into()))
+        );
+
+        // Subtitles row: the pinned "None (off)" choice.
+        settings.on_key(KeyEvent::from(KeyCode::Down));
+        settings.on_key(KeyEvent::from(KeyCode::Enter));
+        settings.on_key(KeyEvent::from(KeyCode::Down)); // "No preference" -> "None (off)"
+        settings.on_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(
+            settings.config.lock().unwrap().jellyfin.subtitle_language,
+            Some(TrackPreference::Off)
+        );
+
+        // Back to "No preference" clears the value again. The picker reopens
+        // seeded on the current value ("None (off)"), so step up once.
+        settings.on_key(KeyEvent::from(KeyCode::Enter));
+        settings.on_key(KeyEvent::from(KeyCode::Up));
+        settings.on_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(
+            settings.config.lock().unwrap().jellyfin.subtitle_language,
+            None
+        );
+
+        // Esc chain: language page -> submenu (Language row) -> list.
+        settings.on_key(KeyEvent::from(KeyCode::Esc));
+        assert!(matches!(
+            settings.editor,
+            Editor::JellyfinMenu { cursor: 1 }
+        ));
+        settings.on_key(KeyEvent::from(KeyCode::Esc));
+        assert!(matches!(settings.editor, Editor::None));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn submenu_backspace_backs_out_and_q_quits() {
+        let mut settings = app();
+        settings.open(Setting::Jellyfin);
+        assert!(matches!(
+            settings.on_key(KeyEvent::from(KeyCode::Char('q'))),
+            Some(ShellRequest::Quit)
+        ));
+        // Quitting is the shell's business; the submenu stays as it was.
+        assert!(matches!(settings.editor, Editor::JellyfinMenu { .. }));
+        settings.on_key(KeyEvent::from(KeyCode::Backspace));
+        assert!(matches!(settings.editor, Editor::None));
+    }
+
+    #[test]
+    fn language_page_backspace_and_q_unless_picker_is_typing() {
+        let mut settings = app();
+        settings.editor = Editor::Language(LanguageEditor {
+            cursor: 0,
+            picker: None,
+        });
+        assert!(matches!(
+            settings.on_key(KeyEvent::from(KeyCode::Char('q'))),
+            Some(ShellRequest::Quit)
+        ));
+
+        // With the picker open, q and Backspace belong to the filter input.
+        settings.on_key(KeyEvent::from(KeyCode::Enter));
+        assert!(
+            settings
+                .on_key(KeyEvent::from(KeyCode::Char('q')))
+                .is_none()
+        );
+        assert!(
+            settings
+                .on_key(KeyEvent::from(KeyCode::Backspace))
+                .is_none()
+        );
+        match &settings.editor {
+            Editor::Language(editor) => assert!(editor.picker.is_some()),
+            _ => panic!("picker should still be open"),
+        }
+        settings.on_key(KeyEvent::from(KeyCode::Esc)); // close the picker
+
+        // Back on the page rows, Backspace returns to the submenu.
+        settings.on_key(KeyEvent::from(KeyCode::Backspace));
+        assert!(matches!(
+            settings.editor,
+            Editor::JellyfinMenu { cursor: 1 }
+        ));
+    }
+
+    #[test]
+    fn credentials_form_backspace_and_q_on_the_buttons() {
+        let mut settings = app();
+        settings.open(Setting::Radarr);
+        // On a field, q is input, not quit.
+        assert!(
+            settings
+                .on_key(KeyEvent::from(KeyCode::Char('q')))
+                .is_none()
+        );
+        match &settings.editor {
+            Editor::Backend(editor) => assert_eq!(editor.form.text(field::HOST), "q"),
+            _ => panic!("form should be open"),
+        }
+        // Walk Host -> API key -> Save: there q quits and Backspace cancels.
+        settings.on_key(KeyEvent::from(KeyCode::Down));
+        settings.on_key(KeyEvent::from(KeyCode::Down));
+        assert!(matches!(
+            settings.on_key(KeyEvent::from(KeyCode::Char('q'))),
+            Some(ShellRequest::Quit)
+        ));
+        settings.on_key(KeyEvent::from(KeyCode::Backspace));
+        assert!(matches!(settings.editor, Editor::None));
+
+        // The Jellyfin form cancels back into the submenu instead.
+        settings.open(Setting::Jellyfin);
+        settings.on_key(KeyEvent::from(KeyCode::Enter));
+        for _ in 0..3 {
+            settings.on_key(KeyEvent::from(KeyCode::Down)); // -> Save
+        }
+        settings.on_key(KeyEvent::from(KeyCode::Backspace));
+        assert!(matches!(settings.editor, Editor::JellyfinMenu { .. }));
+    }
+
+    #[test]
+    fn picker_seeds_from_non_canonical_codes() {
+        // A hand-edited config may hold a /T or 639-1 form; the picker must
+        // still open on the matching row (which then re-stores it as /B).
+        let (mut settings, path) = app_with_temp_config("lang-seed");
+        settings.config.lock().unwrap().jellyfin.audio_language =
+            Some(TrackPreference::Language("deu".into()));
+        settings.editor = Editor::Language(LanguageEditor {
+            cursor: 0,
+            picker: None,
+        });
+        settings.on_key(KeyEvent::from(KeyCode::Enter)); // open, seeded on German
+        settings.on_key(KeyEvent::from(KeyCode::Enter)); // choose it
+        assert_eq!(
+            settings.config.lock().unwrap().jellyfin.audio_language,
+            Some(TrackPreference::Language("ger".into()))
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn language_summaries_are_shown() {
+        let (mut settings, _path) = app_with_temp_config("lang-summary");
+        {
+            let mut config = settings.config.lock().unwrap();
+            config.jellyfin.audio_language = Some(TrackPreference::Language("ita".into()));
+            config.jellyfin.subtitle_language = Some(TrackPreference::Off);
+        }
+        settings.editor = Editor::JellyfinMenu { cursor: 1 };
+        let text = draw_to_text(&mut settings);
+        assert!(text.contains("audio: Italian (ita)"), "{text}");
+        assert!(text.contains("subs: off"), "{text}");
+
+        settings.editor = Editor::Language(LanguageEditor {
+            cursor: 0,
+            picker: None,
+        });
+        let text = draw_to_text(&mut settings);
+        assert!(text.contains("Italian (ita)"), "{text}");
     }
 }
