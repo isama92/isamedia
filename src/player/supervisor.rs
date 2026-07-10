@@ -265,6 +265,9 @@ pub(super) async fn run(
     let mut current = items[index].clone();
     let mut skippable: Vec<(f64, f64)> = Vec::new();
     let mut last_report = Instant::now();
+    // Set on seek: send a progress report on the next time-pos even if the
+    // debounce interval has not elapsed.
+    let mut report_due = false;
     let mut last_emitted_sec = i64::MIN;
     let mut quit_deadline: Option<Instant> = None;
     let mut cmd_open = true;
@@ -317,7 +320,7 @@ pub(super) async fn run(
                                 }
                             }
 
-                            if last_report.elapsed() > PROGRESS_REPORT_INTERVAL {
+                            if report_due || last_report.elapsed() > PROGRESS_REPORT_INTERVAL {
                                 // Fire-and-forget; the debounce advances no
                                 // matter how the report fares, so a down
                                 // server is attempted once per interval, not
@@ -326,6 +329,7 @@ pub(super) async fn run(
                                     item_id: current.id.clone(),
                                     ticks: seconds_to_ticks(pos),
                                 });
+                                report_due = false;
                                 last_report = Instant::now();
                             }
 
@@ -417,11 +421,9 @@ pub(super) async fn run(
                     }
 
                     Some("seek") => {
-                        // Report immediately after a seek: pretend the last
-                        // report is old, like jfsh resetting its debounce.
-                        last_report = Instant::now()
-                            .checked_sub(PROGRESS_REPORT_INTERVAL + Duration::from_secs(1))
-                            .unwrap_or_else(Instant::now);
+                        // Report on the next time-pos regardless of the
+                        // debounce, like jfsh resetting its timer on seek.
+                        report_due = true;
                     }
 
                     Some("end-file") | Some("shutdown") => {
