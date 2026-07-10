@@ -31,6 +31,10 @@ pub enum PlayerEvent {
     },
     /// Something went wrong; shown as the browse error line.
     Failed(String),
+    /// The server answered 401 to a playback-path request (episode fetch,
+    /// playstate report, segment fetch): the session token is dead and the
+    /// app should run its re-login flow.
+    SessionExpired,
     /// The player is gone. Always the final event, exactly once.
     Exited,
 }
@@ -80,6 +84,11 @@ pub fn spawn(
                     (episodes, index)
                 }
                 Ok(_) => (vec![item], 0),
+                Err(crate::jellyfin::Error::Unauthorized) => {
+                    emit(PlayerEvent::SessionExpired);
+                    emit(PlayerEvent::Exited);
+                    return;
+                }
                 Err(err) => {
                     emit(PlayerEvent::Failed(format!(
                         "failed to fetch episodes: {err}"

@@ -119,6 +119,7 @@ impl JellyfinApp {
                     browse.error = Some(message);
                 }
             }
+            PlayerEvent::SessionExpired => self.on_session_expired(),
             PlayerEvent::Exited => {
                 self.player = None;
                 if let Screen::Browse(browse) = &mut self.screen {
