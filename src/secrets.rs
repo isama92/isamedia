@@ -12,6 +12,7 @@ const SERVICE: &str = "isamedia";
 pub const JELLYFIN_TOKEN: &str = "jellyfin-token";
 pub const JELLYFIN_PASSWORD: &str = "jellyfin-password";
 pub const SONARR_API_KEY: &str = "sonarr-api-key";
+pub const RADARR_API_KEY: &str = "radarr-api-key";
 
 /// Read a secret; a missing entry and an unavailable keyring both come back
 /// as `None` (the caller falls back to interactive login either way).
