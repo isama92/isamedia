@@ -74,5 +74,9 @@ pub enum CommandKind {
     AutoSearch,
     Grab,
     DeleteFile,
+    /// Carries the deleted series' id, so the result can leave its pages only
+    /// when the user is still viewing that series (navigation doesn't bump the
+    /// generation counter).
+    DeleteSeries(i64),
     DeleteQueue,
 }

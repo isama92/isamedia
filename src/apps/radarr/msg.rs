@@ -70,5 +70,9 @@ pub enum CommandKind {
     AutoSearch,
     Grab,
     DeleteFile,
+    /// Carries the deleted movie's id, so the result can leave its detail only
+    /// when the user is still viewing that movie (navigation doesn't bump the
+    /// generation counter).
+    DeleteMovie(i64),
     DeleteQueue,
 }
