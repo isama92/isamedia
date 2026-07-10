@@ -67,7 +67,14 @@ impl Client {
     /// token is stored yet (same short-circuit jfsh does).
     pub async fn connect(creds: Credentials) -> Result<Self, Error> {
         let host = url::normalize_host(&creds.host)?;
-        let http = reqwest::Client::new();
+        // Every request path needs a timeout: an unbounded call can never be
+        // cancelled from the render loop. All calls here are small JSON
+        // (media streaming goes through mpv, not this client), so a blanket
+        // per-request timeout is safe.
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()?;
 
         let (token, user_id) = if creds.token.is_empty() || creds.user_id.is_empty() {
             let header = auth_header(&creds.device, &creds.device_id, &creds.version, None);

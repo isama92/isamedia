@@ -99,13 +99,33 @@ pub fn quit_cmd() -> Vec<Value> {
     vec![json!("quit")]
 }
 
-/// `loadfile <url> replace [0] {force-media-title, start}` — the index arg
-/// only exists on mpv >= 0.38.
-pub fn play_file_cmd(url: &str, title: &str, start_secs: f64, old_mpv: bool) -> Vec<Value> {
-    let opts = json!({
-        "force-media-title": title,
-        "start": format!("{start_secs:.6}"),
-    });
+/// Per-file auth for mpv's stream requests. A header keeps the token out of
+/// the URL (which mpv shows in logs and OSD). X-Emby-Token is used because
+/// its value has no commas — mpv parses http-header-fields as a comma-
+/// separated list, which would split the full MediaBrowser header.
+fn add_stream_auth(opts: &mut serde_json::Map<String, Value>, token: &str) {
+    if !token.is_empty() {
+        opts.insert(
+            "http-header-fields".into(),
+            json!(format!("X-Emby-Token: {token}")),
+        );
+    }
+}
+
+/// `loadfile <url> replace [0] {force-media-title, start, auth}` — the index
+/// arg only exists on mpv >= 0.38.
+pub fn play_file_cmd(
+    url: &str,
+    title: &str,
+    start_secs: f64,
+    old_mpv: bool,
+    token: &str,
+) -> Vec<Value> {
+    let mut opts = serde_json::Map::new();
+    opts.insert("force-media-title".into(), json!(title));
+    opts.insert("start".into(), json!(format!("{start_secs:.6}")));
+    add_stream_auth(&mut opts, token);
+    let opts = Value::Object(opts);
     if old_mpv {
         vec![json!("loadfile"), json!(url), json!("replace"), opts]
     } else {
@@ -119,8 +139,11 @@ pub fn play_file_cmd(url: &str, title: &str, start_secs: f64, old_mpv: bool) -> 
     }
 }
 
-pub fn append_file_cmd(url: &str, title: &str, old_mpv: bool) -> Vec<Value> {
-    let opts = json!({"force-media-title": title});
+pub fn append_file_cmd(url: &str, title: &str, old_mpv: bool, token: &str) -> Vec<Value> {
+    let mut opts = serde_json::Map::new();
+    opts.insert("force-media-title".into(), json!(title));
+    add_stream_auth(&mut opts, token);
+    let opts = Value::Object(opts);
     if old_mpv {
         vec![json!("loadfile"), json!(url), json!("append"), opts]
     } else {
@@ -135,14 +158,42 @@ pub fn append_file_cmd(url: &str, title: &str, old_mpv: bool) -> Vec<Value> {
 }
 
 /// Only valid on mpv >= 0.38; callers must skip prepending on old mpv.
-pub fn prepend_file_cmd(url: &str, title: &str) -> Vec<Value> {
+pub fn prepend_file_cmd(url: &str, title: &str, token: &str) -> Vec<Value> {
+    let mut opts = serde_json::Map::new();
+    opts.insert("force-media-title".into(), json!(title));
+    add_stream_auth(&mut opts, token);
     vec![
         json!("loadfile"),
         json!(url),
         json!("insert-at"),
         json!(0),
-        json!({"force-media-title": title}),
+        Value::Object(opts),
     ]
+}
+
+/// Strip credential values before a command reaches a log: `api_key=` query
+/// params (subtitle URLs) and `X-Emby-Token:` header values. The mpv IPC
+/// debug log prints full commands, URLs included.
+pub fn redact_secrets(text: &str) -> String {
+    let redacted = redact_after(text, "api_key=", &['&', '"', '\\', ',']);
+    redact_after(&redacted, "X-Emby-Token: ", &['"', '\\', ','])
+}
+
+fn redact_after(text: &str, marker: &str, terminators: &[char]) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(idx) = rest.find(marker) {
+        let value_start = idx + marker.len();
+        result.push_str(&rest[..value_start]);
+        result.push_str("REDACTED");
+        let tail = &rest[value_start..];
+        let end = tail
+            .find(|c| terminators.contains(&c))
+            .unwrap_or(tail.len());
+        rest = &tail[end..];
+    }
+    result.push_str(rest);
+    result
 }
 
 /// Parse `mpv --version` output; true when older than 0.38.0 (different
@@ -211,21 +262,54 @@ mod tests {
 
     #[test]
     fn loadfile_shapes() {
-        let new = play_file_cmd("http://x/v", "T", 12.5, false);
+        let new = play_file_cmd("http://x/v", "T", 12.5, false, "tok");
         assert_eq!(
             serde_json::to_string(&new).unwrap(),
-            r#"["loadfile","http://x/v","replace",0,{"force-media-title":"T","start":"12.500000"}]"#
+            r#"["loadfile","http://x/v","replace",0,{"force-media-title":"T","http-header-fields":"X-Emby-Token: tok","start":"12.500000"}]"#
         );
-        let old = play_file_cmd("http://x/v", "T", 12.5, true);
+        let old = play_file_cmd("http://x/v", "T", 12.5, true, "tok");
         assert_eq!(
             serde_json::to_string(&old).unwrap(),
-            r#"["loadfile","http://x/v","replace",{"force-media-title":"T","start":"12.500000"}]"#
+            r#"["loadfile","http://x/v","replace",{"force-media-title":"T","http-header-fields":"X-Emby-Token: tok","start":"12.500000"}]"#
         );
-        let append_old = append_file_cmd("u", "t", true);
+        let append_old = append_file_cmd("u", "t", true, "tok");
         assert_eq!(append_old.len(), 4);
-        let append_new = append_file_cmd("u", "t", false);
+        let append_new = append_file_cmd("u", "t", false, "tok");
         assert_eq!(append_new.len(), 5);
-        assert_eq!(prepend_file_cmd("u", "t").len(), 5);
+        assert_eq!(prepend_file_cmd("u", "t", "tok").len(), 5);
+    }
+
+    #[test]
+    fn empty_token_adds_no_header() {
+        let cmd = play_file_cmd("u", "t", 0.0, false, "");
+        assert!(
+            !serde_json::to_string(&cmd)
+                .unwrap()
+                .contains("http-header-fields")
+        );
+    }
+
+    #[test]
+    fn redacts_secrets_from_commands() {
+        let sub_add = serde_json::to_string(&sub_add_cmd(
+            "https://x/Videos/a/a/Subtitles/2/0/Stream.srt?api_key=deadbeef123",
+            "English",
+            "eng",
+        ))
+        .unwrap();
+        let redacted = redact_secrets(&sub_add);
+        assert!(!redacted.contains("deadbeef123"), "{redacted}");
+        assert!(redacted.contains("api_key=REDACTED"), "{redacted}");
+
+        let loadfile =
+            serde_json::to_string(&play_file_cmd("http://x/v", "T", 0.0, false, "deadbeef123"))
+                .unwrap();
+        let redacted = redact_secrets(&loadfile);
+        assert!(!redacted.contains("deadbeef123"), "{redacted}");
+        assert!(redacted.contains("X-Emby-Token: REDACTED"), "{redacted}");
+
+        // No secrets: unchanged.
+        assert_eq!(redact_secrets("plain text"), "plain text");
     }
 
     #[test]
