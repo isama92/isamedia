@@ -11,7 +11,7 @@ pub mod models;
 use reqwest::{Method, StatusCode};
 use serde::de::DeserializeOwned;
 
-use models::{Page, QueueItem};
+use models::{Page, QualityProfile, QueueItem, RootFolder};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -119,6 +119,35 @@ impl Transport {
     ) -> Result<T, Error> {
         let response = self.send(method, path, query, None, timeout).await?;
         Ok(response.json().await?)
+    }
+
+    /// Like [`request`](Self::request) but forwards a body and reads the
+    /// response back; the add endpoints POST a payload and return the created
+    /// item, which the UI navigates straight to.
+    pub(crate) async fn send_json<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        query: &[(&str, &str)],
+        body: Option<&serde_json::Value>,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<T, Error> {
+        let response = self.send(method, path, query, body, timeout).await?;
+        Ok(response.json().await?)
+    }
+
+    /// The configured library roots, offered as add targets. Same shape on
+    /// both backends.
+    pub async fn get_root_folders(&self) -> Result<Vec<RootFolder>, Error> {
+        self.request(Method::GET, "/api/v3/rootfolder", &[], None)
+            .await
+    }
+
+    /// The quality profiles, offered as add targets. Same shape on both
+    /// backends.
+    pub async fn get_quality_profiles(&self) -> Result<Vec<QualityProfile>, Error> {
+        self.request(Method::GET, "/api/v3/qualityprofile", &[], None)
+            .await
     }
 
     /// The whole download queue; callers filter client-side, which sidesteps

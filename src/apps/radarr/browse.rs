@@ -15,7 +15,7 @@ use ratatui::widgets::Widget;
 
 use crate::event::AppSender;
 use crate::radarr::display::{self, MOVIE_SORTS, MovieSort, MovieStatus};
-use crate::radarr::{Client, HistoryRecord, Movie, QueueItem, Release};
+use crate::radarr::{Client, HistoryRecord, Movie, QualityProfile, QueueItem, Release, RootFolder};
 use crate::ui::input::TextInput;
 use crate::ui::text::{truncate, wrap_text};
 use crate::ui::{prompt, theme};
@@ -46,12 +46,52 @@ enum Level {
     Search {
         movie: Movie,
     },
+    /// Add a new movie: a persistent search box over movie/lookup and its
+    /// results, from which the add wizard starts.
+    Add,
 }
 
 /// A pending yes/no decision; modal while set.
 enum Confirm {
     DeleteFile { file_id: i64 },
     Grab { index: usize },
+}
+
+/// One step of the add wizard, in order. Radarr walks all five.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AddStep {
+    RootFolder,
+    QualityProfile,
+    MinAvailability,
+    Monitored,
+    Download,
+}
+
+impl AddStep {
+    /// The step after this one, or `None` to commit the add.
+    fn next(self) -> Option<AddStep> {
+        match self {
+            AddStep::RootFolder => Some(AddStep::QualityProfile),
+            AddStep::QualityProfile => Some(AddStep::MinAvailability),
+            AddStep::MinAvailability => Some(AddStep::Monitored),
+            AddStep::Monitored => Some(AddStep::Download),
+            AddStep::Download => None,
+        }
+    }
+}
+
+/// The in-progress add wizard: which result is being added, the current step
+/// with its selection cursor, and the choices gathered so far. Modal while
+/// `Some`.
+struct AddFlow {
+    result: usize,
+    step: AddStep,
+    cursor: usize,
+    root_folder: Option<String>,
+    quality_profile_id: Option<i64>,
+    min_availability: usize,
+    monitored: bool,
+    search: bool,
 }
 
 /// What the browse screen wants its parent (the Radarr app) to do.
@@ -88,6 +128,19 @@ pub struct Browse {
     confirm: Option<Confirm>,
     /// Cursor into the selected release's rejection list; `None` when closed.
     rejections_popup: Option<usize>,
+
+    // The add-new flow (Level::Add): a persistent search box, its lookup
+    // results, the wizard prerequisites, and the wizard itself when open.
+    add_search: TextInput,
+    add_search_focused: bool,
+    add_results: Vec<Movie>,
+    add_cursor: usize,
+    root_folders: Vec<RootFolder>,
+    quality_profiles: Vec<QualityProfile>,
+    /// Generation of the latest add-prerequisites fetch, independent of list
+    /// fetches so a lookup can never invalidate it.
+    add_prereq_gen: u64,
+    add_flow: Option<AddFlow>,
 
     /// Full-screen scrollable overview on the detail level.
     overview_fullscreen: bool,
@@ -137,6 +190,14 @@ impl Browse {
             search_menu: None,
             confirm: None,
             rejections_popup: None,
+            add_search: TextInput::default(),
+            add_search_focused: false,
+            add_results: Vec::new(),
+            add_cursor: 0,
+            root_folders: Vec::new(),
+            quality_profiles: Vec::new(),
+            add_prereq_gen: 0,
+            add_flow: None,
             overview_fullscreen: false,
             overview_scroll: 0,
             show_full_help: false,
@@ -272,7 +333,7 @@ impl Browse {
                 // grab) must also refresh the embedded copy the detail
                 // renders from.
                 let embedded = match &mut self.level {
-                    Level::MovieList => None,
+                    Level::MovieList | Level::Add => None,
                     Level::MovieDetail { movie } | Level::Search { movie } => Some(movie),
                 };
                 if let Some(movie) = embedded
@@ -393,6 +454,85 @@ impl Browse {
         false
     }
 
+    /// Add-flow lookup results. Same contract as `on_movies_loaded`; shares
+    /// `fetch_gen`, so a superseded lookup is dropped.
+    #[must_use]
+    pub fn on_lookup_loaded(
+        &mut self,
+        fetch_gen: u64,
+        result: Result<Vec<Movie>, crate::radarr::Error>,
+    ) -> bool {
+        if fetch_gen != self.fetch_gen {
+            return false; // stale response from a superseded lookup
+        }
+        self.loading = false;
+        match result {
+            Ok(list) => {
+                self.add_results = list;
+                self.add_cursor = 0;
+            }
+            Err(crate::radarr::Error::Unauthorized) => return true,
+            Err(err) => self.error = Some(err.to_string()),
+        }
+        false
+    }
+
+    /// Add-wizard prerequisites. Checked against `add_prereq_gen`, not the
+    /// list generation. A non-401 failure just leaves the pickers empty (the
+    /// wizard then refuses to open), so it is logged, not shown.
+    #[must_use]
+    pub fn on_add_options_loaded(
+        &mut self,
+        prereq_gen: u64,
+        result: Result<(Vec<RootFolder>, Vec<QualityProfile>), crate::radarr::Error>,
+    ) -> bool {
+        if prereq_gen != self.add_prereq_gen {
+            return false;
+        }
+        match result {
+            Ok((folders, profiles)) => {
+                self.root_folders = folders;
+                self.quality_profiles = profiles;
+            }
+            Err(crate::radarr::Error::Unauthorized) => return true,
+            Err(err) => tracing::debug!(%err, "add options fetch failed"),
+        }
+        false
+    }
+
+    /// The add finished. Same contract as `on_movies_loaded`; on success we
+    /// jump straight to the created movie and refetch the library so it is
+    /// present when the user pops back.
+    #[must_use]
+    pub fn on_movie_added(
+        &mut self,
+        fetch_gen: u64,
+        result: Result<Box<Movie>, crate::radarr::Error>,
+    ) -> bool {
+        if fetch_gen != self.fetch_gen {
+            return false; // superseded: the user moved on meanwhile
+        }
+        if matches!(result, Err(crate::radarr::Error::Unauthorized)) {
+            return true;
+        }
+        self.loading = false;
+        match result {
+            Ok(movie) => {
+                self.overview_scroll = 0;
+                self.level = Level::MovieDetail { movie: *movie };
+                self.add_results.clear();
+                self.add_search.clear();
+                self.add_search_focused = false;
+                self.fetch_movies();
+                self.fetch_queue();
+                // Set AFTER the refetch, which clears the notice row.
+                self.notice = Some("movie added".into());
+            }
+            Err(err) => self.error = Some(err.to_string()),
+        }
+        false
+    }
+
     /// Return from the search level to the movie detail and refetch: the
     /// caller just changed server state.
     fn pop_to_detail(&mut self) {
@@ -447,6 +587,7 @@ impl Browse {
             Level::MovieList => Some((&mut self.movie_cursor, self.movies.len())),
             Level::MovieDetail { .. } => None,
             Level::Search { .. } => Some((&mut self.release_cursor, self.releases.len())),
+            Level::Add => Some((&mut self.add_cursor, self.add_results.len())),
         }
     }
 
@@ -468,6 +609,7 @@ impl Browse {
                     });
                 }
             }
+            Level::Add => self.start_add_flow(),
         }
     }
 
@@ -486,6 +628,13 @@ impl Browse {
                 self.level = Level::MovieDetail { movie };
                 true
             }
+            Level::Add => {
+                self.add_results.clear();
+                self.add_search.clear();
+                self.add_search_focused = false;
+                self.add_flow = None;
+                true
+            }
         }
     }
 
@@ -498,6 +647,13 @@ impl Browse {
             Level::Search { movie } => {
                 let id = movie.id;
                 self.fetch_releases(id);
+            }
+            Level::Add => {
+                self.fetch_add_options();
+                let term = self.add_search.value().to_string();
+                if !term.trim().is_empty() {
+                    self.fetch_lookup(term);
+                }
             }
         }
     }
@@ -544,6 +700,204 @@ impl Browse {
         }
     }
 
+    /// Open the add-new screen: a fresh search box (focused) and its wizard
+    /// prerequisites fetched in the background.
+    fn enter_add(&mut self) {
+        self.level = Level::Add;
+        self.add_search.clear();
+        self.add_search_focused = true;
+        self.add_search.focused = true;
+        self.add_results.clear();
+        self.add_cursor = 0;
+        self.add_flow = None;
+        self.error = None;
+        self.notice = None;
+        self.fetch_add_options();
+    }
+
+    /// Fetch the root folders and quality profiles the wizard picks from, on
+    /// their own generation so a lookup can't invalidate them.
+    fn fetch_add_options(&mut self) {
+        self.add_prereq_gen = self.gen_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        let prereq_gen = self.add_prereq_gen;
+        let client = self.client.clone();
+        let sender = self.sender.clone();
+        tokio::spawn(async move {
+            let result: Result<_, crate::radarr::Error> = async {
+                let folders = client.get_root_folders().await?;
+                let profiles = client.get_quality_profiles().await?;
+                Ok((folders, profiles))
+            }
+            .await;
+            sender.send(Msg::AddOptionsLoaded { prereq_gen, result });
+        });
+    }
+
+    /// Run a lookup for the add screen; an empty term just clears the list.
+    fn fetch_lookup(&mut self, term: String) {
+        if term.trim().is_empty() {
+            self.add_results.clear();
+            self.add_cursor = 0;
+            return;
+        }
+        let fetch_gen = self.begin_fetch();
+        let client = self.client.clone();
+        let sender = self.sender.clone();
+        tokio::spawn(async move {
+            let result = client.lookup_movies(&term).await;
+            sender.send(Msg::LookupLoaded { fetch_gen, result });
+        });
+    }
+
+    /// Open the add wizard for the highlighted result; refuses if the
+    /// prerequisites haven't loaded (or none are configured).
+    fn start_add_flow(&mut self) {
+        if self.add_cursor >= self.add_results.len() {
+            return;
+        }
+        if self.root_folders.is_empty() || self.quality_profiles.is_empty() {
+            self.notice =
+                Some("add options unavailable: need a root folder and a quality profile".into());
+            return;
+        }
+        self.add_flow = Some(AddFlow {
+            result: self.add_cursor,
+            step: AddStep::RootFolder,
+            cursor: 0,
+            root_folder: None,
+            quality_profile_id: None,
+            min_availability: 0,
+            monitored: true,
+            search: true,
+        });
+    }
+
+    /// Options for the wizard's current step; the count clamps the cursor and
+    /// the labels are what `draw_menu` renders.
+    fn add_step_menu(&self) -> (String, Vec<String>) {
+        let Some(flow) = &self.add_flow else {
+            return (String::new(), Vec::new());
+        };
+        match flow.step {
+            AddStep::RootFolder => (
+                "Root folder".to_string(),
+                self.root_folders.iter().map(|f| f.path.clone()).collect(),
+            ),
+            AddStep::QualityProfile => (
+                "Quality profile".to_string(),
+                self.quality_profiles
+                    .iter()
+                    .map(|p| p.name.clone())
+                    .collect(),
+            ),
+            AddStep::MinAvailability => (
+                "Minimum availability".to_string(),
+                MIN_AVAILABILITY
+                    .iter()
+                    .map(|(label, _)| label.to_string())
+                    .collect(),
+            ),
+            AddStep::Monitored => (
+                "Monitor this movie?".to_string(),
+                vec!["Yes".to_string(), "No".to_string()],
+            ),
+            AddStep::Download => (
+                "Search & download now?".to_string(),
+                vec!["Yes".to_string(), "No".to_string()],
+            ),
+        }
+    }
+
+    fn add_step_option_count(&self) -> usize {
+        let Some(flow) = &self.add_flow else {
+            return 0;
+        };
+        match flow.step {
+            AddStep::RootFolder => self.root_folders.len(),
+            AddStep::QualityProfile => self.quality_profiles.len(),
+            AddStep::MinAvailability => MIN_AVAILABILITY.len(),
+            AddStep::Monitored | AddStep::Download => 2,
+        }
+    }
+
+    /// Record the current step's selection and move to the next; commit once
+    /// the last step is answered.
+    fn advance_add_flow(&mut self) {
+        let Some(flow) = self.add_flow.as_ref() else {
+            return;
+        };
+        let (step, cursor) = (flow.step, flow.cursor);
+        match step {
+            AddStep::RootFolder => {
+                let path = self.root_folders.get(cursor).map(|f| f.path.clone());
+                if let Some(flow) = self.add_flow.as_mut() {
+                    flow.root_folder = path;
+                }
+            }
+            AddStep::QualityProfile => {
+                let id = self.quality_profiles.get(cursor).map(|p| p.id);
+                if let Some(flow) = self.add_flow.as_mut() {
+                    flow.quality_profile_id = id;
+                }
+            }
+            AddStep::MinAvailability => {
+                if let Some(flow) = self.add_flow.as_mut() {
+                    flow.min_availability = cursor;
+                }
+            }
+            AddStep::Monitored => {
+                if let Some(flow) = self.add_flow.as_mut() {
+                    flow.monitored = cursor == 0;
+                }
+            }
+            AddStep::Download => {
+                if let Some(flow) = self.add_flow.as_mut() {
+                    flow.search = cursor == 0;
+                }
+            }
+        }
+        match step.next() {
+            Some(next) => {
+                if let Some(flow) = self.add_flow.as_mut() {
+                    flow.step = next;
+                    flow.cursor = 0;
+                }
+            }
+            None => self.commit_add(),
+        }
+    }
+
+    /// Build the add payload from the finished wizard and POST it.
+    fn commit_add(&mut self) {
+        let Some(flow) = self.add_flow.take() else {
+            return;
+        };
+        let Some(movie) = self.add_results.get(flow.result).cloned() else {
+            return;
+        };
+        let min_availability = MIN_AVAILABILITY
+            .get(flow.min_availability)
+            .map(|(_, value)| *value)
+            .unwrap_or("announced");
+        let body = serde_json::json!({
+            "tmdbId": movie.tmdb_id,
+            "title": movie.title,
+            "year": movie.year,
+            "qualityProfileId": flow.quality_profile_id,
+            "rootFolderPath": flow.root_folder,
+            "monitored": flow.monitored,
+            "minimumAvailability": min_availability,
+            "addOptions": { "searchForMovie": flow.search },
+        });
+        let fetch_gen = self.begin_fetch();
+        let client = self.client.clone();
+        let sender = self.sender.clone();
+        tokio::spawn(async move {
+            let result = client.add_movie(&body).await.map(Box::new);
+            sender.send(Msg::MovieAdded { fetch_gen, result });
+        });
+    }
+
     pub fn on_key(&mut self, key: KeyEvent) -> Option<BrowseAction> {
         if self.filter_focused {
             match key.code {
@@ -569,9 +923,50 @@ impl Browse {
             return None;
         }
 
+        // The add-screen search box: enter runs the lookup, esc/tab/arrows
+        // just unfocus so the results can be navigated.
+        if self.add_search_focused {
+            match key.code {
+                KeyCode::Enter => {
+                    self.add_search_focused = false;
+                    let term = self.add_search.value().to_string();
+                    self.fetch_lookup(term);
+                }
+                KeyCode::Esc | KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => {
+                    self.add_search_focused = false;
+                }
+                _ => {
+                    self.add_search.on_key(key);
+                }
+            }
+            self.add_search.focused = self.add_search_focused;
+            return None;
+        }
+
         // The shell only claims ctrl+c/arrows/digits; don't let other
         // ctrl/alt-modified chars fall through to single-letter shortcuts.
         if crate::app::modified_char(&key) {
+            return None;
+        }
+
+        // The add wizard is modal: while open it owns every key.
+        if self.add_flow.is_some() {
+            let count = self.add_step_option_count();
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if let Some(flow) = self.add_flow.as_mut() {
+                        flow.cursor = flow.cursor.saturating_sub(1);
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if let Some(flow) = self.add_flow.as_mut() {
+                        flow.cursor = (flow.cursor + 1).min(count.saturating_sub(1));
+                    }
+                }
+                KeyCode::Enter => self.advance_add_flow(),
+                KeyCode::Esc | KeyCode::Char('q') => self.add_flow = None,
+                _ => {}
+            }
             return None;
         }
 
@@ -715,6 +1110,13 @@ impl Browse {
                 self.filter_focused = true;
                 self.filter.focused = true;
             }
+            // Re-focus the add search box and scroll its results back to top.
+            KeyCode::Char('/') if matches!(self.level, Level::Add) => {
+                self.add_search_focused = true;
+                self.add_search.focused = true;
+                self.add_cursor = 0;
+            }
+            KeyCode::Char('a') if matches!(self.level, Level::MovieList) => self.enter_add(),
             KeyCode::Esc | KeyCode::Backspace => {
                 if !self.pop_level() && self.filter_active && key.code == KeyCode::Esc {
                     self.filter.clear();
@@ -763,12 +1165,14 @@ impl Browse {
         self.last_height = area.height;
         let has_message = self.error.is_some() || self.notice.is_some();
         let show_filter = self.filter_active && matches!(self.level, Level::MovieList);
+        let show_add_input = matches!(self.level, Level::Add);
+        let show_input = show_filter || show_add_input;
         let help_height = if self.show_full_help { 8 } else { 1 };
 
         let rows = Layout::vertical([
             Constraint::Length(if has_message { 1 } else { 0 }),
             Constraint::Length(2), // breadcrumb row + spacer
-            Constraint::Length(if show_filter { 2 } else { 0 }),
+            Constraint::Length(if show_input { 2 } else { 0 }),
             Constraint::Fill(1), // level content
             Constraint::Length(help_height),
         ])
@@ -783,6 +1187,8 @@ impl Browse {
         self.draw_breadcrumb(frame, rows[1]);
         if show_filter {
             self.draw_filter_row(frame, rows[2]);
+        } else if show_add_input {
+            self.draw_add_row(frame, rows[2]);
         }
         if self.overview_fullscreen {
             self.draw_overview_fullscreen(frame, rows[3]);
@@ -791,6 +1197,7 @@ impl Browse {
                 Level::MovieList => self.draw_movie_list(frame, rows[3]),
                 Level::MovieDetail { .. } => self.draw_movie_detail(frame, rows[3]),
                 Level::Search { .. } => self.draw_search(frame, rows[3]),
+                Level::Add => self.draw_add_results(frame, rows[3]),
             }
         }
         self.draw_help(frame, rows[4]);
@@ -826,6 +1233,12 @@ impl Browse {
             };
             prompt::draw_confirm(frame, area, question);
         }
+        if self.add_flow.is_some() {
+            let (title, options) = self.add_step_menu();
+            let labels: Vec<&str> = options.iter().map(String::as_str).collect();
+            let cursor = self.add_flow.as_ref().map(|flow| flow.cursor).unwrap_or(0);
+            prompt::draw_menu(frame, area, &title, &labels, cursor);
+        }
     }
 
     fn breadcrumb(&self) -> String {
@@ -834,6 +1247,14 @@ impl Browse {
             Level::MovieList => "Movies".to_string(),
             Level::MovieDetail { movie } => title(movie),
             Level::Search { movie } => format!("{} / search", title(movie)),
+            Level::Add => {
+                let term = self.add_search.value();
+                if term.is_empty() {
+                    "Add movie".to_string()
+                } else {
+                    format!("Add movie / {term}")
+                }
+            }
         }
     }
 
@@ -863,6 +1284,80 @@ impl Browse {
         Line::styled("  Filter: ", Style::new().fg(theme::fg()))
             .render(prompt_area, frame.buffer_mut());
         self.filter.render(input_area, frame.buffer_mut());
+    }
+
+    fn draw_add_row(&self, frame: &mut Frame, area: Rect) {
+        let [row, _] = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
+        let [prompt_area, input_area] =
+            Layout::horizontal([Constraint::Length(10), Constraint::Fill(1)]).areas(row);
+        Line::styled("  Search: ", Style::new().fg(theme::fg()))
+            .render(prompt_area, frame.buffer_mut());
+        self.add_search.render(input_area, frame.buffer_mut());
+    }
+
+    /// Add-screen results: title, "year • rating • runtime", one truncated
+    /// overview line, and a blank spacer (4 rows each).
+    fn draw_add_results(&self, frame: &mut Frame, area: Rect) {
+        let buf = frame.buffer_mut();
+        if self.add_results.is_empty() {
+            let message = if self.loading {
+                "  Searching..."
+            } else if self.add_search.value().trim().is_empty() {
+                "  Type a title or tmdb:<id>, then enter to search."
+            } else {
+                "  No results."
+            };
+            Line::styled(message.to_string(), theme::dim()).render(area, buf);
+            return;
+        }
+        let avail_height = area.height as usize;
+        let items_per_page = (avail_height / 4).max(1);
+        let first = Self::window_start(self.add_cursor, self.add_results.len(), items_per_page);
+        let last = (first + items_per_page).min(self.add_results.len());
+        let text_width = area.width.saturating_sub(6) as usize;
+
+        let gutter = |accent: bool| {
+            if accent {
+                Span::styled(" │ ", Style::new().fg(theme::accent_bright()))
+            } else {
+                Span::raw("   ")
+            }
+        };
+        let row = |x: u16, y: u16| Rect::new(x, y, area.width.saturating_sub(1), 1);
+
+        let mut y = area.y;
+        for (i, movie) in self.add_results.iter().enumerate().take(last).skip(first) {
+            let selected = i == self.add_cursor;
+            let title = truncate(movie.title.as_deref().unwrap_or("(untitled)"), text_width);
+            let meta = truncate(&display::movie_meta(movie), text_width);
+            let overview = truncate(movie.overview.as_deref().unwrap_or_default(), text_width);
+
+            let title_style = if selected {
+                Style::new()
+                    .fg(theme::accent_bright())
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::new().fg(theme::fg())
+            };
+            let meta_style = if selected {
+                Style::new().fg(theme::accent_color())
+            } else {
+                theme::dim()
+            };
+
+            if y + 2 < area.y + area.height {
+                Line::from(vec![gutter(selected), Span::styled(title, title_style)])
+                    .render(row(area.x, y), buf);
+                Line::from(vec![gutter(selected), Span::styled(meta, meta_style)])
+                    .render(row(area.x, y + 1), buf);
+                Line::from(vec![gutter(selected), Span::styled(overview, theme::dim())])
+                    .render(row(area.x, y + 2), buf);
+            }
+            y += 4;
+        }
+        if self.add_results.len() > items_per_page {
+            Self::draw_scrollbar(buf, area, self.add_cursor, self.add_results.len());
+        }
     }
 
     /// The centered window of a cursor list: which item to draw first.
@@ -1270,6 +1765,12 @@ impl Browse {
         if self.filter_focused {
             return vec![("esc", "cancel"), ("enter", "apply")];
         }
+        if self.add_search_focused {
+            return vec![("esc", "unfocus"), ("enter", "search")];
+        }
+        if self.add_flow.is_some() {
+            return vec![("j/k", "move"), ("enter", "next"), ("esc", "cancel")];
+        }
         if self.confirm.is_some() {
             return vec![("y/enter", "confirm"), ("n/esc", "cancel")];
         }
@@ -1286,6 +1787,7 @@ impl Browse {
         match &self.level {
             Level::MovieList => {
                 entries.push(("enter", "open"));
+                entries.push(("a", "add"));
                 entries.push(("/", "filter"));
                 if self.filter_active {
                     entries.push(("esc", "clear"));
@@ -1309,6 +1811,11 @@ impl Browse {
                 {
                     entries.push(("x", "rejections"));
                 }
+            }
+            Level::Add => {
+                entries.push(("enter", "add"));
+                entries.push(("/", "search"));
+                entries.push(("esc", "back"));
             }
         }
         entries.push(("r", "refresh"));
@@ -1391,3 +1898,11 @@ impl Browse {
 }
 
 const SEARCH_MENU_OPTIONS: [&str; 3] = ["Auto search", "Interactive search", "Cancel"];
+
+/// Radarr's minimumAvailability options for the add wizard: (menu label, API
+/// value).
+const MIN_AVAILABILITY: [(&str, &str); 3] = [
+    ("Announced", "announced"),
+    ("In Cinemas", "inCinemas"),
+    ("Released", "released"),
+];

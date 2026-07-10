@@ -8,7 +8,7 @@ pub mod models;
 use reqwest::Method;
 
 pub use crate::arr::Error;
-pub use models::{HistoryRecord, Movie, QueueItem, Release};
+pub use models::{HistoryRecord, Movie, QualityProfile, QueueItem, Release, RootFolder};
 
 #[derive(Clone, Debug)] // derived Debug is safe: Transport redacts the key
 pub struct Client {
@@ -39,6 +39,31 @@ impl Client {
     /// extra params are needed. Callers filter client-side.
     pub async fn get_queue(&self) -> Result<Vec<QueueItem>, Error> {
         self.transport.get_queue(&[]).await
+    }
+
+    /// Look up movies to add, by free text or by `tmdb:<id>` / `imdb:<id>`;
+    /// the server parses the prefix itself, so id searches need no special
+    /// handling. Hits are shaped like library movies but have id 0.
+    pub async fn lookup_movies(&self, term: &str) -> Result<Vec<Movie>, Error> {
+        self.transport
+            .request(Method::GET, "/api/v3/movie/lookup", &[("term", term)], None)
+            .await
+    }
+
+    /// Add a movie from a built payload and return the created movie (with
+    /// its new id), so the UI can open its detail straight away.
+    pub async fn add_movie(&self, body: &serde_json::Value) -> Result<Movie, Error> {
+        self.transport
+            .send_json(Method::POST, "/api/v3/movie", &[], Some(body), None)
+            .await
+    }
+
+    pub async fn get_root_folders(&self) -> Result<Vec<RootFolder>, Error> {
+        self.transport.get_root_folders().await
+    }
+
+    pub async fn get_quality_profiles(&self) -> Result<Vec<QualityProfile>, Error> {
+        self.transport.get_quality_profiles().await
     }
 
     pub async fn search_releases(&self, movie_id: i64) -> Result<Vec<Release>, Error> {

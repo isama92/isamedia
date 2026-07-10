@@ -111,6 +111,22 @@ pub struct HistoryRecord {
     pub data: std::collections::HashMap<String, serde_json::Value>,
 }
 
+/// A configured library root, offered as a target when adding a new item.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RootFolder {
+    pub path: String,
+    pub accessible: bool,
+}
+
+/// A named quality profile the add flow lets the user pick by name.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct QualityProfile {
+    pub id: i64,
+    pub name: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,5 +252,27 @@ mod tests {
             record.data.get("guid").and_then(|v| v.as_str()),
             Some("magnet-abc")
         );
+    }
+
+    #[test]
+    fn deserializes_add_prerequisites() {
+        let folders = r#"[
+            { "id": 1, "path": "/movies", "accessible": true, "freeSpace": 1000 },
+            { "id": 2, "path": "/movies-4k", "accessible": false }
+        ]"#;
+        let folders: Vec<RootFolder> = serde_json::from_str(folders).unwrap();
+        assert_eq!(folders.len(), 2);
+        assert_eq!(folders[0].path, "/movies");
+        assert!(folders[0].accessible);
+        assert!(!folders[1].accessible);
+
+        let profiles = r#"[
+            { "id": 4, "name": "HD-1080p", "items": [] },
+            { "id": 6, "name": "Any" }
+        ]"#;
+        let profiles: Vec<QualityProfile> = serde_json::from_str(profiles).unwrap();
+        assert_eq!(profiles.len(), 2);
+        assert_eq!(profiles[0].id, 4);
+        assert_eq!(profiles[1].name, "Any");
     }
 }
