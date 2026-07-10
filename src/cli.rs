@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-/// Terminal client for Jellyfin, with Sonarr and Radarr support planned.
+/// Terminal client for Jellyfin, Radarr and Sonarr.
 #[derive(Debug, Parser)]
 #[command(name = "isamedia", version, about)]
 pub struct Cli {
