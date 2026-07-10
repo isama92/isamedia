@@ -29,9 +29,9 @@ pub enum Error {
     Http(#[from] reqwest::Error),
 }
 
-/// Everything needed to (re)connect. Mirrors the jellyfin section of the
-/// config file.
-#[derive(Debug, Clone)]
+/// Everything needed to (re)connect: the jellyfin config section plus the
+/// secrets fetched from the OS keyring.
+#[derive(Clone)]
 pub struct Credentials {
     pub host: String,
     pub username: String,
@@ -43,13 +43,41 @@ pub struct Credentials {
     pub user_id: String,
 }
 
-#[derive(Debug, Clone)]
+// Hand-written so `{:?}` can never leak a secret into a log, no matter how
+// carelessly a Credentials/Client ends up in a tracing call.
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials")
+            .field("host", &self.host)
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .field("device", &self.device)
+            .field("device_id", &self.device_id)
+            .field("version", &self.version)
+            .field("token", &"<redacted>")
+            .field("user_id", &self.user_id)
+            .finish()
+    }
+}
+
+#[derive(Clone)]
 pub struct Client {
     http: reqwest::Client,
     pub host: String,
     pub user_id: String,
     pub token: String,
     auth_header: String,
+}
+
+impl std::fmt::Debug for Client {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Client")
+            .field("host", &self.host)
+            .field("user_id", &self.user_id)
+            .field("token", &"<redacted>")
+            .field("auth_header", &"<redacted>")
+            .finish_non_exhaustive()
+    }
 }
 
 fn auth_header(device: &str, device_id: &str, version: &str, token: Option<&str>) -> String {
@@ -295,6 +323,36 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_never_prints_secrets() {
+        let creds = Credentials {
+            host: "https://jf.example.com".into(),
+            username: "me".into(),
+            password: "hunter2".into(),
+            device: "box".into(),
+            device_id: "dev-1".into(),
+            version: "0.1.0".into(),
+            token: "sekret-token".into(),
+            user_id: "uid".into(),
+        };
+        let debug = format!("{creds:?}");
+        assert!(!debug.contains("hunter2"), "{debug}");
+        assert!(!debug.contains("sekret-token"), "{debug}");
+        assert!(debug.contains("<redacted>"));
+        // The username/host still print, which is what makes Debug useful.
+        assert!(debug.contains("jf.example.com"));
+
+        let client = Client {
+            http: reqwest::Client::new(),
+            host: "https://jf.example.com".into(),
+            user_id: "uid".into(),
+            token: "sekret-token".into(),
+            auth_header: "MediaBrowser Token=\"sekret-token\"".into(),
+        };
+        let debug = format!("{client:?}");
+        assert!(!debug.contains("sekret-token"), "{debug}");
+    }
 
     /// Smoke test against the public Jellyfin demo server; run manually with
     /// `cargo test demo_server -- --ignored`.

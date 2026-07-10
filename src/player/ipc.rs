@@ -18,8 +18,14 @@ pub type IpcStream = tokio::net::windows::named_pipe::NamedPipeClient;
 pub fn socket_path(unique: u128) -> String {
     #[cfg(unix)]
     {
-        std::env::temp_dir()
-            .join(format!("isamedia-mpv-{unique}"))
+        // Anyone who can connect to this socket can run arbitrary mpv
+        // commands (including `run`), so prefer the per-user 0700
+        // $XDG_RUNTIME_DIR over world-readable /tmp, where only the umask
+        // stands between the socket and other local users.
+        let dir = directories::BaseDirs::new()
+            .and_then(|dirs| dirs.runtime_dir().map(std::path::Path::to_path_buf))
+            .unwrap_or_else(std::env::temp_dir);
+        dir.join(format!("isamedia-mpv-{unique}"))
             .to_string_lossy()
             .into_owned()
     }
