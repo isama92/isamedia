@@ -1,0 +1,46 @@
+name: Release-plz
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+# Never cancel a release mid-flight.
+concurrency:
+  group: release-plz-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-plz:
+    name: Release-plz
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          # release-plz needs full history + tags to build the changelog and
+          # find the last release.
+          fetch-depth: 0
+          # Use the PAT/App token (not GITHUB_TOKEN) so the release PR and the
+          # published release can trigger other workflows (ci.yml, release.yml).
+          token: ${{ secrets.RELEASE_PLZ_TOKEN }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
+
+      # No command specified: the action runs `release-pr` (open/update the
+      # "chore: release X.Y.Z" PR) and `release` (tag + GitHub release once that
+      # PR is merged). No crates.io publish because Cargo.toml sets
+      # publish = false.
+      - name: Run release-plz
+        uses: release-plz/action@e8792575c7f2366cf6ff3ccc33ead9ace5b691c7 # v0.5.130
+        with:
+          config: .github/release-plz.toml
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
