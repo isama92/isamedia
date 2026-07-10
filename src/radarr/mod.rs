@@ -8,7 +8,7 @@ pub mod models;
 use reqwest::Method;
 
 pub use crate::arr::Error;
-pub use models::{HistoryRecord, Movie, QualityProfile, QueueItem, Release, RootFolder};
+pub use models::{Command, HistoryRecord, Movie, QualityProfile, QueueItem, Release, RootFolder};
 
 #[derive(Clone, Debug)] // derived Debug is safe: Transport redacts the key
 pub struct Client {
@@ -97,18 +97,24 @@ impl Client {
         self.transport.grab_release(guid, indexer_id).await
     }
 
-    /// Kick off Radarr's own automatic search for one movie.
-    pub async fn movie_search(&self, movie_id: i64) -> Result<(), Error> {
+    /// Kick off Radarr's own automatic search for one movie. Returns the
+    /// created command so a background monitor can poll it to completion (see
+    /// [`get_command`](Self::get_command)).
+    pub async fn movie_search(&self, movie_id: i64) -> Result<Command, Error> {
         self.transport
-            .send(
+            .send_json(
                 Method::POST,
                 "/api/v3/command",
                 &[],
                 Some(&serde_json::json!({ "name": "MoviesSearch", "movieIds": [movie_id] })),
                 None,
             )
-            .await?;
-        Ok(())
+            .await
+    }
+
+    /// Poll one command's status by id; see `arr::Transport::get_command`.
+    pub async fn get_command(&self, command_id: i64) -> Result<Command, Error> {
+        self.transport.get_command(command_id).await
     }
 
     pub async fn delete_movie_file(&self, file_id: i64) -> Result<(), Error> {

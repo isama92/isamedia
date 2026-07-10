@@ -307,12 +307,41 @@ impl MediaApp for SonarrApp {
                     self.on_session_expired();
                 }
             }
+            Msg::AutoSearchStarted {
+                auto_search_gen,
+                result,
+            } => {
+                if let Screen::Browse(browse) = &mut self.screen
+                    && browse.on_auto_search_started(auto_search_gen, result)
+                {
+                    self.on_session_expired();
+                }
+            }
+            Msg::AutoSearchPolled {
+                auto_search_gen,
+                result,
+            } => {
+                if let Screen::Browse(browse) = &mut self.screen
+                    && browse.on_auto_search_polled(auto_search_gen, result)
+                {
+                    self.on_session_expired();
+                }
+            }
             Msg::KeyringError(message) => {
                 tracing::warn!(message, "keyring problem");
                 if let Screen::Browse(browse) = &mut self.screen {
                     browse.error = Some(message);
                 }
             }
+        }
+    }
+
+    /// Surface the background auto-search status in the shell status bar, so
+    /// it stays visible even from another tab.
+    fn status_line(&self) -> Option<Line<'static>> {
+        match &self.screen {
+            Screen::Browse(browse) => browse.status_line(),
+            _ => None,
         }
     }
 

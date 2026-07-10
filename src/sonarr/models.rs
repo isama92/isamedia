@@ -6,8 +6,8 @@
 use serde::Deserialize;
 
 pub use crate::arr::models::{
-    HistoryRecord, Language, MediaInfo, QualityProfile, QualityWrapper, QueueItem, Release,
-    RootFolder,
+    Command, HistoryRecord, Language, MediaInfo, QualityProfile, QualityWrapper, QueueItem,
+    Release, RootFolder,
 };
 
 #[derive(Debug, Clone, Default, Deserialize)]

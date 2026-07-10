@@ -9,7 +9,9 @@ pub mod models;
 use reqwest::Method;
 
 pub use crate::arr::Error;
-pub use models::{Episode, HistoryRecord, QualityProfile, QueueItem, Release, RootFolder, Series};
+pub use models::{
+    Command, Episode, HistoryRecord, QualityProfile, QueueItem, Release, RootFolder, Series,
+};
 
 use crate::arr::models::Page;
 
@@ -134,6 +136,26 @@ impl Client {
             )
             .await?;
         Ok(())
+    }
+
+    /// Kick off Sonarr's automatic search across a whole series (every
+    /// monitored missing episode). Returns the created command so a background
+    /// monitor can poll it to completion (see [`get_command`](Self::get_command)).
+    pub async fn series_search(&self, series_id: i64) -> Result<Command, Error> {
+        self.transport
+            .send_json(
+                Method::POST,
+                "/api/v3/command",
+                &[],
+                Some(&serde_json::json!({ "name": "SeriesSearch", "seriesId": series_id })),
+                None,
+            )
+            .await
+    }
+
+    /// Poll one command's status by id; see `arr::Transport::get_command`.
+    pub async fn get_command(&self, command_id: i64) -> Result<Command, Error> {
+        self.transport.get_command(command_id).await
     }
 
     pub async fn delete_episode_file(&self, file_id: i64) -> Result<(), Error> {
