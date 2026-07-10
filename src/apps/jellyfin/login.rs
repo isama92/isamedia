@@ -62,11 +62,7 @@ impl LoginForm {
     /// Plain http means the password and token cross the network unencrypted.
     /// Legitimate on a trusted LAN, but worth a visible nudge.
     fn plain_http(&self) -> bool {
-        self.host
-            .value()
-            .trim()
-            .to_ascii_lowercase()
-            .starts_with("http://")
+        crate::jellyfin::url::is_plain_http(self.host.value())
     }
 
     fn valid(&self) -> bool {

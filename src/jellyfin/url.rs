@@ -34,6 +34,12 @@ pub fn stream_url(host: &str, item_id: &str) -> Result<String, Error> {
     Ok(format!("{host}/videos/{item_id}/stream?static=true"))
 }
 
+/// True when the host uses unencrypted http://, so callers can warn that
+/// credentials and traffic cross the network in cleartext.
+pub fn is_plain_http(host: &str) -> bool {
+    host.trim().to_ascii_lowercase().starts_with("http://")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
