@@ -30,21 +30,14 @@ impl Config {
         Ok(dirs.config_dir().join("config.toml"))
     }
 
-    /// Load the config, creating it on first run. When no isamedia config
-    /// exists yet, credentials are imported from an existing jfsh config so
-    /// the user does not have to log in again.
+    /// Load the config, creating an empty one on first run (the login screen
+    /// collects credentials).
     pub fn load_or_init(path: &Path) -> Result<Self> {
         let mut config = if path.exists() {
             let raw = std::fs::read_to_string(path)
                 .with_context(|| format!("reading config file {}", path.display()))?;
             toml::from_str(&raw)
                 .with_context(|| format!("parsing config file {}", path.display()))?
-        } else if let Some(imported) = import_jfsh_config() {
-            tracing::info!("imported existing jfsh config");
-            Config {
-                jellyfin: imported,
-                ..Config::default()
-            }
         } else {
             Config::default()
         };
@@ -79,57 +72,6 @@ impl Config {
     }
 }
 
-/// Subset of jfsh's YAML config (viper writes lowercase keys).
-#[derive(Debug, Deserialize)]
-struct JfshConfig {
-    #[serde(default)]
-    host: String,
-    #[serde(default)]
-    username: String,
-    #[serde(default)]
-    password: String,
-    #[serde(default)]
-    device: String,
-    #[serde(default)]
-    device_id: String,
-    #[serde(default)]
-    token: String,
-    #[serde(default)]
-    user_id: String,
-    #[serde(default)]
-    skip_segments: Vec<String>,
-}
-
-fn import_jfsh_config() -> Option<JellyfinConfig> {
-    let path = jfsh_config_path()?;
-    let raw = std::fs::read_to_string(&path).ok()?;
-    let jfsh: JfshConfig = serde_yaml::from_str(&raw)
-        .map_err(|err| tracing::warn!(%err, "found jfsh config but failed to parse it"))
-        .ok()?;
-    Some(JellyfinConfig {
-        host: jfsh.host,
-        username: jfsh.username,
-        password: jfsh.password,
-        device: jfsh.device,
-        device_id: jfsh.device_id,
-        token: jfsh.token,
-        user_id: jfsh.user_id,
-        skip_segments: jfsh.skip_segments,
-    })
-}
-
-fn jfsh_config_path() -> Option<PathBuf> {
-    // jfsh uses adrg/xdg: $XDG_CONFIG_HOME/jfsh/jfsh.yaml. On Windows adrg/xdg
-    // maps XDG_CONFIG_HOME to %LOCALAPPDATA%.
-    #[cfg(unix)]
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
-    #[cfg(windows)]
-    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from)?;
-    Some(base.join("jfsh").join("jfsh.yaml"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,12 +101,4 @@ mod tests {
         assert!(parsed.last_app.is_none());
     }
 
-    #[test]
-    fn imports_jfsh_yaml() {
-        let raw = "host: https://jf.example.com\nusername: me\npassword: hunter2\ndevice: box\ndevice_id: abc-123\ntoken: tok\nuser_id: uid\nskip_segments:\n  - Intro\nclient_version: 0.1.0\n";
-        let jfsh: JfshConfig = serde_yaml::from_str(raw).unwrap();
-        assert_eq!(jfsh.host, "https://jf.example.com");
-        assert_eq!(jfsh.device_id, "abc-123");
-        assert_eq!(jfsh.skip_segments, vec!["Intro"]);
-    }
 }
