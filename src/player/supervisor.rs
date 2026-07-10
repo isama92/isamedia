@@ -20,6 +20,21 @@ use super::{PlayerCommand, PlayerEvent, TrackKind, override_key};
 const PROGRESS_REPORT_INTERVAL: Duration = Duration::from_secs(3);
 /// How long to wait for mpv to exit after we ask it to quit.
 const QUIT_GRACE: Duration = Duration::from_secs(5);
+/// How long to wait for queued playback reports (typically the final stopped)
+/// to flush after mpv is gone, bounded so a dead server cannot hold shutdown
+/// hostage.
+const REPORT_FLUSH_GRACE: Duration = Duration::from_secs(5);
+
+/// Worst-case time the supervisor needs after being told to stop: wait for mpv
+/// to obey `quit` (`QUIT_GRACE`), then flush the final report
+/// (`REPORT_FLUSH_GRACE`), plus a 1s margin. The shell's shutdown drain waits
+/// at least this long so it never abandons the supervisor mid-flush, which
+/// would leak the IPC socket and lose the final Stopped report. Derived from
+/// the two budgets so it stays correct if either changes;
+/// `shutdown_budget_covers_supervisor` guards the invariant regardless.
+pub(crate) const SHUTDOWN_BUDGET: Duration = QUIT_GRACE
+    .saturating_add(REPORT_FLUSH_GRACE)
+    .saturating_add(Duration::from_secs(1));
 
 static OLD_MPV: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
 
@@ -279,6 +294,11 @@ pub(super) async fn run(
             return;
         }
     };
+    // The socket file and its fallback directory now exist (or will once mpv
+    // starts); this guard removes them on every exit path from here, including
+    // when the runtime drops this task mid-shutdown, so no explicit
+    // `cleanup_socket` calls are needed below.
+    let _socket_guard = ipc::SocketGuard::new(socket.clone());
 
     let mut child = match tokio::process::Command::new("mpv")
         // `once`, not `yes`: mpv idles waiting for the playlist we load over
@@ -299,8 +319,7 @@ pub(super) async fn run(
             emit(PlayerEvent::Failed(format!(
                 "failed to launch mpv (is it installed and in PATH?): {err}"
             )));
-            // No socket exists yet, but the fallback 0700 directory does.
-            ipc::cleanup_socket(&socket);
+            // The fallback 0700 directory is removed by `_socket_guard`.
             return;
         }
     };
@@ -312,7 +331,6 @@ pub(super) async fn run(
                 "failed to connect to mpv IPC socket: {err}"
             )));
             let _ = child.kill().await;
-            ipc::cleanup_socket(&socket);
             return;
         }
     };
@@ -328,7 +346,6 @@ pub(super) async fn run(
     if let Err(err) = ipc.send(&ipc::observe_property_cmd(1, "time-pos")).await {
         emit(PlayerEvent::Failed(format!("mpv IPC write failed: {err}")));
         let _ = child.kill().await;
-        ipc::cleanup_socket(&socket);
         return;
     }
     let _ = ipc.send(&ipc::observe_property_cmd(2, "duration")).await;
@@ -671,13 +688,13 @@ pub(super) async fn run(
 
     let _ = child.kill().await;
     let _ = child.wait().await;
-    ipc::cleanup_socket(&socket);
+    // The socket is removed by `_socket_guard` when this function returns.
 
     // Let queued reports (typically the final stopped) land before the
     // caller emits Exited and the UI refetches watch state; bounded so a
     // dead server cannot hold shutdown hostage.
     drop(report_tx);
-    if tokio::time::timeout(Duration::from_secs(5), reporter)
+    if tokio::time::timeout(REPORT_FLUSH_GRACE, reporter)
         .await
         .is_err()
     {
@@ -688,6 +705,13 @@ pub(super) async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shutdown_budget_covers_supervisor() {
+        // The shell's drain deadline uses SHUTDOWN_BUDGET; it must cover the
+        // supervisor's own worst case so a slow quit is not abandoned mid-flush.
+        assert!(SHUTDOWN_BUDGET >= QUIT_GRACE + REPORT_FLUSH_GRACE);
+    }
 
     #[test]
     fn load_order_middle_of_series() {

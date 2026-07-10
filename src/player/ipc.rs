@@ -76,6 +76,28 @@ pub fn cleanup_socket(socket: &str) {
     }
 }
 
+/// Removes the mpv IPC socket (and its fallback directory) on drop, so the
+/// socket is cleaned up on EVERY supervisor exit path, including when the
+/// tokio runtime drops the supervisor task mid-shutdown (a forced quit) and
+/// the code after the select loop never runs. mpv is SIGKILLed via
+/// `kill_on_drop` and so cannot remove its own socket; this guard is what
+/// keeps the "removes its IPC socket on every exit path" invariant.
+pub(crate) struct SocketGuard {
+    path: String,
+}
+
+impl SocketGuard {
+    pub(crate) fn new(path: String) -> Self {
+        Self { path }
+    }
+}
+
+impl Drop for SocketGuard {
+    fn drop(&mut self) {
+        cleanup_socket(&self.path);
+    }
+}
+
 async fn try_connect(path: &str) -> io::Result<IpcStream> {
     #[cfg(unix)]
     {
