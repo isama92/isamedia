@@ -5,8 +5,8 @@
 use super::models::{Episode, QueueItem, Season, Series};
 
 pub use crate::arr::display::{
-    GLYPH_DOWNLOADING, GLYPH_GRABBED, GLYPH_REJECTED, SYMBOL_LEGEND, format_size, now_utc_iso,
-    previously_grabbed, queue_progress, release_line2,
+    GLYPH_DOWNLOADING, GLYPH_GRABBED, GLYPH_REJECTED, SYMBOL_LEGEND, format_size, monitored_label,
+    now_utc_iso, previously_grabbed, queue_progress, release_line2,
 };
 
 /// One episode row's status column, in priority order: an active download
@@ -79,11 +79,7 @@ pub fn season_label(season: &Season) -> String {
         .as_ref()
         .map(|stats| format!("{}/{}", stats.episode_file_count, stats.episode_count))
         .unwrap_or_default();
-    let monitored = if season.monitored {
-        "monitored"
-    } else {
-        "unmonitored"
-    };
+    let monitored = monitored_label(season.monitored);
     format!("{name:<10}  {counts:>7} • {monitored}")
 }
 

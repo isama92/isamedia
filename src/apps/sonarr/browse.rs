@@ -519,6 +519,14 @@ impl Browse {
         match result {
             Ok(mut episodes) => {
                 episodes.sort_by_key(|episode| episode.episode_number);
+                // A reload with the episode-info view open must also refresh
+                // the embedded episode it renders from, mirroring the embedded
+                // series in on_series_loaded / movie in on_movies_loaded.
+                if let Level::EpisodeDetail { episode, .. } = &mut self.level
+                    && let Some(updated) = episodes.iter().find(|e| e.id == episode.id)
+                {
+                    *episode = updated.clone();
+                }
                 self.episodes = episodes;
                 if self.episode_cursor >= self.episodes.len() {
                     self.episode_cursor = 0;
@@ -653,6 +661,13 @@ impl Browse {
                 self.downloads.clear_marks();
                 self.fetch_queue();
                 self.notice = Some("removed from queue".into());
+            }
+            CommandKind::SetMonitored => {
+                // Level-aware refetch: the series list (which re-syncs the
+                // embedded series behind the season/episode views via
+                // on_series_loaded) or the episode list. The flipped indicator
+                // is feedback enough, so no notice.
+                self.refresh();
             }
         }
         false
@@ -1587,6 +1602,7 @@ impl Browse {
                     self.pop_level();
                     self.info_scroll = 0;
                 }
+                KeyCode::Char('m') => self.toggle_monitored(),
                 KeyCode::Char('r') => self.refresh(),
                 KeyCode::Char('?') => self.show_full_help = !self.show_full_help,
                 KeyCode::Char('q') => return Some(BrowseAction::Quit),
@@ -1712,12 +1728,56 @@ impl Browse {
                     ));
                 }
             }
+            KeyCode::Char('m') => self.toggle_monitored(),
             KeyCode::Char('r') => self.refresh(),
             KeyCode::Char('?') => self.show_full_help = !self.show_full_help,
             KeyCode::Char('q') => return Some(BrowseAction::Quit),
             _ => {}
         }
         None
+    }
+
+    /// Flip the monitored flag on the item under the cursor: the selected
+    /// series (series list), season (season list), or episode (episode list /
+    /// episode-info view). Copy the ids/new-state out before spawning so the
+    /// borrow of `self.level` ends before `spawn_command` takes `&mut self`.
+    fn toggle_monitored(&mut self) {
+        enum Target {
+            Series(i64),
+            Season(i64, i32),
+            Episode(i64),
+        }
+        let (target, want) = match &self.level {
+            Level::SeriesList => match self.selected_series() {
+                Some(series) => (Target::Series(series.id), !series.monitored),
+                None => return,
+            },
+            Level::Show { series } => match series.seasons.get(self.season_cursor) {
+                Some(season) => (
+                    Target::Season(series.id, season.season_number),
+                    !season.monitored,
+                ),
+                None => return,
+            },
+            Level::Episodes { .. } => match self.selected_episode() {
+                Some(episode) => (Target::Episode(episode.id), !episode.monitored),
+                None => return,
+            },
+            Level::EpisodeDetail { episode, .. } => {
+                (Target::Episode(episode.id), !episode.monitored)
+            }
+            _ => return,
+        };
+        let client = self.client.clone();
+        self.spawn_command(CommandKind::SetMonitored, async move {
+            match target {
+                Target::Series(id) => client.set_series_monitored(id, want).await,
+                Target::Season(series_id, season) => {
+                    client.set_season_monitored(series_id, season, want).await
+                }
+                Target::Episode(id) => client.set_episode_monitored(id, want).await,
+            }
+        });
     }
 
     pub fn draw(&mut self, frame: &mut Frame, area: Rect) {
@@ -2028,8 +2088,18 @@ impl Browse {
             .iter()
             .map(|series| {
                 let title = truncate(series.title.as_deref().unwrap_or("(untitled)"), text_width);
-                let overview = truncate(series.overview.as_deref().unwrap_or_default(), text_width);
-                (title, vec![Span::styled(overview, theme::dim())])
+                let overview = series.overview.as_deref().unwrap_or_default();
+                // Flag an unmonitored show on the detail line; the shared
+                // two-line renderer owns the title style, so we can't dim that.
+                let detail = if series.monitored {
+                    truncate(overview, text_width)
+                } else {
+                    truncate(
+                        &format!("{} • {overview}", display::monitored_label(false)),
+                        text_width,
+                    )
+                };
+                (title, vec![Span::styled(detail, theme::dim())])
             })
             .collect();
         self.draw_two_line_list(frame, area, self.series_cursor, &rows, "  No series.");
@@ -2064,6 +2134,8 @@ impl Browse {
         {
             meta.push(format!("{:.1}", ratings.value));
         }
+        // Always surface the show's monitored state in the header.
+        meta.push(display::monitored_label(series.monitored).to_string());
 
         // Reserve a few rows for the list: title + optional meta + two spacers.
         let fixed = 1 + (!meta.is_empty()) as u16 + 2;
@@ -2224,7 +2296,17 @@ impl Browse {
             let unaired = status == EpStatus::Unaired;
 
             let code = display::episode_code(episode.season_number, episode.episode_number);
-            let title = truncate(episode.title.as_deref().unwrap_or(""), title_width.max(4));
+            // An unmonitored episode gets a dim marker; shrink the title to
+            // reserve room for it so it never collides with the meta column.
+            let mon_tag = if episode.monitored {
+                String::new()
+            } else {
+                format!(" • {}", display::monitored_label(false))
+            };
+            let title = truncate(
+                episode.title.as_deref().unwrap_or(""),
+                title_width.saturating_sub(mon_tag.chars().count()).max(4),
+            );
             let air_date = episode
                 .air_date
                 .clone()
@@ -2252,7 +2334,7 @@ impl Browse {
                 Style::new()
                     .fg(theme::accent_bright())
                     .add_modifier(Modifier::BOLD)
-            } else if unaired {
+            } else if unaired || !episode.monitored {
                 theme::dim()
             } else {
                 Style::new().fg(theme::fg())
@@ -2271,6 +2353,7 @@ impl Browse {
                 gutter,
                 Span::styled(format!("{code}  "), base_style),
                 Span::styled(title, base_style),
+                Span::styled(mon_tag, theme::dim()),
             ])
             .render(left, buf);
             Line::from(vec![
@@ -2347,12 +2430,13 @@ impl Browse {
             if let Some(runtime) = episode.runtime {
                 meta.push(format!("{runtime}m"));
             }
-            if !meta.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    format!("  {}", meta.join(" · ")),
-                    theme::dim(),
-                )));
-            }
+            // Surface the episode's monitored state so the `m` toggle has
+            // visible feedback here, like the other levels.
+            meta.push(display::monitored_label(episode.monitored).to_string());
+            lines.push(Line::from(Span::styled(
+                format!("  {}", meta.join(" · ")),
+                theme::dim(),
+            )));
             // File details first (or "not downloaded"), then the description.
             if let Some(file) = &episode.episode_file {
                 lines.push(Line::from(""));
@@ -2486,6 +2570,7 @@ impl Browse {
                     entries.push(("esc", "clear"));
                 }
                 entries.push(("s", "sort"));
+                entries.push(("m", "monitor"));
             }
             Level::Downloads => {
                 entries.push(("esc", "back"));
@@ -2496,17 +2581,20 @@ impl Browse {
                 entries.push(("esc", "back"));
                 entries.push(("enter", "open season"));
                 entries.push(("z", "delete"));
+                entries.push(("m", "monitor"));
             }
             Level::Episodes { .. } => {
                 entries.push(("esc", "back"));
                 entries.push(("enter", "search"));
                 entries.push(("i", "info"));
+                entries.push(("m", "monitor"));
             }
             Level::EpisodeDetail { episode, .. } => {
                 entries.push(("↑/↓", "scroll"));
                 if episode.episode_file.is_some() {
                     entries.push(("x", "delete file"));
                 }
+                entries.push(("m", "monitor"));
                 entries.push(("esc/i", "back"));
             }
             Level::Search { .. } => {
