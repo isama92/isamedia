@@ -42,6 +42,63 @@ pub fn draw_confirm(frame: &mut Frame, area: Rect, question: &str) {
         .render(keys_row, buf);
 }
 
+/// Centered modal option list; the caller owns the selection state and
+/// routes arrows/enter/esc itself, this only draws.
+pub fn draw_menu(frame: &mut Frame, area: Rect, title: &str, options: &[&str], selected: usize) {
+    let footer = "enter: select   esc: close";
+    let content_width = options
+        .iter()
+        .map(|option| option.chars().count())
+        .chain([title.chars().count(), footer.chars().count()])
+        .max()
+        .unwrap_or(0) as u16;
+    // max-then-min, not clamp: clamp panics on terminals narrower than the
+    // minimum (same guard as draw_confirm).
+    let width = (content_width + 6).max(24).min(area.width);
+    let height = (options.len() as u16 + 4).min(area.height);
+    let [box_area] = Layout::horizontal([Constraint::Length(width)])
+        .flex(Flex::Center)
+        .areas(area);
+    let [box_area] = Layout::vertical([Constraint::Length(height)])
+        .flex(Flex::Center)
+        .areas(box_area);
+
+    let buf = frame.buffer_mut();
+    Clear.render(box_area, buf);
+    let block = Block::bordered()
+        .title(format!(" {title} "))
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(theme::accent_bright()));
+    let inner = block.inner(box_area);
+    block.render(box_area, buf);
+
+    for (i, option) in options.iter().enumerate() {
+        if i as u16 >= inner.height {
+            break;
+        }
+        let row = Rect::new(inner.x, inner.y + i as u16, inner.width, 1);
+        let style = if i == selected {
+            Style::new()
+                .fg(theme::on_accent())
+                .bg(theme::accent_color())
+        } else {
+            Style::new().fg(theme::fg())
+        };
+        Line::styled(format!(" {option} "), style).render(row, buf);
+    }
+    if options.len() as u16 + 1 < inner.height {
+        let row = Rect::new(
+            inner.x,
+            inner.y + inner.height.saturating_sub(1),
+            inner.width,
+            1,
+        );
+        Line::styled(footer, theme::dim())
+            .centered()
+            .render(row, buf);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -53,6 +110,17 @@ mod tests {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal
                 .draw(|frame| draw_confirm(frame, frame.area(), "Replace current playback?"))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn menu_does_not_panic_on_narrow_terminals() {
+        let options = ["Name ascending", "Name descending", "Date added"];
+        for (width, height) in [(10, 5), (1, 1), (0, 0), (24, 3), (120, 40)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| draw_menu(frame, frame.area(), "Sort by", &options, 1))
                 .unwrap();
         }
     }
