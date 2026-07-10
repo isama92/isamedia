@@ -1,7 +1,7 @@
 //! Presentation helpers for media items, ported from jfsh's item.go so the
 //! list output matches jfsh exactly.
 
-use super::models::{ItemKind, MediaItem};
+use super::models::{ItemKind, MediaItem, MediaStream};
 
 fn runtime(ticks: i64) -> String {
     let minutes = ticks / 600_000_000;
@@ -203,6 +203,87 @@ pub fn external_subtitles(item: &MediaItem) -> Vec<ExternalSubtitle> {
         .collect()
 }
 
+/// Season selector label: "Season 1", or "Specials" for season 0 / unnumbered.
+pub fn season_name(number: Option<i32>) -> String {
+    match number {
+        Some(n) if n > 0 => format!("Season {n}"),
+        _ => "Specials".to_string(),
+    }
+}
+
+/// Episode code, e.g. "S01E02", from the season/episode numbers an Episode
+/// carries. Missing numbers fall back to 0.
+pub fn episode_code(item: &MediaItem) -> String {
+    format!(
+        "S{:02}E{:02}",
+        item.parent_index_number.unwrap_or(0),
+        item.index_number.unwrap_or(0),
+    )
+}
+
+/// One-line episode meta for the info panel, e.g. "Aired 2015-12-14 · 8.1 · 45m".
+/// Each segment is dropped when its data is absent.
+pub fn episode_meta(item: &MediaItem) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(aired) = &item.premiere_date {
+        parts.push(format!("Aired {}", short_date(aired)));
+    }
+    if rating(item) > 0.0 {
+        parts.push(format!("{:.1}", rating(item)));
+    }
+    if let Some(ticks) = item.run_time_ticks
+        && ticks > 0
+    {
+        parts.push(runtime(ticks));
+    }
+    parts.join(" · ")
+}
+
+/// Technical stream summary for the info panel: a (label, value) row for the
+/// primary video and audio tracks and the subtitle languages. Rows whose data
+/// is missing are omitted, so a server that returns sparse `MediaStreams`
+/// simply shows fewer lines. Values come from Jellyfin's own `DisplayTitle`
+/// (e.g. "1080p H264", "English - EAC3 - 5.1"), falling back to the language.
+pub fn media_summary(item: &MediaItem) -> Vec<(&'static str, String)> {
+    let label = |stream: &MediaStream| {
+        stream
+            .display_title
+            .clone()
+            .or_else(|| stream.language.clone())
+            .filter(|value| !value.is_empty())
+    };
+    let first = |kind: &str| {
+        item.media_streams
+            .iter()
+            .find(|stream| stream.kind.as_deref() == Some(kind))
+            .and_then(label)
+    };
+
+    let mut rows: Vec<(&'static str, String)> = Vec::new();
+    if let Some(video) = first("Video") {
+        rows.push(("Video", video));
+    }
+    if let Some(audio) = first("Audio") {
+        rows.push(("Audio", audio));
+    }
+    let subs: Vec<String> = item
+        .media_streams
+        .iter()
+        .filter(|stream| stream.kind.as_deref() == Some("Subtitle"))
+        .filter_map(|stream| {
+            stream
+                .language
+                .clone()
+                .or_else(|| stream.display_title.clone())
+                .filter(|value| !value.is_empty())
+        })
+        .collect();
+    if !subs.is_empty() {
+        rows.push(("Subs", subs.join(", ")));
+    }
+    rows
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,6 +450,87 @@ mod tests {
         assert_eq!(item_description(&item), "Playlists");
         item.collection_type = None;
         assert_eq!(item_description(&item), "Library");
+    }
+
+    #[test]
+    fn season_names() {
+        assert_eq!(season_name(Some(1)), "Season 1");
+        assert_eq!(season_name(Some(12)), "Season 12");
+        assert_eq!(season_name(Some(0)), "Specials");
+        assert_eq!(season_name(None), "Specials");
+        assert_eq!(season_name(Some(-1)), "Specials");
+    }
+
+    #[test]
+    fn episode_codes() {
+        let item = MediaItem {
+            kind: ItemKind::Episode,
+            parent_index_number: Some(1),
+            index_number: Some(2),
+            ..Default::default()
+        };
+        assert_eq!(episode_code(&item), "S01E02");
+        // Missing numbers fall back to zero.
+        assert_eq!(episode_code(&MediaItem::default()), "S00E00");
+    }
+
+    #[test]
+    fn episode_meta_omits_absent_segments() {
+        let mut item = MediaItem {
+            kind: ItemKind::Episode,
+            premiere_date: Some("2015-12-14T00:00:00.0000000Z".into()),
+            community_rating: Some(8.1),
+            run_time_ticks: Some(45 * 600_000_000),
+            ..Default::default()
+        };
+        assert_eq!(episode_meta(&item), "Aired 2015-12-14 · 8.1 · 45m");
+        // No rating, no runtime, no air date -> empty string, no stray dots.
+        item.community_rating = None;
+        item.run_time_ticks = None;
+        item.premiere_date = None;
+        assert_eq!(episode_meta(&item), "");
+        // Only a rating.
+        item.community_rating = Some(7.0);
+        assert_eq!(episode_meta(&item), "7.0");
+    }
+
+    #[test]
+    fn media_summary_from_streams() {
+        let item = MediaItem {
+            media_streams: vec![
+                MediaStream {
+                    kind: Some("Video".into()),
+                    display_title: Some("1080p H264".into()),
+                    ..Default::default()
+                },
+                MediaStream {
+                    kind: Some("Audio".into()),
+                    display_title: Some("English - EAC3 - 5.1".into()),
+                    ..Default::default()
+                },
+                MediaStream {
+                    kind: Some("Subtitle".into()),
+                    language: Some("English".into()),
+                    ..Default::default()
+                },
+                MediaStream {
+                    kind: Some("Subtitle".into()),
+                    language: Some("Dutch".into()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            media_summary(&item),
+            vec![
+                ("Video", "1080p H264".to_string()),
+                ("Audio", "English - EAC3 - 5.1".to_string()),
+                ("Subs", "English, Dutch".to_string()),
+            ]
+        );
+        // No streams -> no rows.
+        assert!(media_summary(&MediaItem::default()).is_empty());
     }
 
     #[test]

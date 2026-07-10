@@ -46,6 +46,11 @@ pub struct MediaItem {
     pub path: Option<String>,
     pub user_data: Option<UserData>,
     pub media_streams: Vec<MediaStream>,
+    /// Plot/description text; only returned when `fields=Overview` is requested.
+    /// Shown by the `i` info panel.
+    pub overview: Option<String>,
+    /// Genre names; only returned when `fields=Genres` is requested.
+    pub genres: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -141,6 +146,26 @@ mod tests {
         assert_eq!(item.kind, ItemKind::Series);
         assert_eq!(item.name.as_deref(), Some("The Expanse"));
         assert_eq!(item.user_data.unwrap().unplayed_item_count, Some(12));
+    }
+
+    #[test]
+    fn deserializes_overview_and_genres() {
+        let raw = r#"{
+            "Id": "m1",
+            "Type": "Movie",
+            "Overview": "A crew hauls ice across the belt.",
+            "Genres": ["Drama", "Sci-Fi"]
+        }"#;
+        let item: MediaItem = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            item.overview.as_deref(),
+            Some("A crew hauls ice across the belt.")
+        );
+        assert_eq!(item.genres, vec!["Drama", "Sci-Fi"]);
+        // Both are optional: a bare item leaves them empty.
+        let bare: MediaItem = serde_json::from_str(r#"{"Id": "m2", "Type": "Movie"}"#).unwrap();
+        assert_eq!(bare.overview, None);
+        assert!(bare.genres.is_empty());
     }
 
     #[test]

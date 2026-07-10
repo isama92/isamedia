@@ -13,8 +13,8 @@ use crate::jellyfin::{
     Client, LibraryItemsQuery, MediaItem, display, library_scope, models::ItemKind,
 };
 use crate::ui::input::TextInput;
-use crate::ui::text::truncate;
-use crate::ui::{prompt, theme};
+use crate::ui::text::{truncate, wrap_text};
+use crate::ui::{help, list, prompt, theme};
 
 use super::msg::Msg;
 
@@ -80,6 +80,15 @@ fn library_kind(item: &MediaItem) -> LibraryKind {
         Some("tvshows") => LibraryKind::Shows,
         _ => LibraryKind::Other,
     }
+}
+
+/// Whether the info panel is meaningful for this item. Containers (library
+/// views, box sets) carry no overview, so `i` is inert on them.
+fn info_available(item: &MediaItem) -> bool {
+    matches!(
+        item.kind,
+        ItemKind::Movie | ItemKind::Series | ItemKind::Episode | ItemKind::Video
+    )
 }
 
 /// Where the user is inside the Libraries tab. A flat enum rather than a
@@ -183,6 +192,30 @@ fn should_fetch_more(cursor: usize, loaded: usize, total: usize, loading: bool) 
     !loading && loaded < total && cursor + FETCH_AHEAD >= loaded
 }
 
+/// Group a flat, season-ordered episode list into seasons by season number
+/// (`parent_index_number`), preserving first-seen (server) order. Season
+/// `None`/`0` collects as its own bucket (rendered as "Specials"). Free
+/// function so the grouping is unit-testable without a `Client`.
+fn group_seasons(items: &[MediaItem]) -> Vec<SeasonRow> {
+    let mut seasons: Vec<SeasonRow> = Vec::new();
+    for episode in items {
+        let number = episode.parent_index_number;
+        let watched = display::watched(episode) as usize;
+        match seasons.iter_mut().find(|season| season.number == number) {
+            Some(season) => {
+                season.episode_count += 1;
+                season.watched_count += watched;
+            }
+            None => seasons.push(SeasonRow {
+                number,
+                episode_count: 1,
+                watched_count: watched,
+            }),
+        }
+    }
+    seasons
+}
+
 /// Whether this level's `/` filter runs server-side (`searchTerm` on the
 /// paginated request). Only levels that query with `recursive=true` qualify:
 /// Jellyfin silently ignores `searchTerm` on non-recursive queries, so the
@@ -238,6 +271,24 @@ pub enum BrowseAction {
     Play(MediaItem),
 }
 
+/// Sub-position while drilled into a series (`current_series` is `Some`). The
+/// show-info header stays pinned; only the bottom region cycles through these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeriesView {
+    Seasons,
+    Episodes,
+    EpisodeInfo,
+}
+
+/// A season derived from the flat episode list by grouping on the episodes'
+/// season number (`parent_index_number`); `number == None`/`0` is Specials.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SeasonRow {
+    number: Option<i32>,
+    episode_count: usize,
+    watched_count: usize,
+}
+
 pub struct Browse {
     pub client: Client,
     sender: AppSender,
@@ -255,6 +306,12 @@ pub struct Browse {
     filter_focused: bool,
 
     current_series: Option<MediaItem>,
+    /// Sub-view within a drilled-in series; ignored when `current_series` is None.
+    series_view: SeriesView,
+    /// Seasons derived from the loaded episode list, in first-seen order.
+    seasons: Vec<SeasonRow>,
+    /// Cursor within the seasons list (the episode list reuses `cursor`).
+    season_cursor: usize,
 
     /// Drill-down position inside the Libraries tab; `Root` elsewhere.
     lib_level: LibraryLevel,
@@ -264,6 +321,10 @@ pub struct Browse {
     collection_sort: Sort,
     /// Sort popup cursor into `SORT_OPTIONS`; `None` when closed.
     sort_menu: Option<usize>,
+    /// Full-screen info/overview panel for the selected item; modal while open.
+    info_open: bool,
+    /// Scroll offset into the info panel's wrapped text; clamped when drawing.
+    info_scroll: u16,
 
     show_full_help: bool,
     loading: bool,
@@ -298,10 +359,15 @@ impl Browse {
             filter_active: false,
             filter_focused: false,
             current_series: None,
+            series_view: SeriesView::Seasons,
+            seasons: Vec::new(),
+            season_cursor: 0,
             lib_level: LibraryLevel::Root,
             lib_total: 0,
             collection_sort: Sort::DEFAULT,
             sort_menu: None,
+            info_open: false,
+            info_scroll: 0,
             show_full_help: false,
             loading: false,
             error: None,
@@ -521,7 +587,23 @@ impl Browse {
                 self.filter.clear();
                 self.filter_active = false;
                 self.filter_focused = false;
-                self.apply_filter();
+                if self.current_series.is_some() {
+                    // These are the series' episodes: group them into seasons
+                    // (the bottom region), keeping the current sub-view so a
+                    // refresh does not kick the user back to the seasons list.
+                    self.build_seasons();
+                    if self.season_cursor >= self.seasons.len() {
+                        self.season_cursor = self.seasons.len().saturating_sub(1);
+                    }
+                    if matches!(
+                        self.series_view,
+                        SeriesView::Episodes | SeriesView::EpisodeInfo
+                    ) {
+                        self.rebuild_season_episodes();
+                    }
+                } else {
+                    self.apply_filter();
+                }
             }
             Err(crate::jellyfin::Error::Unauthorized) => return true,
             Err(err) => self.error = Some(err.to_string()),
@@ -594,6 +676,42 @@ impl Browse {
             self.error = Some(err.to_string());
         }
         false
+    }
+
+    /// Group the loaded flat episode list into seasons.
+    fn build_seasons(&mut self) {
+        self.seasons = group_seasons(&self.all_items);
+    }
+
+    /// The season number currently selected in the seasons list (`None` is a
+    /// valid value: the Specials bucket).
+    fn selected_season(&self) -> Option<i32> {
+        self.seasons.get(self.season_cursor).and_then(|s| s.number)
+    }
+
+    /// Rebuild `items` to just the selected season's episodes, clamping the
+    /// episode cursor. Used on entering a season and on refresh.
+    fn rebuild_season_episodes(&mut self) {
+        let number = self.selected_season();
+        self.items = self
+            .all_items
+            .iter()
+            .filter(|episode| episode.parent_index_number == number)
+            .cloned()
+            .collect();
+        if self.cursor >= self.items.len() {
+            self.cursor = self.items.len().saturating_sub(1);
+        }
+    }
+
+    /// Enter the highlighted season: switch the bottom region to its episodes.
+    fn enter_season(&mut self) {
+        if self.seasons.get(self.season_cursor).is_none() {
+            return;
+        }
+        self.cursor = 0;
+        self.series_view = SeriesView::Episodes;
+        self.rebuild_season_episodes();
     }
 
     /// Refetch after playback so progress/watched state is fresh. A playback
@@ -747,10 +865,10 @@ impl Browse {
         // The sort popup is modal: while open it owns every key.
         if let Some(selected) = self.sort_menu {
             match key.code {
-                KeyCode::Up | KeyCode::Char('k') => {
+                KeyCode::Up => {
                     self.sort_menu = Some(selected.saturating_sub(1));
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
+                KeyCode::Down => {
                     self.sort_menu = Some((selected + 1).min(SORT_OPTIONS.len() - 1));
                 }
                 KeyCode::Enter => {
@@ -768,31 +886,62 @@ impl Browse {
             return None;
         }
 
+        // The info panel is modal: while open it owns scroll and close keys, so
+        // the list cursor stays pinned to the item being read.
+        if self.info_open {
+            let page = self.last_height.saturating_sub(4).max(1);
+            match key.code {
+                KeyCode::Up => self.info_scroll = self.info_scroll.saturating_sub(1),
+                KeyCode::Down => self.info_scroll = self.info_scroll.saturating_add(1),
+                KeyCode::PageUp | KeyCode::Left => {
+                    self.info_scroll = self.info_scroll.saturating_sub(page);
+                }
+                KeyCode::PageDown | KeyCode::Right => {
+                    self.info_scroll = self.info_scroll.saturating_add(page);
+                }
+                KeyCode::Home | KeyCode::Char('g') => self.info_scroll = 0,
+                KeyCode::End | KeyCode::Char('G') => self.info_scroll = u16::MAX,
+                KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('i') => {
+                    self.info_open = false;
+                    self.info_scroll = 0;
+                }
+                KeyCode::Char('q') => return Some(BrowseAction::Quit),
+                _ => {}
+            }
+            return None;
+        }
+
+        // Inside a drilled-in series the bottom region owns its own seasons /
+        // episodes / episode-info sub-levels with their own key handling.
+        if self.current_series.is_some() {
+            return self.on_series_key(key);
+        }
+
         let page_jump = (self.last_height / 5).max(1) as usize;
         match key.code {
-            KeyCode::Up | KeyCode::Char('k') => self.cursor = self.cursor.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => {
+            KeyCode::Up => self.cursor = self.cursor.saturating_sub(1),
+            KeyCode::Down => {
                 if self.cursor + 1 < self.items.len() {
                     self.cursor += 1;
                 }
             }
-            KeyCode::PageUp | KeyCode::Char('b') | KeyCode::Char('u') => {
+            KeyCode::PageUp | KeyCode::Left => {
                 self.cursor = self.cursor.saturating_sub(page_jump);
             }
-            KeyCode::PageDown | KeyCode::Char('f') | KeyCode::Char('d') => {
+            KeyCode::PageDown | KeyCode::Right => {
                 self.cursor = (self.cursor + page_jump).min(self.items.len().saturating_sub(1));
             }
             KeyCode::Home | KeyCode::Char('g') => self.cursor = 0,
             KeyCode::End | KeyCode::Char('G') => self.cursor = self.items.len().saturating_sub(1),
 
-            KeyCode::Right | KeyCode::Char('l') if !self.drilled_in() => {
+            KeyCode::Tab if !self.drilled_in() => {
                 self.tab = self.tab.next();
                 self.cursor = 0;
                 self.lib_level = LibraryLevel::Root;
                 self.lib_total = 0;
                 self.fetch();
             }
-            KeyCode::Left | KeyCode::Char('h') if !self.drilled_in() => {
+            KeyCode::BackTab if !self.drilled_in() => {
                 self.tab = self.tab.prev();
                 self.cursor = 0;
                 self.lib_level = LibraryLevel::Root;
@@ -892,6 +1041,9 @@ impl Browse {
                     }
                     if item.kind == ItemKind::Series {
                         self.current_series = Some(item);
+                        self.series_view = SeriesView::Seasons;
+                        self.season_cursor = 0;
+                        self.seasons.clear();
                         self.cursor = 0;
                         self.fetch();
                     } else if !matches!(item.kind, ItemKind::BoxSet | ItemKind::CollectionFolder) {
@@ -912,6 +1064,10 @@ impl Browse {
                 );
             }
             KeyCode::Char('w') => self.toggle_watched(),
+            KeyCode::Char('i') if self.current_item().is_some_and(info_available) => {
+                self.info_open = true;
+                self.info_scroll = 0;
+            }
             KeyCode::Char('r') => self.fetch(),
             KeyCode::Char('?') => self.show_full_help = !self.show_full_help,
             KeyCode::Char('q') => return Some(BrowseAction::Quit),
@@ -921,11 +1077,118 @@ impl Browse {
         None
     }
 
+    /// Key handling inside a drilled-in series, dispatched on `series_view`.
+    /// The show-info header stays fixed; these keys drive the bottom region:
+    /// seasons list -> episode list -> episode info.
+    fn on_series_key(&mut self, key: KeyEvent) -> Option<BrowseAction> {
+        let page_jump = (self.last_height / 5).max(1) as usize;
+        match self.series_view {
+            SeriesView::Seasons => match key.code {
+                KeyCode::Up => self.season_cursor = self.season_cursor.saturating_sub(1),
+                KeyCode::Down => {
+                    if self.season_cursor + 1 < self.seasons.len() {
+                        self.season_cursor += 1;
+                    }
+                }
+                KeyCode::PageUp | KeyCode::Left => {
+                    self.season_cursor = self.season_cursor.saturating_sub(page_jump);
+                }
+                KeyCode::PageDown | KeyCode::Right => {
+                    self.season_cursor =
+                        (self.season_cursor + page_jump).min(self.seasons.len().saturating_sub(1));
+                }
+                KeyCode::Home | KeyCode::Char('g') => self.season_cursor = 0,
+                KeyCode::End | KeyCode::Char('G') => {
+                    self.season_cursor = self.seasons.len().saturating_sub(1);
+                }
+                KeyCode::Enter | KeyCode::Char(' ') => self.enter_season(),
+                KeyCode::Esc | KeyCode::Backspace => {
+                    // Leave the series, back to the tab's list.
+                    self.current_series = None;
+                    self.cursor = 0;
+                    self.fetch();
+                }
+                KeyCode::Char('r') => self.fetch(),
+                KeyCode::Char('?') => self.show_full_help = !self.show_full_help,
+                KeyCode::Char('q') => return Some(BrowseAction::Quit),
+                _ => {}
+            },
+            SeriesView::Episodes => match key.code {
+                KeyCode::Up => self.cursor = self.cursor.saturating_sub(1),
+                KeyCode::Down => {
+                    if self.cursor + 1 < self.items.len() {
+                        self.cursor += 1;
+                    }
+                }
+                KeyCode::PageUp | KeyCode::Left => {
+                    self.cursor = self.cursor.saturating_sub(page_jump);
+                }
+                KeyCode::PageDown | KeyCode::Right => {
+                    self.cursor = (self.cursor + page_jump).min(self.items.len().saturating_sub(1));
+                }
+                KeyCode::Home | KeyCode::Char('g') => self.cursor = 0,
+                KeyCode::End | KeyCode::Char('G') => {
+                    self.cursor = self.items.len().saturating_sub(1);
+                }
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    if let Some(episode) = self.current_item().cloned() {
+                        return Some(BrowseAction::Play(episode));
+                    }
+                }
+                KeyCode::Char('i') if !self.items.is_empty() => {
+                    self.series_view = SeriesView::EpisodeInfo;
+                    self.info_scroll = 0;
+                }
+                KeyCode::Char('w') => self.toggle_watched(),
+                KeyCode::Esc | KeyCode::Backspace => {
+                    self.series_view = SeriesView::Seasons;
+                    self.cursor = 0;
+                }
+                KeyCode::Char('r') => self.fetch(),
+                KeyCode::Char('?') => self.show_full_help = !self.show_full_help,
+                KeyCode::Char('q') => return Some(BrowseAction::Quit),
+                _ => {}
+            },
+            SeriesView::EpisodeInfo => {
+                let page = self.last_height.saturating_sub(4).max(1);
+                match key.code {
+                    KeyCode::Up => self.info_scroll = self.info_scroll.saturating_sub(1),
+                    KeyCode::Down => self.info_scroll = self.info_scroll.saturating_add(1),
+                    KeyCode::PageUp | KeyCode::Left => {
+                        self.info_scroll = self.info_scroll.saturating_sub(page);
+                    }
+                    KeyCode::PageDown | KeyCode::Right => {
+                        self.info_scroll = self.info_scroll.saturating_add(page);
+                    }
+                    KeyCode::Home | KeyCode::Char('g') => self.info_scroll = 0,
+                    KeyCode::End | KeyCode::Char('G') => self.info_scroll = u16::MAX,
+                    KeyCode::Enter => {
+                        if let Some(episode) = self.current_item().cloned() {
+                            return Some(BrowseAction::Play(episode));
+                        }
+                    }
+                    KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('i') => {
+                        self.series_view = SeriesView::Episodes;
+                        self.info_scroll = 0;
+                    }
+                    KeyCode::Char('?') => self.show_full_help = !self.show_full_help,
+                    KeyCode::Char('q') => return Some(BrowseAction::Quit),
+                    _ => {}
+                }
+            }
+        }
+        None
+    }
+
     pub fn draw(&mut self, frame: &mut Frame, area: Rect) {
         self.last_height = area.height;
         let has_message = self.error.is_some() || self.notice.is_some();
         let show_search = self.tab == Tab::Search && self.current_series.is_none();
-        let help_height = if self.show_full_help { 8 } else { 1 };
+        let help_height = if self.show_full_help {
+            help::rows(&self.help_sections())
+        } else {
+            1
+        };
 
         let rows = Layout::vertical([
             Constraint::Length(if has_message { 1 } else { 0 }),
@@ -950,7 +1213,20 @@ impl Browse {
         if self.filter_active {
             self.draw_input_row(frame, rows[3], "Filter: ", &self.filter);
         }
-        self.draw_list(frame, rows[4]);
+        if let Some(series) = self.current_series.clone() {
+            // Show-info header stays pinned; the bottom region is the current
+            // sub-view (cloning `series` frees the borrow for the &mut draws).
+            let body = self.draw_series_header(frame, rows[4], &series);
+            match self.series_view {
+                SeriesView::Seasons => self.draw_seasons(frame, body),
+                SeriesView::Episodes => self.draw_episode_list(frame, body),
+                SeriesView::EpisodeInfo => self.draw_episode_info(frame, body),
+            }
+        } else if self.info_open {
+            self.draw_info(frame, rows[4]);
+        } else {
+            self.draw_list(frame, rows[4]);
+        }
         self.draw_help(frame, rows[5]);
         if let Some(selected) = self.sort_menu {
             let labels: Vec<&str> = SORT_OPTIONS.iter().map(|sort| sort.label()).collect();
@@ -1099,12 +1375,397 @@ impl Browse {
         }
     }
 
+    /// The selected item's info: a title, the shared metadata line, genres, and
+    /// the wrapped overview. Scrolls with the info-panel modal keys.
+    fn draw_info(&mut self, frame: &mut Frame, area: Rect) {
+        let text_width = area.width.saturating_sub(4) as usize;
+        // Build the owned lines first so the borrow of `self.items` is released
+        // before we mutate `self.info_scroll` below.
+        let lines: Vec<Line> = {
+            let Some(item) = self.items.get(self.cursor) else {
+                self.info_open = false;
+                return;
+            };
+            let mut lines: Vec<Line> = Vec::new();
+            lines.push(Line::from(Span::styled(
+                format!("  {}", display::item_title(item)),
+                Style::new()
+                    .fg(theme::accent_bright())
+                    .add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(Span::styled(
+                format!("  {}", display::item_description(item)),
+                theme::dim(),
+            )));
+            if !item.genres.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    format!("  Genres: {}", item.genres.join(", ")),
+                    theme::dim(),
+                )));
+            }
+            lines.push(Line::from(""));
+            let overview = item.overview.as_deref().unwrap_or("No overview available.");
+            for line in wrap_text(overview, text_width) {
+                lines.push(Line::from(Span::styled(
+                    format!("  {line}"),
+                    Style::new().fg(theme::fg()),
+                )));
+            }
+            lines
+        };
+
+        let buf = frame.buffer_mut();
+        let total = lines.len();
+        let height = area.height as usize;
+        let max_scroll = total.saturating_sub(height).min(u16::MAX as usize) as u16;
+        self.info_scroll = self.info_scroll.min(max_scroll);
+        for (row, line) in lines
+            .into_iter()
+            .skip(self.info_scroll as usize)
+            .take(height)
+            .enumerate()
+        {
+            line.render(
+                Rect::new(area.x, area.y + row as u16, area.width.saturating_sub(1), 1),
+                buf,
+            );
+        }
+        if total > height {
+            list::draw_scrollbar(
+                buf,
+                area,
+                self.info_scroll as usize,
+                max_scroll as usize + 1,
+            );
+        }
+    }
+
+    /// The pinned show-info header shown across all three series sub-views:
+    /// title, a "year · rating" meta line, and the show overview (clamped so a
+    /// very long synopsis can't push the bottom list off screen). Returns the
+    /// leftover `Rect` below it for the sub-view's list.
+    fn draw_series_header(&self, frame: &mut Frame, area: Rect, series: &MediaItem) -> Rect {
+        // Clamp the overview by characters (bounds the header on any terminal),
+        // and always keep at least a few rows for the bottom list.
+        const OVERVIEW_MAX_CHARS: usize = 600;
+        const MIN_LIST_ROWS: u16 = 4;
+
+        let buf = frame.buffer_mut();
+        let text_width = area.width.saturating_sub(4) as usize;
+
+        let overview_raw = series
+            .overview
+            .as_deref()
+            .unwrap_or("No overview available.");
+        let overview = if overview_raw.chars().count() > OVERVIEW_MAX_CHARS {
+            let clipped: String = overview_raw.chars().take(OVERVIEW_MAX_CHARS).collect();
+            format!("{}…", clipped.trim_end())
+        } else {
+            overview_raw.to_string()
+        };
+
+        let mut lines: Vec<Line> = Vec::new();
+        lines.push(Line::from(Span::styled(
+            format!("  {}", display::item_title(series)),
+            Style::new()
+                .fg(theme::accent_bright())
+                .add_modifier(Modifier::BOLD),
+        )));
+        let mut meta: Vec<String> = Vec::new();
+        if let Some(year) = series.production_year {
+            meta.push(year.to_string());
+        }
+        if let Some(rating) = series.community_rating
+            && rating > 0.0
+        {
+            meta.push(format!("{rating:.1}"));
+        }
+        if !meta.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!("  {}", meta.join(" · ")),
+                theme::dim(),
+            )));
+        }
+        lines.push(Line::from(""));
+        for line in wrap_text(&overview, text_width) {
+            lines.push(Line::from(Span::styled(
+                format!("  {line}"),
+                Style::new().fg(theme::fg()),
+            )));
+        }
+        lines.push(Line::from(""));
+
+        let max_header = area.height.saturating_sub(MIN_LIST_ROWS).max(1) as usize;
+        let header_h = lines.len().min(max_header);
+        for (row, line) in lines.into_iter().take(header_h).enumerate() {
+            line.render(
+                Rect::new(area.x, area.y + row as u16, area.width.saturating_sub(1), 1),
+                buf,
+            );
+        }
+
+        let bottom = area.y + area.height;
+        let top = (area.y + header_h as u16).min(bottom);
+        Rect::new(area.x, top, area.width, bottom.saturating_sub(top))
+    }
+
+    /// The seasons list (bottom region of the Seasons sub-view).
+    fn draw_seasons(&self, frame: &mut Frame, area: Rect) {
+        let buf = frame.buffer_mut();
+        if area.height == 0 {
+            return;
+        }
+        if self.seasons.is_empty() {
+            let message = if self.loading {
+                "  Loading..."
+            } else {
+                "  No seasons."
+            };
+            Line::styled(message, theme::dim()).render(area, buf);
+            return;
+        }
+        let per_page = area.height as usize;
+        let first = list::window_start(self.season_cursor, self.seasons.len(), per_page);
+        let last = (first + per_page).min(self.seasons.len());
+        for (row, (i, season)) in self
+            .seasons
+            .iter()
+            .enumerate()
+            .take(last)
+            .skip(first)
+            .enumerate()
+        {
+            let selected = i == self.season_cursor;
+            let fully_watched =
+                season.episode_count > 0 && season.watched_count == season.episode_count;
+            let gutter = if selected {
+                Span::styled(" │ ", Style::new().fg(theme::accent_bright()))
+            } else {
+                Span::raw("   ")
+            };
+            let name_style = if selected {
+                Style::new()
+                    .fg(theme::accent_bright())
+                    .add_modifier(Modifier::BOLD)
+            } else if fully_watched {
+                theme::dim()
+            } else {
+                Style::new().fg(theme::fg())
+            };
+            let row_area = Rect::new(area.x, area.y + row as u16, area.width.saturating_sub(1), 1);
+            let [left, right] =
+                Layout::horizontal([Constraint::Fill(1), Constraint::Length(10)]).areas(row_area);
+            Line::from(vec![
+                gutter,
+                Span::styled(display::season_name(season.number), name_style),
+            ])
+            .render(left, buf);
+            Line::from(Span::styled(
+                format!("{}/{} ", season.watched_count, season.episode_count),
+                theme::dim(),
+            ))
+            .right_aligned()
+            .render(right, buf);
+        }
+        if self.seasons.len() > per_page {
+            list::draw_scrollbar(buf, area, self.season_cursor, self.seasons.len());
+        }
+    }
+
+    /// The selected season's episode list (bottom region of the Episodes
+    /// sub-view). One line per episode: code + title, watched/progress marker.
+    fn draw_episode_list(&self, frame: &mut Frame, area: Rect) {
+        let buf = frame.buffer_mut();
+        if area.height == 0 {
+            return;
+        }
+        if self.items.is_empty() {
+            let message = if self.loading {
+                "  Loading..."
+            } else {
+                "  No episodes."
+            };
+            Line::styled(message, theme::dim()).render(area, buf);
+            return;
+        }
+        let per_page = area.height as usize;
+        let first = list::window_start(self.cursor, self.items.len(), per_page);
+        let last = (first + per_page).min(self.items.len());
+        for (row, (i, item)) in self
+            .items
+            .iter()
+            .enumerate()
+            .take(last)
+            .skip(first)
+            .enumerate()
+        {
+            let selected = i == self.cursor;
+            let watched = display::watched(item);
+            let base_style = if selected {
+                Style::new()
+                    .fg(theme::accent_bright())
+                    .add_modifier(Modifier::BOLD)
+            } else if watched {
+                theme::dim()
+            } else {
+                Style::new().fg(theme::fg())
+            };
+            let gutter = if selected {
+                Span::styled(" │ ", Style::new().fg(theme::accent_bright()))
+            } else {
+                Span::raw("   ")
+            };
+            let code = display::episode_code(item);
+            let row_area = Rect::new(area.x, area.y + row as u16, area.width.saturating_sub(1), 1);
+            let [left, right] =
+                Layout::horizontal([Constraint::Fill(1), Constraint::Length(6)]).areas(row_area);
+            let title_width = (left.width as usize)
+                .saturating_sub(3 + code.len() + 2)
+                .max(4);
+            let title = truncate(item.name.as_deref().unwrap_or(""), title_width);
+            Line::from(vec![
+                gutter,
+                Span::styled(format!("{code}  "), base_style),
+                Span::styled(title, base_style),
+            ])
+            .render(left, buf);
+            let marker = if watched {
+                Span::styled("✓ ", theme::dim())
+            } else {
+                let pct = item
+                    .user_data
+                    .as_ref()
+                    .and_then(|data| data.played_percentage)
+                    .unwrap_or(0.0);
+                if pct > 0.0 {
+                    Span::styled(format!("{pct:.0}% "), theme::dim())
+                } else {
+                    Span::raw("")
+                }
+            };
+            Line::from(marker).right_aligned().render(right, buf);
+        }
+        if self.items.len() > per_page {
+            list::draw_scrollbar(buf, area, self.cursor, self.items.len());
+        }
+    }
+
+    /// The selected episode's info (bottom region of the EpisodeInfo sub-view):
+    /// code + title, meta, technical streams, then the wrapped overview.
+    /// Scrolls with `info_scroll`; reuses the `draw_info` window/scrollbar math.
+    fn draw_episode_info(&mut self, frame: &mut Frame, area: Rect) {
+        let text_width = area.width.saturating_sub(4) as usize;
+        let lines: Vec<Line> = {
+            let Some(item) = self.items.get(self.cursor) else {
+                self.series_view = SeriesView::Episodes;
+                return;
+            };
+            let mut lines: Vec<Line> = Vec::new();
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "  {}  {}",
+                    display::episode_code(item),
+                    item.name.as_deref().unwrap_or("")
+                ),
+                Style::new()
+                    .fg(theme::accent_bright())
+                    .add_modifier(Modifier::BOLD),
+            )));
+            let meta = display::episode_meta(item);
+            if !meta.is_empty() {
+                lines.push(Line::from(Span::styled(format!("  {meta}"), theme::dim())));
+            }
+            for (label, value) in display::media_summary(item) {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {label:<7}"), theme::dim()),
+                    Span::styled(value, Style::new().fg(theme::fg())),
+                ]));
+            }
+            lines.push(Line::from(""));
+            let overview = item.overview.as_deref().unwrap_or("No overview available.");
+            for line in wrap_text(overview, text_width) {
+                lines.push(Line::from(Span::styled(
+                    format!("  {line}"),
+                    Style::new().fg(theme::fg()),
+                )));
+            }
+            lines
+        };
+
+        let buf = frame.buffer_mut();
+        let total = lines.len();
+        let height = area.height as usize;
+        let max_scroll = total.saturating_sub(height).min(u16::MAX as usize) as u16;
+        self.info_scroll = self.info_scroll.min(max_scroll);
+        for (row, line) in lines
+            .into_iter()
+            .skip(self.info_scroll as usize)
+            .take(height)
+            .enumerate()
+        {
+            line.render(
+                Rect::new(area.x, area.y + row as u16, area.width.saturating_sub(1), 1),
+                buf,
+            );
+        }
+        if total > height {
+            list::draw_scrollbar(
+                buf,
+                area,
+                self.info_scroll as usize,
+                max_scroll as usize + 1,
+            );
+        }
+    }
+
     fn help_entries(&self) -> Vec<(&'static str, &'static str)> {
         if self.search_focused || self.filter_focused {
             return vec![("esc", "cancel"), ("enter", "apply")];
         }
         if self.sort_menu.is_some() {
             return vec![("esc", "close"), ("enter", "select")];
+        }
+        if self.info_open {
+            return vec![
+                ("↑/↓", "scroll"),
+                ("←/→", "page"),
+                ("g/G", "top/bottom"),
+                ("i/esc", "close"),
+            ];
+        }
+        if self.current_series.is_some() {
+            let help = if self.show_full_help {
+                "close help"
+            } else {
+                "help"
+            };
+            return match self.series_view {
+                SeriesView::Seasons => vec![
+                    ("↑/↓", "move"),
+                    ("enter", "open season"),
+                    ("esc", "back"),
+                    ("r", "refresh"),
+                    ("?", help),
+                    ("q", "quit"),
+                ],
+                SeriesView::Episodes => vec![
+                    ("↑/↓", "move"),
+                    ("enter", "play"),
+                    ("i", "info"),
+                    ("w", "watched"),
+                    ("esc", "back"),
+                    ("r", "refresh"),
+                    ("?", help),
+                    ("q", "quit"),
+                ],
+                SeriesView::EpisodeInfo => vec![
+                    ("↑/↓", "scroll"),
+                    ("←/→", "page"),
+                    ("g/G", "top/bottom"),
+                    ("i/esc", "close"),
+                    ("q", "quit"),
+                ],
+            };
         }
         let mut entries = Vec::new();
         if self.drilled_in() {
@@ -1117,6 +1778,9 @@ impl Browse {
             )
         }) {
             entries.push(("w", "toggle watched"));
+        }
+        if self.current_item().is_some_and(info_available) {
+            entries.push(("i", "info"));
         }
         if self.tab == Tab::Search && self.current_series.is_none() {
             entries.push(("/", "search"));
@@ -1149,9 +1813,30 @@ impl Browse {
         entries
     }
 
+    /// Columns for the expanded (`?`) help: navigation on the left, the
+    /// context-aware `help_entries` on the right, so the full help shows only
+    /// what applies to the current screen (never a stale cheat sheet).
+    fn help_sections(&self) -> Vec<help::Section> {
+        let mut nav = help::NAV.to_vec();
+        if !self.drilled_in() && !self.info_open {
+            nav.push(("tab", "next tab"));
+            nav.push(("shift+tab", "prev tab"));
+        }
+        vec![
+            help::Section {
+                title: "Move",
+                entries: nav,
+            },
+            help::Section {
+                title: "Actions",
+                entries: self.help_entries(),
+            },
+        ]
+    }
+
     fn draw_help(&self, frame: &mut Frame, area: Rect) {
-        let buf = frame.buffer_mut();
         if !self.show_full_help {
+            let buf = frame.buffer_mut();
             let mut spans = vec![Span::raw("  ")];
             for (i, (key, desc)) in self.help_entries().into_iter().enumerate() {
                 if i > 0 {
@@ -1163,55 +1848,7 @@ impl Browse {
             Line::from(spans).render(area, buf);
             return;
         }
-
-        let mut third: Vec<(&str, &str)> = vec![("w", "toggle watched")];
-        if self.sort_key_available() {
-            third.push(("s", "sort (in collection)"));
-        }
-        third.push(("q", "quit"));
-        third.push(("?", "close help"));
-        let columns: [&[(&str, &str)]; 3] = [
-            &[
-                ("↑/k", "up"),
-                ("↓/j", "down"),
-                ("pgup/b/u", "page up"),
-                ("pgdn/f/d", "page down"),
-                ("g/home", "go to start"),
-                ("G/end", "go to end"),
-            ],
-            &[
-                ("→/l", "next tab"),
-                ("←/h", "prev tab"),
-                ("r", "refresh"),
-                ("enter", "select"),
-                ("/", "search/filter"),
-                ("esc", "clear/back"),
-            ],
-            &third,
-        ];
-        let areas = Layout::horizontal([
-            Constraint::Length(26),
-            Constraint::Length(26),
-            Constraint::Length(26),
-        ])
-        .split(area);
-        for (column, column_area) in columns.iter().zip(areas.iter()) {
-            for (row, (key, desc)) in column.iter().enumerate() {
-                if (row as u16) < column_area.height {
-                    let line_area = Rect::new(
-                        column_area.x,
-                        column_area.y + row as u16,
-                        column_area.width,
-                        1,
-                    );
-                    Line::from(vec![
-                        Span::styled(format!("  {key:<10}"), Style::new().fg(theme::dim_color())),
-                        Span::styled(desc.to_string(), theme::dim()),
-                    ])
-                    .render(line_area, buf);
-                }
-            }
-        }
+        help::draw(frame, area, &self.help_sections());
     }
 }
 
@@ -1257,6 +1894,41 @@ mod tests {
             LibraryKind::Other
         );
         assert_eq!(library_kind(&library("e", None)), LibraryKind::Other);
+    }
+
+    fn episode(season: Option<i32>, number: i32, played: bool) -> MediaItem {
+        MediaItem {
+            id: "x".into(),
+            kind: ItemKind::Episode,
+            parent_index_number: season,
+            index_number: Some(number),
+            user_data: Some(crate::jellyfin::models::UserData {
+                played: Some(played),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn group_seasons_buckets_by_number_in_first_seen_order() {
+        let items = vec![
+            episode(Some(1), 1, true),
+            episode(Some(1), 2, false),
+            episode(Some(2), 1, false),
+            episode(None, 1, true), // a special with no season number
+            episode(Some(2), 2, true),
+        ];
+        let seasons = group_seasons(&items);
+        assert_eq!(seasons.len(), 3);
+        // First-seen order preserved: season 1, season 2, then the None bucket.
+        assert_eq!(seasons[0].number, Some(1));
+        assert_eq!((seasons[0].episode_count, seasons[0].watched_count), (2, 1));
+        assert_eq!(seasons[1].number, Some(2));
+        assert_eq!((seasons[1].episode_count, seasons[1].watched_count), (2, 1));
+        assert_eq!(seasons[2].number, None);
+        assert_eq!((seasons[2].episode_count, seasons[2].watched_count), (1, 1));
+        assert!(group_seasons(&[]).is_empty());
     }
 
     #[test]

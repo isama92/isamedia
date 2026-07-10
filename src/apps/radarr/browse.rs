@@ -23,7 +23,7 @@ use crate::radarr::{
 };
 use crate::ui::input::TextInput;
 use crate::ui::text::{truncate, wrap_text};
-use crate::ui::{list, prompt, theme};
+use crate::ui::{help, list, prompt, theme};
 
 use super::msg::{CommandKind, Msg};
 
@@ -1278,12 +1278,12 @@ impl Browse {
         if self.add_flow.is_some() {
             let count = self.add_step_option_count();
             match key.code {
-                KeyCode::Up | KeyCode::Char('k') => {
+                KeyCode::Up => {
                     if let Some(flow) = self.add_flow.as_mut() {
                         flow.cursor = flow.cursor.saturating_sub(1);
                     }
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
+                KeyCode::Down => {
                     if let Some(flow) = self.add_flow.as_mut() {
                         flow.cursor = (flow.cursor + 1).min(count.saturating_sub(1));
                     }
@@ -1352,10 +1352,10 @@ impl Browse {
 
         if let Some(selected) = self.sort_menu {
             match key.code {
-                KeyCode::Up | KeyCode::Char('k') => {
+                KeyCode::Up => {
                     self.sort_menu = Some(selected.saturating_sub(1));
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
+                KeyCode::Down => {
                     self.sort_menu = Some((selected + 1).min(MOVIE_SORTS.len() - 1));
                 }
                 KeyCode::Enter => {
@@ -1375,10 +1375,10 @@ impl Browse {
         }
         if let Some(selected) = self.search_menu {
             match key.code {
-                KeyCode::Up | KeyCode::Char('k') => {
+                KeyCode::Up => {
                     self.search_menu = Some(selected.saturating_sub(1));
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
+                KeyCode::Down => {
                     self.search_menu = Some((selected + 1).min(SEARCH_MENU_OPTIONS.len() - 1));
                 }
                 KeyCode::Enter => {
@@ -1396,10 +1396,10 @@ impl Browse {
                 .map(|release| release.rejections.len())
                 .unwrap_or(0);
             match key.code {
-                KeyCode::Up | KeyCode::Char('k') => {
+                KeyCode::Up => {
                     self.rejections_popup = Some(selected.saturating_sub(1));
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
+                KeyCode::Down => {
                     self.rejections_popup = Some((selected + 1).min(count.saturating_sub(1)));
                 }
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('x') => {
@@ -1414,21 +1414,23 @@ impl Browse {
         if self.overview_fullscreen {
             let page = self.last_height.saturating_sub(4).max(1) as usize;
             match key.code {
-                KeyCode::Up | KeyCode::Char('k') => {
+                KeyCode::Up => {
                     self.overview_scroll = self.overview_scroll.saturating_sub(1);
                 }
-                KeyCode::Down | KeyCode::Char('j') => self.overview_scroll += 1,
-                KeyCode::PageUp | KeyCode::Char('b') | KeyCode::Char('u') => {
+                KeyCode::Down => self.overview_scroll += 1,
+                KeyCode::PageUp | KeyCode::Left => {
                     self.overview_scroll = self.overview_scroll.saturating_sub(page);
                 }
-                KeyCode::PageDown | KeyCode::Char('f') | KeyCode::Char('d') => {
+                KeyCode::PageDown | KeyCode::Right => {
                     self.overview_scroll += page;
                 }
                 KeyCode::Home | KeyCode::Char('g') => self.overview_scroll = 0,
-                KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('v') => {
+                KeyCode::End | KeyCode::Char('G') => self.overview_scroll = usize::MAX,
+                KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('i') => {
                     self.overview_fullscreen = false;
                     self.overview_scroll = 0;
                 }
+                KeyCode::Char('?') => self.show_full_help = !self.show_full_help,
                 KeyCode::Char('q') => return Some(BrowseAction::Quit),
                 _ => {}
             }
@@ -1437,31 +1439,31 @@ impl Browse {
 
         let page_jump = (self.last_height / 5).max(1) as usize;
         match key.code {
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Up => {
                 if let Some((cursor, _)) = self.cursor_and_len() {
                     *cursor = cursor.saturating_sub(1);
                 }
             }
-            KeyCode::Down | KeyCode::Char('j') => {
+            KeyCode::Down => {
                 if let Some((cursor, len)) = self.cursor_and_len()
                     && *cursor + 1 < len
                 {
                     *cursor += 1;
                 }
             }
-            // Opening Downloads must come before the `d` page-down alias
-            // below, but only claims `d` on the main list.
+            // `d` opens Downloads on the main list only; it is no longer a
+            // page-down alias, so it is unbound on every other level.
             KeyCode::Char('d') if matches!(self.level, Level::MovieList) => {
                 self.level = Level::Downloads;
                 self.downloads.reset();
                 self.fetch_queue();
             }
-            KeyCode::PageUp | KeyCode::Char('b') | KeyCode::Char('u') => {
+            KeyCode::PageUp | KeyCode::Left => {
                 if let Some((cursor, _)) = self.cursor_and_len() {
                     *cursor = cursor.saturating_sub(page_jump);
                 }
             }
-            KeyCode::PageDown | KeyCode::Char('f') | KeyCode::Char('d') => {
+            KeyCode::PageDown | KeyCode::Right => {
                 if let Some((cursor, len)) = self.cursor_and_len() {
                     *cursor = (*cursor + page_jump).min(len.saturating_sub(1));
                 }
@@ -1511,7 +1513,7 @@ impl Browse {
                         .unwrap_or(0),
                 );
             }
-            KeyCode::Char('v') if matches!(self.level, Level::MovieDetail { .. }) => {
+            KeyCode::Char('i') if matches!(self.level, Level::MovieDetail { .. }) => {
                 self.overview_fullscreen = true;
                 self.overview_scroll = 0;
             }
@@ -1558,7 +1560,11 @@ impl Browse {
         let show_filter = self.filter_active && matches!(self.level, Level::MovieList);
         let show_add_input = matches!(self.level, Level::Add);
         let show_input = show_filter || show_add_input;
-        let help_height = if self.show_full_help { 8 } else { 1 };
+        let help_height = if self.show_full_help {
+            help::rows(&self.help_sections())
+        } else {
+            1
+        };
 
         let rows = Layout::vertical([
             Constraint::Length(if has_message { 1 } else { 0 }),
@@ -1769,7 +1775,7 @@ impl Browse {
                 Span::styled(quality.clone(), Style::new().fg(theme::fg()))
             }
             MovieStatus::Downloading(percent) => Span::styled(
-                format!("↓ {percent}%"),
+                format!("{} {percent}%", display::GLYPH_DOWNLOADING),
                 Style::new().fg(theme::accent_bright()),
             ),
             MovieStatus::Missing => Span::styled("missing".to_string(), theme::error()),
@@ -1920,7 +1926,7 @@ impl Browse {
         }
         if overview_truncated {
             line(
-                Line::from(Span::styled("  … (v: full overview)", theme::dim())),
+                Line::from(Span::styled("  … (i: full overview)", theme::dim())),
                 &mut y,
             );
         }
@@ -2132,10 +2138,16 @@ impl Browse {
                 ),
             ];
             if release.rejected {
-                detail.push(Span::styled(" !", theme::error()));
+                detail.push(Span::styled(
+                    format!(" {}", display::GLYPH_REJECTED),
+                    theme::error(),
+                ));
             }
             if display::previously_grabbed(&self.history, release) {
-                detail.push(Span::styled(" ✓", Style::new().fg(theme::accent_bright())));
+                detail.push(Span::styled(
+                    format!(" {}", display::GLYPH_GRABBED),
+                    Style::new().fg(theme::accent_bright()),
+                ));
             }
             if y + 1 < area.y + area.height {
                 Line::from(vec![gutter(selected), Span::styled(title, title_style)])
@@ -2160,14 +2172,14 @@ impl Browse {
             return vec![("esc", "unfocus"), ("enter", "search")];
         }
         if self.add_flow.is_some() {
-            return vec![("j/k", "move"), ("enter", "next"), ("esc", "cancel")];
+            return vec![("↑/↓", "move"), ("enter", "next"), ("esc", "cancel")];
         }
         if self.confirm.is_some() {
             return vec![("y/enter", "confirm"), ("n/esc", "cancel")];
         }
         if self.delete_prompt.is_some() {
             return vec![
-                ("j/k", "move"),
+                ("↑/↓", "move"),
                 ("space", "toggle"),
                 ("enter", "delete"),
                 ("esc", "cancel"),
@@ -2175,7 +2187,7 @@ impl Browse {
         }
         if self.downloads.is_prompting() {
             return vec![
-                ("j/k", "move"),
+                ("↑/↓", "move"),
                 ("space", "toggle"),
                 ("enter", "remove"),
                 ("esc", "cancel"),
@@ -2188,7 +2200,7 @@ impl Browse {
             return vec![("esc", "close")];
         }
         if self.overview_fullscreen {
-            return vec![("esc/v", "back"), ("j/k", "scroll")];
+            return vec![("esc/i", "back"), ("↑/↓", "scroll")];
         }
         let mut entries: Vec<(&'static str, &'static str)> = Vec::new();
         match &self.level {
@@ -2214,7 +2226,7 @@ impl Browse {
                     entries.push(("x", "delete file"));
                 }
                 entries.push(("z", "delete"));
-                entries.push(("v", "overview"));
+                entries.push(("i", "overview"));
             }
             Level::Search { .. } => {
                 entries.push(("esc", "back"));
@@ -2245,9 +2257,29 @@ impl Browse {
         entries
     }
 
+    /// Columns for the expanded (`?`) help: shared navigation, the
+    /// level-aware `help_entries`, and the symbol legend as its own labelled
+    /// column so the glyphs are never mistaken for keybindings.
+    fn help_sections(&self) -> Vec<help::Section> {
+        vec![
+            help::Section {
+                title: "Move",
+                entries: help::NAV.to_vec(),
+            },
+            help::Section {
+                title: "Actions",
+                entries: self.help_entries(),
+            },
+            help::Section {
+                title: "Symbols",
+                entries: display::SYMBOL_LEGEND.to_vec(),
+            },
+        ]
+    }
+
     fn draw_help(&self, frame: &mut Frame, area: Rect) {
-        let buf = frame.buffer_mut();
         if !self.show_full_help {
+            let buf = frame.buffer_mut();
             let mut spans = vec![Span::raw("  ")];
             for (i, (key, desc)) in self.help_entries().into_iter().enumerate() {
                 if i > 0 {
@@ -2259,56 +2291,7 @@ impl Browse {
             Line::from(spans).render(area, buf);
             return;
         }
-
-        let columns: [&[(&str, &str)]; 3] = [
-            &[
-                ("↑/k", "up"),
-                ("↓/j", "down"),
-                ("pgup/b/u", "page up"),
-                ("pgdn/f/d", "page down"),
-                ("g/home", "go to start"),
-                ("G/end", "go to end"),
-            ],
-            &[
-                ("enter", "open/search"),
-                ("esc", "back/clear"),
-                ("/", "filter movies"),
-                ("s", "sort movies"),
-                ("v", "full overview"),
-                ("r", "refresh"),
-            ],
-            &[
-                ("x", "delete file / rejections"),
-                ("z", "delete movie"),
-                ("! ✓", "rejected / grabbed before"),
-                ("↓", "downloading"),
-                ("q", "quit"),
-                ("?", "close help"),
-            ],
-        ];
-        let areas = Layout::horizontal([
-            Constraint::Length(26),
-            Constraint::Length(26),
-            Constraint::Length(34),
-        ])
-        .split(area);
-        for (column, column_area) in columns.iter().zip(areas.iter()) {
-            for (row, (key, desc)) in column.iter().enumerate() {
-                if (row as u16) < column_area.height {
-                    let line_area = Rect::new(
-                        column_area.x,
-                        column_area.y + row as u16,
-                        column_area.width,
-                        1,
-                    );
-                    Line::from(vec![
-                        Span::styled(format!("  {key:<10}"), Style::new().fg(theme::dim_color())),
-                        Span::styled(desc.to_string(), theme::dim()),
-                    ])
-                    .render(line_area, buf);
-                }
-            }
-        }
+        help::draw(frame, area, &self.help_sections());
     }
 }
 

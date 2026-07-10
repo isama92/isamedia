@@ -151,13 +151,13 @@ impl SettingsApp {
         let cursor = editing.cursor;
         let count = choice_count(setting);
         match key.code {
-            KeyCode::Up | KeyCode::Char('k') if count > 0 => {
+            KeyCode::Up if count > 0 => {
                 self.editor = Editor::Choice(Editing {
                     setting,
                     cursor: (cursor + count - 1) % count,
                 });
             }
-            KeyCode::Down | KeyCode::Char('j') if count > 0 => {
+            KeyCode::Down if count > 0 => {
                 self.editor = Editor::Choice(Editing {
                     setting,
                     cursor: (cursor + 1) % count,
@@ -225,7 +225,7 @@ impl SettingsApp {
             }
         }
         if area.height as usize > rows.len() + 1 {
-            Line::styled("  enter: change   j/k: move   q: quit", theme::dim()).render(
+            Line::styled("  enter: change   up/down: move   q: quit", theme::dim()).render(
                 Rect::new(area.x, area.y + area.height - 1, area.width, 1),
                 buf,
             );
@@ -754,10 +754,10 @@ impl MediaApp for SettingsApp {
 
         let rows = self.rows();
         match key.code {
-            KeyCode::Up | KeyCode::Char('k') if !rows.is_empty() => {
+            KeyCode::Up if !rows.is_empty() => {
                 self.cursor = (self.cursor + rows.len() - 1) % rows.len();
             }
-            KeyCode::Down | KeyCode::Char('j') if !rows.is_empty() => {
+            KeyCode::Down if !rows.is_empty() => {
                 self.cursor = (self.cursor + 1) % rows.len();
             }
             KeyCode::Enter => {

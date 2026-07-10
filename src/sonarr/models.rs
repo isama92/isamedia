@@ -61,10 +61,14 @@ pub struct Episode {
     pub season_number: i32,
     pub episode_number: i32,
     pub title: Option<String>,
+    /// Plot/description; returned by /episode by default. Shown by the info view.
+    pub overview: Option<String>,
     /// Air date as "YYYY-MM-DD", already in the series' timezone.
     pub air_date: Option<String>,
     /// Air moment as an ISO UTC datetime; the unaired check uses this.
     pub air_date_utc: Option<String>,
+    /// Runtime in minutes; sent by v4, absent on older v3.
+    pub runtime: Option<i32>,
     pub has_file: bool,
     pub monitored: bool,
     pub episode_file_id: i64,
@@ -137,8 +141,10 @@ mod tests {
             "seasonNumber": 1,
             "episodeNumber": 5,
             "title": "The Path to the Wizard King",
+            "overview": "Asta and Yuno chase the wizard king dream.",
             "airDate": "2017-11-07",
             "airDateUtc": "2017-11-07T09:25:00Z",
+            "runtime": 24,
             "hasFile": true,
             "monitored": true,
             "episodeFileId": 88,
@@ -161,6 +167,11 @@ mod tests {
         }"#;
         let episode: Episode = serde_json::from_str(with_file).unwrap();
         assert!(episode.has_file);
+        assert_eq!(
+            episode.overview.as_deref(),
+            Some("Asta and Yuno chase the wizard king dream.")
+        );
+        assert_eq!(episode.runtime, Some(24));
         let file = episode.episode_file.as_ref().unwrap();
         assert_eq!(
             file.quality.as_ref().unwrap().quality.name.as_deref(),
@@ -188,6 +199,8 @@ mod tests {
         assert!(!episode.has_file);
         assert!(episode.episode_file.is_none());
         assert!(episode.air_date_utc.is_none());
+        assert!(episode.overview.is_none());
+        assert!(episode.runtime.is_none());
     }
 
     #[test]
