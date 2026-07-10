@@ -14,7 +14,7 @@ use ratatui::text::Line;
 use ratatui::widgets::Widget;
 
 use crate::app::{AppId, MediaApp, ShellRequest};
-use crate::config::Config;
+use crate::config::{Config, LanguageOverrides};
 use crate::event::AppSender;
 use crate::jellyfin::{Client, Credentials, MediaItem};
 use crate::player::{self, PlayerEvent, PlayerHandle};
@@ -69,6 +69,12 @@ pub struct JellyfinApp {
     /// freshly stored token instead of being forced back to the login form.
     reauth: Arc<std::sync::atomic::AtomicU64>,
     seen_reauth: u64,
+    /// Remembered per-movie/per-show track switches. Only this app touches
+    /// them (read at playback start, written on `TrackSwitched`, both on the
+    /// render thread), so they live here as plain state, in their own file
+    /// (`language_overrides.json`) rather than in the shared config.
+    overrides: LanguageOverrides,
+    overrides_path: PathBuf,
 }
 
 impl JellyfinApp {
@@ -79,6 +85,8 @@ impl JellyfinApp {
         reauth: Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
         let seen_reauth = reauth.load(Ordering::Relaxed);
+        let overrides_path = LanguageOverrides::path_for(&config_path);
+        let overrides = LanguageOverrides::load(&overrides_path);
         Self {
             config,
             config_path,
@@ -91,6 +99,8 @@ impl JellyfinApp {
             browse_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             reauth,
             seen_reauth,
+            overrides,
+            overrides_path,
         }
     }
 
@@ -99,11 +109,19 @@ impl JellyfinApp {
             return;
         };
         let client = browse.client.clone();
-        let skip_types = self.config.lock().unwrap().jellyfin.skip_segments.clone();
+        let (skip_types, prefs) = {
+            let config = self.config.lock().unwrap();
+            let jf = &config.jellyfin;
+            (
+                jf.skip_segments.clone(),
+                self.overrides
+                    .language_prefs(player::override_key(&item), jf),
+            )
+        };
         self.player_gen += 1;
         let player_gen = self.player_gen;
         let sender = self.sender.clone();
-        let handle = player::spawn(client, item, skip_types, move |event| {
+        let handle = player::spawn(client, item, skip_types, prefs, move |event| {
             sender.send(Msg::Player { player_gen, event });
         });
         self.player = Some(handle);
@@ -126,6 +144,23 @@ impl JellyfinApp {
             PlayerEvent::Duration { secs } => {
                 if let Some(player) = &mut self.player {
                     player.now.duration_secs = Some(secs);
+                }
+            }
+            PlayerEvent::TrackSwitched {
+                override_key,
+                kind,
+                selection,
+            } => {
+                let entry = self.overrides.entry(override_key);
+                match kind {
+                    player::TrackKind::Audio => entry.audio = Some(selection),
+                    player::TrackKind::Subtitle => entry.subtitles = Some(selection),
+                }
+                // Small synchronous write, same weight as the theme saves;
+                // the supervisor only emits genuine switches, so this stays
+                // rare.
+                if let Err(err) = self.overrides.save(&self.overrides_path) {
+                    tracing::warn!(%err, "failed to persist language override");
                 }
             }
             PlayerEvent::Failed(message) => {

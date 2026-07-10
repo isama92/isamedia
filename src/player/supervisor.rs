@@ -4,16 +4,18 @@
 
 use std::time::Duration;
 
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, WriteHalf};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
+use crate::config::{LanguagePrefs, TrackPreference};
 use crate::jellyfin::{Client, MediaItem, display, url::stream_url};
+use crate::lang;
 
 use super::ipc::{self, IpcStream};
 use super::ticks::{seconds_to_ticks, ticks_to_seconds};
-use super::{PlayerCommand, PlayerEvent};
+use super::{PlayerCommand, PlayerEvent, TrackKind, override_key};
 
 const PROGRESS_REPORT_INTERVAL: Duration = Duration::from_secs(3);
 /// How long to wait for mpv to exit after we ask it to quit.
@@ -59,6 +61,95 @@ fn load_order(len: usize, index: usize, include_prior: bool) -> Vec<usize> {
         order.extend((0..index).rev());
     }
     order
+}
+
+/// Commands applying the language preferences once, before the playlist
+/// loads. alang/slang/sid are global options while mpv idles, so every
+/// playlist entry inherits them — which is exactly why they are not passed
+/// as per-file loadfile options: a mid-session switch could then never
+/// affect the already-loaded later entries.
+fn language_setup_cmds(prefs: &LanguagePrefs) -> Vec<Vec<Value>> {
+    let mut cmds = Vec::new();
+    if let Some(TrackPreference::Language(code)) = &prefs.audio {
+        cmds.push(ipc::set_property_cmd(
+            "alang",
+            json!(lang::mpv_lang_list(code)),
+        ));
+    }
+    match &prefs.subtitles {
+        Some(TrackPreference::Language(code)) => cmds.push(ipc::set_property_cmd(
+            "slang",
+            json!(lang::mpv_lang_list(code)),
+        )),
+        Some(TrackPreference::Off) => cmds.push(ipc::set_property_cmd("sid", json!("no"))),
+        _ => {}
+    }
+    cmds
+}
+
+/// Commands re-asserting the session preference between playlist entries
+/// after a user switch. Resetting aid/sid to "auto" is essential: the
+/// switch left a numeric track id in the option, which would beat
+/// alang/slang on the next file and can map to a different language there.
+fn language_reapply_cmds(prefs: &LanguagePrefs) -> Vec<Vec<Value>> {
+    let mut cmds = Vec::new();
+    match &prefs.audio {
+        Some(TrackPreference::Language(code)) => {
+            cmds.push(ipc::set_property_cmd(
+                "alang",
+                json!(lang::mpv_lang_list(code)),
+            ));
+            cmds.push(ipc::set_property_cmd("aid", json!("auto")));
+        }
+        Some(TrackPreference::Default) => {
+            cmds.push(ipc::set_property_cmd("alang", json!("")));
+            cmds.push(ipc::set_property_cmd("aid", json!("auto")));
+        }
+        Some(TrackPreference::Off) | None => {}
+    }
+    match &prefs.subtitles {
+        Some(TrackPreference::Language(code)) => {
+            cmds.push(ipc::set_property_cmd(
+                "slang",
+                json!(lang::mpv_lang_list(code)),
+            ));
+            cmds.push(ipc::set_property_cmd("sid", json!("auto")));
+        }
+        Some(TrackPreference::Off) => {
+            cmds.push(ipc::set_property_cmd("slang", json!("")));
+            cmds.push(ipc::set_property_cmd("sid", json!("no")));
+        }
+        Some(TrackPreference::Default) | None => {}
+    }
+    cmds
+}
+
+/// Map an aid/sid property-change value to a remembered preference, or None
+/// when it should be ignored: an untagged track (no language to remember),
+/// "auto"/null/malformed data, an id missing from the track cache, or audio
+/// switched off (muting audio is not a language choice).
+fn classify_selection(
+    kind: TrackKind,
+    data: Option<&Value>,
+    tracks: &[ipc::Track],
+) -> Option<TrackPreference> {
+    let data = data?;
+    if let Some(id) = data.as_i64() {
+        let track_kind = match kind {
+            TrackKind::Audio => "audio",
+            TrackKind::Subtitle => "sub",
+        };
+        let track = tracks
+            .iter()
+            .find(|track| track.kind == track_kind && track.id == id)?;
+        let tag = track.lang.as_deref()?;
+        return Some(TrackPreference::Language(lang::canonical(tag)));
+    }
+    let off = matches!(data, Value::Bool(false)) || data.as_str() == Some("no");
+    if off && kind == TrackKind::Subtitle {
+        return Some(TrackPreference::Off);
+    }
+    None
 }
 
 /// End of the segment `pos` is inside of, if any.
@@ -168,6 +259,7 @@ pub(super) async fn run(
     items: Vec<MediaItem>,
     index: usize,
     skip_types: Vec<String>,
+    prefs: LanguagePrefs,
     mut cmd_rx: mpsc::UnboundedReceiver<PlayerCommand>,
     emit: &(impl Fn(PlayerEvent) + Send + Sync),
 ) {
@@ -235,6 +327,18 @@ pub(super) async fn run(
         return;
     }
     let _ = ipc.send(&ipc::observe_property_cmd(2, "duration")).await;
+    // aid/sid feed the track-switch memory; track-list keeps a local cache
+    // so a switched track id can be mapped back to its language without
+    // request/reply matching.
+    let _ = ipc.send(&ipc::observe_property_cmd(3, "aid")).await;
+    let _ = ipc.send(&ipc::observe_property_cmd(4, "sid")).await;
+    let _ = ipc.send(&ipc::observe_property_cmd(5, "track-list")).await;
+
+    for command in language_setup_cmds(&prefs) {
+        if let Err(err) = ipc.send(&command).await {
+            tracing::error!(%err, "failed to apply language preferences");
+        }
+    }
 
     // Load the playlist; `playlist[entry_id - 1]` maps back to an item index.
     let playlist = load_order(items.len(), index, !old_mpv);
@@ -271,6 +375,14 @@ pub(super) async fn run(
     let mut last_emitted_sec = i64::MIN;
     let mut quit_deadline: Option<Instant> = None;
     let mut cmd_open = true;
+    // Track-switch memory. aid/sid changes count as user actions only inside
+    // the window between file-loaded and the next start-file/end-file:
+    // everything outside it is the observe registration echo, mpv's per-file
+    // auto-selection, or our own setup/reapply churn.
+    let mut session_prefs = prefs;
+    let mut prefs_dirty = false;
+    let mut user_window = false;
+    let mut tracks: Vec<ipc::Track> = Vec::new();
 
     // Background tasks report a 401 here; the supervisor owns `emit` and
     // raises SessionExpired (once) so the app can run its re-login flow.
@@ -344,10 +456,49 @@ pub(super) async fn run(
                                 emit(PlayerEvent::Duration { secs });
                             }
                         }
+                        Some("track-list") => {
+                            if let Some(data) = msg.data.as_ref() {
+                                tracks = ipc::parse_track_list(data);
+                            }
+                        }
+                        Some(name @ ("aid" | "sid")) => {
+                            if !user_window {
+                                continue;
+                            }
+                            let kind = if name == "aid" {
+                                TrackKind::Audio
+                            } else {
+                                TrackKind::Subtitle
+                            };
+                            let Some(selection) =
+                                classify_selection(kind, msg.data.as_ref(), &tracks)
+                            else {
+                                continue;
+                            };
+                            let field = match kind {
+                                TrackKind::Audio => &mut session_prefs.audio,
+                                TrackKind::Subtitle => &mut session_prefs.subtitles,
+                            };
+                            // mpv can repeat the property; only a genuine
+                            // change is remembered (this also bounds config
+                            // writes to distinct switches).
+                            if field.as_ref() == Some(&selection) {
+                                continue;
+                            }
+                            *field = Some(selection.clone());
+                            prefs_dirty = true;
+                            tracing::info!(?kind, ?selection, "user switched track");
+                            emit(PlayerEvent::TrackSwitched {
+                                override_key: override_key(&current).to_string(),
+                                kind,
+                                selection,
+                            });
+                        }
                         _ => {}
                     },
 
                     Some("start-file") => {
+                        user_window = false;
                         let entry = msg.playlist_entry_id.unwrap_or(0) - 1;
                         let Some(&item_index) = usize::try_from(entry)
                             .ok()
@@ -426,7 +577,34 @@ pub(super) async fn run(
                         report_due = true;
                     }
 
-                    Some("end-file") | Some("shutdown") => {
+                    Some("file-loaded") => {
+                        // mpv finished this file's own track selection; any
+                        // aid/sid change from here on is the user's doing.
+                        user_window = true;
+                    }
+
+                    Some("end-file") => {
+                        user_window = false;
+                        // A switch happened during the finished file: point
+                        // alang/slang at the new choice and put aid/sid back
+                        // on auto so the next entry selects by language, not
+                        // by a track id that means something else there.
+                        if prefs_dirty {
+                            prefs_dirty = false;
+                            for command in language_reapply_cmds(&session_prefs) {
+                                if let Err(err) = ipc.send(&command).await {
+                                    tracing::error!(%err, "failed to reapply language preferences");
+                                }
+                            }
+                        }
+                        let _ = report_tx.send(Report::Stopped {
+                            item_id: current.id.clone(),
+                            ticks: seconds_to_ticks(pos),
+                        });
+                    }
+
+                    Some("shutdown") => {
+                        user_window = false;
                         let _ = report_tx.send(Report::Stopped {
                             item_id: current.id.clone(),
                             ticks: seconds_to_ticks(pos),
@@ -527,5 +705,125 @@ mod tests {
         assert_eq!(inside_skippable_segment(&segments, 299.9), None);
         assert_eq!(inside_skippable_segment(&segments, 300.0), Some(330.0));
         assert_eq!(inside_skippable_segment(&segments, 5.0), None);
+    }
+
+    fn prefs(audio: Option<TrackPreference>, subtitles: Option<TrackPreference>) -> LanguagePrefs {
+        LanguagePrefs { audio, subtitles }
+    }
+
+    fn shapes(cmds: &[Vec<Value>]) -> Vec<String> {
+        cmds.iter()
+            .map(|cmd| serde_json::to_string(cmd).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn setup_cmds_per_preference() {
+        assert!(language_setup_cmds(&prefs(None, None)).is_empty());
+        // Default track = leave mpv entirely alone.
+        assert!(language_setup_cmds(&prefs(Some(TrackPreference::Default), None)).is_empty());
+
+        let cmds = language_setup_cmds(&prefs(
+            Some(TrackPreference::Language("ita".into())),
+            Some(TrackPreference::Off),
+        ));
+        assert_eq!(
+            shapes(&cmds),
+            vec![
+                r#"["set_property","alang","ita,it"]"#,
+                r#"["set_property","sid","no"]"#,
+            ]
+        );
+
+        let cmds = language_setup_cmds(&prefs(None, Some(TrackPreference::Language("ger".into()))));
+        assert_eq!(
+            shapes(&cmds),
+            vec![r#"["set_property","slang","ger,deu,de"]"#]
+        );
+    }
+
+    #[test]
+    fn reapply_cmds_reset_track_ids() {
+        assert!(language_reapply_cmds(&prefs(None, None)).is_empty());
+
+        let cmds = language_reapply_cmds(&prefs(
+            Some(TrackPreference::Language("jpn".into())),
+            Some(TrackPreference::Off),
+        ));
+        assert_eq!(
+            shapes(&cmds),
+            vec![
+                r#"["set_property","alang","jpn,ja"]"#,
+                r#"["set_property","aid","auto"]"#,
+                r#"["set_property","slang",""]"#,
+                r#"["set_property","sid","no"]"#,
+            ]
+        );
+
+        // A switch back to the default track clears alang so the next file
+        // is not still steered by the old preference.
+        let cmds = language_reapply_cmds(&prefs(
+            Some(TrackPreference::Default),
+            Some(TrackPreference::Language("eng".into())),
+        ));
+        assert_eq!(
+            shapes(&cmds),
+            vec![
+                r#"["set_property","alang",""]"#,
+                r#"["set_property","aid","auto"]"#,
+                r#"["set_property","slang","eng,en"]"#,
+                r#"["set_property","sid","auto"]"#,
+            ]
+        );
+    }
+
+    #[test]
+    fn classify_selection_table() {
+        let tracks = ipc::parse_track_list(&serde_json::json!([
+            {"id": 1, "type": "audio", "lang": "jpn"},
+            {"id": 2, "type": "audio"},
+            {"id": 1, "type": "sub", "lang": "en"},
+        ]));
+
+        // Tagged track: remembered under its canonical /B code.
+        assert_eq!(
+            classify_selection(TrackKind::Audio, Some(&serde_json::json!(1)), &tracks),
+            Some(TrackPreference::Language("jpn".into()))
+        );
+        assert_eq!(
+            classify_selection(TrackKind::Subtitle, Some(&serde_json::json!(1)), &tracks),
+            Some(TrackPreference::Language("eng".into()))
+        );
+        // Untagged track, unknown id, "auto", null: nothing to remember.
+        assert_eq!(
+            classify_selection(TrackKind::Audio, Some(&serde_json::json!(2)), &tracks),
+            None
+        );
+        assert_eq!(
+            classify_selection(TrackKind::Audio, Some(&serde_json::json!(9)), &tracks),
+            None
+        );
+        assert_eq!(
+            classify_selection(TrackKind::Audio, Some(&serde_json::json!("auto")), &tracks),
+            None
+        );
+        assert_eq!(classify_selection(TrackKind::Audio, None, &tracks), None);
+        // Off: a subtitle choice, not an audio one.
+        assert_eq!(
+            classify_selection(
+                TrackKind::Subtitle,
+                Some(&serde_json::json!(false)),
+                &tracks
+            ),
+            Some(TrackPreference::Off)
+        );
+        assert_eq!(
+            classify_selection(TrackKind::Subtitle, Some(&serde_json::json!("no")), &tracks),
+            Some(TrackPreference::Off)
+        );
+        assert_eq!(
+            classify_selection(TrackKind::Audio, Some(&serde_json::json!(false)), &tracks),
+            None
+        );
     }
 }

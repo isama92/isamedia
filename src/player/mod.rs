@@ -9,11 +9,18 @@ pub mod ticks;
 
 use tokio::sync::mpsc;
 
+use crate::config::{LanguagePrefs, TrackPreference};
 use crate::jellyfin::{Client, MediaItem, display, models::ItemKind};
 
 #[derive(Debug, Clone, Copy)]
 pub enum PlayerCommand {
     Stop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackKind {
+    Audio,
+    Subtitle,
 }
 
 #[derive(Debug)]
@@ -28,6 +35,15 @@ pub enum PlayerEvent {
     },
     Duration {
         secs: f64,
+    },
+    /// The user switched a track inside mpv (auto-selection at file load is
+    /// filtered out by the supervisor). `override_key` is the config key the
+    /// choice should persist under: the movie id, or the series id for
+    /// episodes.
+    TrackSwitched {
+        override_key: String,
+        kind: TrackKind,
+        selection: TrackPreference,
     },
     /// Something went wrong; shown as the browse error line.
     Failed(String),
@@ -60,12 +76,20 @@ impl PlayerHandle {
     }
 }
 
+/// The key a remembered track switch persists under: whole-show for
+/// episodes (a Series item's own id equals its episodes' series id, so the
+/// two always agree), per-movie otherwise.
+pub fn override_key(item: &MediaItem) -> &str {
+    item.series_id.as_deref().unwrap_or(&item.id)
+}
+
 /// Start playing `item`. Episodes are expanded to their full series as an
 /// mpv playlist positioned at the selected episode, like jfsh.
 pub fn spawn(
     client: Client,
     item: MediaItem,
     skip_types: Vec<String>,
+    prefs: LanguagePrefs,
     emit: impl Fn(PlayerEvent) + Send + Sync + 'static,
 ) -> PlayerHandle {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -100,8 +124,29 @@ pub fn spawn(
         } else {
             (vec![item], 0)
         };
-        supervisor::run(client, items, index, skip_types, cmd_rx, &emit).await;
+        supervisor::run(client, items, index, skip_types, prefs, cmd_rx, &emit).await;
         emit(PlayerEvent::Exited);
     });
     PlayerHandle { cmd_tx, now }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn override_key_prefers_series() {
+        let movie = MediaItem {
+            id: "movie-1".into(),
+            ..MediaItem::default()
+        };
+        assert_eq!(override_key(&movie), "movie-1");
+
+        let episode = MediaItem {
+            id: "ep-9".into(),
+            series_id: Some("show-3".into()),
+            ..MediaItem::default()
+        };
+        assert_eq!(override_key(&episode), "show-3");
+    }
 }
