@@ -639,12 +639,27 @@ impl Browse {
     }
 }
 
+/// Truncate to a terminal column budget with a trailing ellipsis. Measures
+/// display width, not chars: CJK characters occupy two columns each.
 fn truncate(text: &str, max_width: usize) -> String {
-    if text.chars().count() <= max_width {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+    if text.width() <= max_width {
         return text.to_string();
     }
-    let truncated: String = text.chars().take(max_width.saturating_sub(1)).collect();
-    format!("{truncated}…")
+    let budget = max_width.saturating_sub(1); // leave a column for the ellipsis
+    let mut used = 0;
+    let mut truncated = String::new();
+    for c in text.chars() {
+        let char_width = c.width().unwrap_or(0);
+        if used + char_width > budget {
+            break;
+        }
+        used += char_width;
+        truncated.push(c);
+    }
+    truncated.push('…');
+    truncated
 }
 
 #[cfg(test)]
@@ -662,5 +677,18 @@ mod tests {
     fn truncate_handles_multibyte() {
         assert_eq!(truncate("héllo wörld", 20), "héllo wörld");
         assert_eq!(truncate("héllo wörld", 6), "héllo…");
+    }
+
+    #[test]
+    fn truncate_counts_display_width() {
+        use unicode_width::UnicodeWidthStr;
+
+        // 5 chars but 10 columns: fits a 10-column budget untouched...
+        assert_eq!(truncate("こんにちは", 10), "こんにちは");
+        // ...but a 6-column budget fits only 2 double-width chars + ellipsis.
+        assert_eq!(truncate("こんにちは", 6), "こん…");
+        // A double-width char never straddles the boundary.
+        assert_eq!(truncate("こんにちは", 5), "こん…");
+        assert!(truncate("攻殻機動隊 S01E01 (1995)", 12).width() <= 12);
     }
 }
