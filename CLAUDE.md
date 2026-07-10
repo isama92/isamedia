@@ -14,7 +14,8 @@ doesn't apply to a change, but don't silently break the patterns.
 - `thiserror` for library-style error enums, `anyhow` only at outer
   boundaries (`main.rs`, `config.rs`, CLI).
 - `tracing` (+ `tracing-subscriber`, `tracing-appender`) for all logging.
-- `clap` for CLI parsing.
+- `clap` for CLI parsing, `directories` for the config path, `uuid` for the
+  generated device id, `gethostname` for the device name.
 
 Don't reach for a new dependency to solve something the stack above already
 covers, and don't add a dependency for a use case the project doesn't have
@@ -34,6 +35,23 @@ is I/O-bound on network calls, not compute-bound).
 - Async work spawned from the event loop reports back via `Msg`; it never
   blocks or is awaited on the render thread.
 
+## Apps and the shell
+
+- Each tab is a `MediaApp` (see `app.rs`). Apps own their entire keymap and
+  state; the shell only handles quit, app switching, and frame chrome (tab
+  bar plus status bar). Route nothing app-specific through the shell.
+- Every app defines its own private `Msg` enum and sends it through
+  `AppSender`. The shell carries it as a type-erased `Box<dyn Any + Send>`;
+  the owning app downcasts in `on_event` and ignores foreign payloads. The
+  shell never needs to know an app's message types.
+- `status_line` may surface cross-tab state (e.g. a now-playing bar visible
+  from another tab). `on_quit` returns `true` to request a short shutdown
+  grace period for flush work such as the mpv quit and final playback report.
+- Adding an app (Sonarr, Radarr) means writing its module and swapping its
+  `ComingSoonApp` entry in `apps::build_apps`; the shell needs no changes.
+  Implement the full trait, including the generation-counter pattern on every
+  async path.
+
 ## REST client rules
 
 - Every request path needs a timeout (client-level or per-request) — an
@@ -44,8 +62,24 @@ is I/O-bound on network calls, not compute-bound).
   auth-expired (401) from server error from network failure.
 - If you add retry/backoff, make it exponential with a capped attempt count.
   Don't add naive immediate retries against a self-hosted server.
-- Any fetch triggered by user navigation must carry a generation counter and
-  be dropped if superseded, per the existing `Msg` pattern above.
+- Any fetch or mutation triggered by user action must carry a generation
+  counter and be dropped if superseded (for example a watched-toggle result
+  that lands after the user has switched tabs), per the `Msg` pattern above.
+
+## Player and external processes
+
+- The player runs mpv as a child process over JSON IPC. Playback state flows
+  back to the UI only as `PlayerEvent`s; never block the render loop to query
+  the player. A supervisor task owns the process and its socket.
+- Any spawned external process sets `kill_on_drop`, removes its IPC socket on
+  every exit path, and connects with a bounded poll (capped attempts, not an
+  unbounded wait) so a player that never starts cannot wedge the app.
+- A replaced player is told apart by `player_gen`; drop events whose
+  generation is stale, exactly like fetches.
+- Prefer authenticating mpv's stream requests with a header over a token in
+  the URL. If a credential must ride in the URL (e.g. a Jellyfin `api_key`),
+  redact it before it can reach a log; the mpv IPC debug log prints full
+  commands, URLs included. See the Security rules.
 
 ## TUI rules
 
@@ -53,7 +87,9 @@ is I/O-bound on network calls, not compute-bound).
   around `ratatui`'s restore). A raw-mode terminal left in a bad state on
   crash is worse than the crash itself.
 - No blocking calls on the render/event thread. All I/O happens in spawned
-  tokio tasks that report back via `Msg`.
+  tokio tasks that report back via `Msg`. The one sanctioned exception is the
+  small synchronous `Config::save` on app switch and after auth; keep such
+  writes tiny and push anything heavier onto a spawned task.
 - No `println!`/`eprintln!` anywhere reachable at runtime — stdout is the
   render surface. Use `tracing` macros exclusively.
 
@@ -64,6 +100,10 @@ is I/O-bound on network calls, not compute-bound).
 - No `.unwrap()`/`.expect()` on anything that can fail at runtime (network,
   filesystem, parsing) — a panic kills the whole session. `.expect()` is only
   for invariants already checked earlier in the same function.
+- The one accepted unwrap on a runtime failure is `.lock().unwrap()` on the
+  config mutex: a poisoned lock means another thread already panicked and the
+  session is unrecoverable, and the panic hook still restores the terminal.
+  Do not extend this to network, filesystem, or parse results.
 - Propagate with `?`; don't swallow errors by logging and continuing unless
   the caller genuinely doesn't need to know.
 
@@ -87,16 +127,22 @@ is I/O-bound on network calls, not compute-bound).
 - Tests that hit a real server are `#[ignore]`d and run manually (see
   `jellyfin::tests::demo_server_smoke`). Never let the default test run
   depend on network access.
-- New `Error` variants get a test asserting the status-code-to-variant
-  mapping, following the `AuthFailed`/`Unauthorized` examples.
+- The status-to-`Error`-variant mapping lives in `Client::send`, so today it
+  is only exercised by the ignored `demo_server_smoke` test. If you add
+  variants and want offline coverage, stand up an HTTP mock instead of
+  reaching for the network; never make the default test run depend on it.
 
 ## Security
 
 - Credentials live only in the config file at `Config::default_path()`,
-  written with `0600` permissions. Don't introduce a second place secrets
-  could land (env vars, cache files, temp files).
-- Never log tokens, passwords, or the `Authorization` header. Check
-  `tracing` calls near auth/request code for accidental leakage.
+  written with `0600` permissions. The file holds host, username, password,
+  and token in plaintext (jfsh parity), so `0600` is the only protection:
+  don't widen it, and don't copy secrets into env vars, cache files, or temp
+  files.
+- Never log tokens, passwords, or the `Authorization` header, including a
+  credential embedded in a URL (a Jellyfin `api_key` on a stream URL would
+  otherwise land in the mpv IPC debug log). Check `tracing` calls near auth,
+  request, and player code for accidental leakage.
 - No secrets or real hostnames in code or tests. The demo-server test only
   ever talks to the public Jellyfin demo instance.
 
@@ -114,5 +160,9 @@ is I/O-bound on network calls, not compute-bound).
 - [ ] `cargo test`
 - [ ] Any new async/fetch path that can be superseded carries a generation
       counter
-- [ ] No blocking calls introduced on the render thread
-- [ ] No secrets or tokens logged
+- [ ] No blocking calls introduced on the render thread (bar the sanctioned
+      `Config::save`)
+- [ ] No secrets or tokens logged, including inside URLs handed to mpv
+- [ ] Any spawned external process cleans up (`kill_on_drop` plus socket
+      removal) on every exit path
+- [ ] A new app implements the full `MediaApp` contract
