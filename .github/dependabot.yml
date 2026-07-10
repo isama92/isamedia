@@ -1,0 +1,26 @@
+version: 2
+updates:
+  # Rust crates.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    # Keep PR titles Conventional-Commit-shaped so the conventions check passes.
+    commit-message:
+      prefix: chore
+    # Dependabot labels its own PRs (its token is unaffected by the read-only
+    # limit that would make the conventions labeller 403 on Dependabot runs).
+    labels:
+      - chore
+
+  # Keep the SHA-pinned actions in .github/workflows current.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore
+    labels:
+      - chore
