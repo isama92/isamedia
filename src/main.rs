@@ -29,7 +29,10 @@ async fn main() -> Result<()> {
         Some(path) => path,
         None => Config::default_path()?,
     };
-    let config = Arc::new(Mutex::new(Config::load_or_init(&config_path)?));
+    let config = Config::load_or_init(&config_path)?;
+    // Set the palette before the first draw so the initial frame is themed.
+    crate::ui::theme::init(config.theme);
+    let config = Arc::new(Mutex::new(config));
 
     let (tx, rx) = mpsc::unbounded_channel();
     event::spawn_input_thread(tx.clone());

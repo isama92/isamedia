@@ -107,7 +107,7 @@ impl TextInput {
             self.value.clone()
         };
         if !self.focused {
-            Line::styled(shown, Style::new().fg(theme::FG)).render(area, buf);
+            Line::styled(shown, Style::new().fg(theme::fg())).render(area, buf);
             return;
         }
 
@@ -133,12 +133,12 @@ impl TextInput {
         let before: String = chars[start..cursor].iter().collect();
         let after: String = chars.get(cursor + 1..).unwrap_or(&[]).iter().collect();
         Line::from(vec![
-            Span::styled(before, Style::new().fg(theme::FG)),
+            Span::styled(before, Style::new().fg(theme::fg())),
             Span::styled(
                 at.to_string(),
                 Style::new().add_modifier(Modifier::REVERSED),
             ),
-            Span::styled(after, Style::new().fg(theme::FG)),
+            Span::styled(after, Style::new().fg(theme::fg())),
         ])
         .render(area, buf);
     }

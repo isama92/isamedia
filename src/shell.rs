@@ -15,7 +15,8 @@ use tokio::sync::mpsc;
 use crate::app::{AppStatus, MediaApp, ShellRequest};
 use crate::config::Config;
 use crate::event::Event;
-use crate::ui::theme;
+use crate::ui::theme::{self, Theme};
+use crate::ui::theme_picker;
 
 pub struct Shell {
     apps: Vec<Box<dyn MediaApp>>,
@@ -24,6 +25,9 @@ pub struct Shell {
     config_path: PathBuf,
     rx: mpsc::UnboundedReceiver<Event>,
     should_quit: bool,
+    /// `None` when closed; `Some(cursor)` when the theme picker is open, where
+    /// `cursor` indexes `Theme::ALL`.
+    theme_picker: Option<usize>,
 }
 
 impl Shell {
@@ -44,13 +48,14 @@ impl Shell {
             config_path,
             rx,
             should_quit: false,
+            theme_picker: None,
         }
     }
 
     pub async fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         self.apps[self.active].activate();
         loop {
-            terminal.draw(|frame| render(frame, &mut self.apps, self.active))?;
+            terminal.draw(|frame| render(frame, &mut self.apps, self.active, self.theme_picker))?;
             let Some(event) = self.rx.recv().await else {
                 break;
             };
@@ -107,6 +112,12 @@ impl Shell {
     }
 
     fn on_key(&mut self, key: KeyEvent) {
+        // The picker is modal: while open it swallows every key so none reach
+        // the active app (mirrors the jellyfin `pending_play` guard).
+        if let Some(cursor) = self.theme_picker {
+            self.handle_picker_key(key, cursor);
+            return;
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('c') => {
@@ -121,6 +132,11 @@ impl Shell {
                 KeyCode::Right => {
                     let target = (self.active + 1) % self.apps.len();
                     self.switch_to(target);
+                    return;
+                }
+                KeyCode::Char('t') => {
+                    // Open on the currently active theme so it starts highlighted.
+                    self.theme_picker = Some(self.config.lock().unwrap().theme as usize);
                     return;
                 }
                 KeyCode::Char(c @ '1'..='9') => {
@@ -140,6 +156,40 @@ impl Shell {
         }
     }
 
+    fn handle_picker_key(&mut self, key: KeyEvent, cursor: usize) {
+        let count = Theme::ALL.len();
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.theme_picker = Some((cursor + count - 1) % count);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.theme_picker = Some((cursor + 1) % count);
+            }
+            KeyCode::Enter => {
+                self.apply_theme(Theme::ALL[cursor]);
+                self.theme_picker = None;
+            }
+            KeyCode::Esc => self.theme_picker = None,
+            // ctrl+c remains the global quit even with the picker open.
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.should_quit = true;
+            }
+            _ => {}
+        }
+    }
+
+    fn apply_theme(&mut self, theme: Theme) {
+        theme::set(theme);
+        let mut config = self.config.lock().unwrap();
+        if config.theme == theme {
+            return;
+        }
+        config.theme = theme;
+        if let Err(err) = config.save(&self.config_path) {
+            tracing::warn!(%err, "failed to persist theme");
+        }
+    }
+
     fn switch_to(&mut self, target: usize) {
         if target == self.active {
             return;
@@ -155,7 +205,12 @@ impl Shell {
     }
 }
 
-fn render(frame: &mut Frame, apps: &mut [Box<dyn MediaApp>], active: usize) {
+fn render(
+    frame: &mut Frame,
+    apps: &mut [Box<dyn MediaApp>],
+    active: usize,
+    theme_picker: Option<usize>,
+) {
     let [tabs_area, body_area, status_area] = Layout::vertical([
         Constraint::Length(2),
         Constraint::Fill(1),
@@ -166,6 +221,10 @@ fn render(frame: &mut Frame, apps: &mut [Box<dyn MediaApp>], active: usize) {
     render_app_tabs(frame, tabs_area, apps, active);
     apps[active].draw(frame, body_area);
     render_status_bar(frame, status_area, apps, active);
+    // Drawn last (plus its own Clear) so it floats over the body.
+    if let Some(cursor) = theme_picker {
+        theme_picker::draw(frame, frame.area(), cursor);
+    }
 }
 
 fn render_app_tabs(frame: &mut Frame, area: Rect, apps: &[Box<dyn MediaApp>], active: usize) {
@@ -176,7 +235,7 @@ fn render_app_tabs(frame: &mut Frame, area: Rect, apps: &[Box<dyn MediaApp>], ac
         } else if app.status() == AppStatus::ComingSoon {
             theme::dim()
         } else {
-            Style::new().fg(theme::FG)
+            Style::new().fg(theme::fg())
         };
         spans.push(Span::styled(format!(" {} ", app.title()), style));
         if app.status() == AppStatus::ComingSoon {
@@ -186,7 +245,16 @@ fn render_app_tabs(frame: &mut Frame, area: Rect, apps: &[Box<dyn MediaApp>], ac
     }
     let [tabs_row, rule_row] =
         Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
-    Line::from(spans).render(tabs_row, frame.buffer_mut());
+    // Reserve a right-hand column for the active-theme label (titles are ASCII,
+    // so char count is the display width); clamp so it never overflows the row.
+    let label = format!(" theme: {} ", theme::active_theme().title());
+    let label_width = (label.chars().count() as u16).min(tabs_row.width);
+    let [tabs_col, label_col] =
+        Layout::horizontal([Constraint::Fill(1), Constraint::Length(label_width)]).areas(tabs_row);
+    Line::from(spans).render(tabs_col, frame.buffer_mut());
+    Line::styled(label, theme::dim())
+        .right_aligned()
+        .render(label_col, frame.buffer_mut());
     Line::styled("─".repeat(rule_row.width as usize), theme::dim())
         .render(rule_row, frame.buffer_mut());
 }

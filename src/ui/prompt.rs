@@ -24,7 +24,7 @@ pub fn draw_confirm(frame: &mut Frame, area: Rect, question: &str) {
     Clear.render(box_area, buf);
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(theme::ACCENT_BRIGHT));
+        .border_style(Style::new().fg(theme::accent_bright()));
     let inner = block.inner(box_area);
     block.render(box_area, buf);
 
@@ -34,7 +34,7 @@ pub fn draw_confirm(frame: &mut Frame, area: Rect, question: &str) {
         Constraint::Length(1),
     ])
     .areas(inner);
-    Line::styled(question.to_string(), Style::new().fg(theme::FG))
+    Line::styled(question.to_string(), Style::new().fg(theme::fg()))
         .centered()
         .render(question_row, buf);
     Line::styled("y: yes   n: no", theme::dim())
