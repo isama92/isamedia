@@ -13,13 +13,14 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 
+use crate::apps::auto_search::{self, Monitor, TickAction};
 use crate::apps::delete_prompt::{self, DeletePrompt};
 use crate::apps::downloads;
 use crate::event::AppSender;
 use crate::sonarr::display::{self, EpStatus, SERIES_SORTS, SeriesSort};
 use crate::sonarr::models::Season;
 use crate::sonarr::{
-    Client, Episode, HistoryRecord, QualityProfile, QueueItem, Release, RootFolder, Series,
+    Client, Command, Episode, HistoryRecord, QualityProfile, QueueItem, Release, RootFolder, Series,
 };
 use crate::ui::input::TextInput;
 use crate::ui::text::{truncate, wrap_text};
@@ -112,6 +113,15 @@ pub enum BrowseAction {
     Quit,
 }
 
+/// A series' "Title (Year)" label for the auto-search status line.
+fn series_label(series: &Series) -> String {
+    let title = series.title.as_deref().unwrap_or("series");
+    match series.year {
+        Some(year) if year > 0 => format!("{title} ({year})"),
+        _ => title.to_string(),
+    }
+}
+
 pub struct Browse {
     pub client: Client,
     sender: AppSender,
@@ -174,6 +184,14 @@ pub struct Browse {
     /// An add POST is in flight; blocks a second submit until it lands.
     add_submitting: bool,
     add_flow: Option<AddFlow>,
+    /// The just-committed add asked for an auto-search; read once its
+    /// `SeriesAdded` lands, to start a background monitor. Only one add is ever
+    /// in flight (`add_submitting` guards a second submit), so one flag suffices.
+    pending_search: bool,
+    /// Background auto-search monitors, one per add-with-search still resolving.
+    /// Each runs on its own generation, independent of the view, so it survives
+    /// navigation; see [`crate::apps::auto_search`].
+    monitors: Vec<Monitor>,
 
     /// Full-screen scrollable overview on the show level.
     overview_fullscreen: bool,
@@ -240,6 +258,8 @@ impl Browse {
             add_gen: 0,
             add_submitting: false,
             add_flow: None,
+            pending_search: false,
+            monitors: Vec::new(),
             overview_fullscreen: false,
             overview_scroll: 0,
             show_full_help: false,
@@ -271,6 +291,7 @@ impl Browse {
         {
             self.fetch_queue();
         }
+        self.tick_monitors();
     }
 
     /// Mark a list fetch as started and allocate its generation; any result
@@ -642,8 +663,14 @@ impl Browse {
             return true;
         }
         self.loading = false;
+        let pending_search = std::mem::take(&mut self.pending_search);
         match result {
             Ok(series) => {
+                // Kick off the tracked background search before the series is
+                // moved into the show level.
+                if pending_search {
+                    self.start_auto_search(series.id, series_label(&series));
+                }
                 self.season_cursor = 0;
                 self.overview_scroll = 0;
                 self.level = Level::Show { series: *series };
@@ -661,6 +688,166 @@ impl Browse {
             Err(err) => self.error = Some(err.to_string()),
         }
         false
+    }
+
+    /// Start tracking a background auto-search for a just-added series: fire the
+    /// tracked `SeriesSearch` command and record a monitor on its own
+    /// generation. The baseline snapshot lets the outcome check tell a fresh
+    /// grab from a download that was already queued.
+    fn start_auto_search(&mut self, series_id: i64, title: String) {
+        let generation = self.gen_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        let baseline = self
+            .queue
+            .iter()
+            .filter(|item| item.series_id == Some(series_id))
+            .map(|item| item.id)
+            .collect();
+        self.monitors
+            .push(Monitor::new(generation, series_id, title, baseline));
+        let client = self.client.clone();
+        let sender = self.sender.clone();
+        tokio::spawn(async move {
+            let result = client.series_search(series_id).await;
+            sender.send(Msg::AutoSearchStarted {
+                auto_search_gen: generation,
+                result,
+            });
+        });
+    }
+
+    /// Queue items for `series_id` that were not present when its search started.
+    fn queue_new_items(&self, monitor: &Monitor) -> usize {
+        self.queue
+            .iter()
+            .filter(|item| {
+                item.series_id == Some(monitor.target_id) && !monitor.is_baseline(item.id)
+            })
+            .count()
+    }
+
+    /// Advance every monitor one tick and run the side effects they request
+    /// (poll a command, refresh the queue, drop an expired monitor). Snapshot
+    /// the per-monitor new-item counts first so the queue and the monitor list
+    /// aren't borrowed at once.
+    fn tick_monitors(&mut self) {
+        if self.monitors.is_empty() {
+            return;
+        }
+        let new_counts: Vec<usize> = self
+            .monitors
+            .iter()
+            .map(|monitor| self.queue_new_items(monitor))
+            .collect();
+        let mut polls: Vec<(u64, i64)> = Vec::new();
+        let mut want_queue = false;
+        let mut expired: Vec<u64> = Vec::new();
+        for (monitor, &new_items) in self.monitors.iter_mut().zip(new_counts.iter()) {
+            match monitor.tick(new_items) {
+                TickAction::Idle => {}
+                TickAction::Poll(command_id) => polls.push((monitor.generation, command_id)),
+                TickAction::FetchQueue => want_queue = true,
+                TickAction::Drop => expired.push(monitor.generation),
+            }
+        }
+        if !expired.is_empty() {
+            self.monitors
+                .retain(|monitor| !expired.contains(&monitor.generation));
+        }
+        if want_queue {
+            self.fetch_queue();
+        }
+        for (generation, command_id) in polls {
+            self.spawn_command_poll(generation, command_id);
+        }
+    }
+
+    /// Poll one tracked command's status; the result rides `AutoSearchPolled`,
+    /// matched back to its monitor by generation.
+    fn spawn_command_poll(&self, generation: u64, command_id: i64) {
+        let client = self.client.clone();
+        let sender = self.sender.clone();
+        tokio::spawn(async move {
+            let result = client.get_command(command_id).await;
+            sender.send(Msg::AutoSearchPolled {
+                auto_search_gen: generation,
+                result,
+            });
+        });
+    }
+
+    /// A tracked search command was created (or failed to start). Matched to
+    /// its monitor by generation; a result with no live monitor is dropped
+    /// (the monitor was cleared, or belongs to a superseded Browse).
+    #[must_use]
+    pub fn on_auto_search_started(
+        &mut self,
+        auto_search_gen: u64,
+        result: Result<Command, crate::sonarr::Error>,
+    ) -> bool {
+        let Some(index) = self
+            .monitors
+            .iter()
+            .position(|monitor| monitor.generation == auto_search_gen)
+        else {
+            return false;
+        };
+        match result {
+            // A real *arr always returns a positive command id; guard against a
+            // malformed response so a defaulted 0 can't have us poll command 0.
+            Ok(command) if command.id > 0 => self.monitors[index].started(command.id),
+            Ok(_) => {
+                self.monitors[index].failed_to_start();
+                tracing::debug!("auto-search command created without an id");
+            }
+            Err(crate::sonarr::Error::Unauthorized) => {
+                self.monitors.remove(index);
+                return true;
+            }
+            Err(err) => {
+                self.monitors[index].failed_to_start();
+                tracing::debug!(%err, "auto-search command failed to start");
+            }
+        }
+        false
+    }
+
+    /// A status poll for a tracked command landed. Same generation contract as
+    /// `on_auto_search_started`; on completion the queue is refreshed to
+    /// confirm whether a release was grabbed.
+    #[must_use]
+    pub fn on_auto_search_polled(
+        &mut self,
+        auto_search_gen: u64,
+        result: Result<Command, crate::sonarr::Error>,
+    ) -> bool {
+        let Some(index) = self
+            .monitors
+            .iter()
+            .position(|monitor| monitor.generation == auto_search_gen)
+        else {
+            return false;
+        };
+        match result {
+            Ok(command) => {
+                if self.monitors[index].polled(command.status.as_deref()) {
+                    self.fetch_queue();
+                }
+            }
+            Err(crate::sonarr::Error::Unauthorized) => {
+                self.monitors.remove(index);
+                return true;
+            }
+            Err(err) => {
+                self.monitors[index].clear_poll_inflight();
+                tracing::debug!(%err, "auto-search poll failed");
+            }
+        }
+        false
+    }
+
+    /// The cross-tab status line summarising this app's auto-search monitors.
+    pub fn status_line(&self) -> Option<Line<'static>> {
+        auto_search::status_line("Sonarr", &self.monitors)
     }
 
     /// Return from a detail/search level to the episode list and refetch it
@@ -1098,14 +1285,18 @@ impl Browse {
             object.insert("monitored".into(), serde_json::json!(flow.monitored));
             object.insert("seasonFolder".into(), serde_json::json!(true));
             object.insert("seriesType".into(), serde_json::json!("standard"));
+            // The search is run and tracked separately (see `start_auto_search`),
+            // so the server must not fire its own untracked one — otherwise the
+            // series would be searched twice.
             object.insert(
                 "addOptions".into(),
                 serde_json::json!({
-                    "searchForMissingEpisodes": flow.search,
+                    "searchForMissingEpisodes": false,
                     "monitor": monitor,
                 }),
             );
         }
+        self.pending_search = flow.search;
         self.add_submitting = true;
         self.loading = true;
         self.error = None;

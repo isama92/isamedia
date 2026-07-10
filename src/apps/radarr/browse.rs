@@ -13,11 +13,14 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 
+use crate::apps::auto_search::{self, Monitor, TickAction};
 use crate::apps::delete_prompt::{self, DeletePrompt};
 use crate::apps::downloads;
 use crate::event::AppSender;
 use crate::radarr::display::{self, MOVIE_SORTS, MovieSort, MovieStatus};
-use crate::radarr::{Client, HistoryRecord, Movie, QualityProfile, QueueItem, Release, RootFolder};
+use crate::radarr::{
+    Client, Command, HistoryRecord, Movie, QualityProfile, QueueItem, Release, RootFolder,
+};
 use crate::ui::input::TextInput;
 use crate::ui::text::{truncate, wrap_text};
 use crate::ui::{list, prompt, theme};
@@ -105,6 +108,15 @@ pub enum BrowseAction {
     Quit,
 }
 
+/// A movie's "Title (Year)" label for the auto-search status line.
+fn movie_label(movie: &Movie) -> String {
+    let title = movie.title.as_deref().unwrap_or("movie");
+    match movie.year {
+        Some(year) if year > 0 => format!("{title} ({year})"),
+        _ => title.to_string(),
+    }
+}
+
 pub struct Browse {
     pub client: Client,
     sender: AppSender,
@@ -164,6 +176,14 @@ pub struct Browse {
     /// An add POST is in flight; blocks a second submit until it lands.
     add_submitting: bool,
     add_flow: Option<AddFlow>,
+    /// The just-committed add asked for an auto-search; read once its
+    /// `MovieAdded` lands, to start a background monitor. Only one add is ever
+    /// in flight (`add_submitting` guards a second submit), so one flag suffices.
+    pending_search: bool,
+    /// Background auto-search monitors, one per add-with-search still resolving.
+    /// Each runs on its own generation, independent of the view, so it survives
+    /// navigation; see [`crate::apps::auto_search`].
+    monitors: Vec<Monitor>,
 
     /// Full-screen scrollable overview on the detail level.
     overview_fullscreen: bool,
@@ -227,6 +247,8 @@ impl Browse {
             add_gen: 0,
             add_submitting: false,
             add_flow: None,
+            pending_search: false,
+            monitors: Vec::new(),
             overview_fullscreen: false,
             overview_scroll: 0,
             show_full_help: false,
@@ -257,6 +279,7 @@ impl Browse {
         if self.tick_count.is_multiple_of(QUEUE_POLL_TICKS) {
             self.fetch_queue();
         }
+        self.tick_monitors();
     }
 
     /// Mark a list fetch as started and allocate its generation; any result
@@ -589,8 +612,14 @@ impl Browse {
             return true;
         }
         self.loading = false;
+        let pending_search = std::mem::take(&mut self.pending_search);
         match result {
             Ok(movie) => {
+                // Kick off the tracked background search before the movie is
+                // moved into the detail level.
+                if pending_search {
+                    self.start_auto_search(movie.id, movie_label(&movie));
+                }
                 self.overview_scroll = 0;
                 self.level = Level::MovieDetail { movie: *movie };
                 self.add_results.clear();
@@ -607,6 +636,166 @@ impl Browse {
             Err(err) => self.error = Some(err.to_string()),
         }
         false
+    }
+
+    /// Start tracking a background auto-search for a just-added movie: fire the
+    /// tracked `MoviesSearch` command and record a monitor on its own
+    /// generation. The baseline snapshot lets the outcome check tell a fresh
+    /// grab from a download that was already queued.
+    fn start_auto_search(&mut self, movie_id: i64, title: String) {
+        let generation = self.gen_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        let baseline = self
+            .queue
+            .iter()
+            .filter(|item| item.movie_id == Some(movie_id))
+            .map(|item| item.id)
+            .collect();
+        self.monitors
+            .push(Monitor::new(generation, movie_id, title, baseline));
+        let client = self.client.clone();
+        let sender = self.sender.clone();
+        tokio::spawn(async move {
+            let result = client.movie_search(movie_id).await;
+            sender.send(Msg::AutoSearchStarted {
+                auto_search_gen: generation,
+                result,
+            });
+        });
+    }
+
+    /// Queue items for `movie_id` that were not present when its search started.
+    fn queue_new_items(&self, monitor: &Monitor) -> usize {
+        self.queue
+            .iter()
+            .filter(|item| {
+                item.movie_id == Some(monitor.target_id) && !monitor.is_baseline(item.id)
+            })
+            .count()
+    }
+
+    /// Advance every monitor one tick and run the side effects they request
+    /// (poll a command, refresh the queue, drop an expired monitor). Snapshot
+    /// the per-monitor new-item counts first so the queue and the monitor list
+    /// aren't borrowed at once.
+    fn tick_monitors(&mut self) {
+        if self.monitors.is_empty() {
+            return;
+        }
+        let new_counts: Vec<usize> = self
+            .monitors
+            .iter()
+            .map(|monitor| self.queue_new_items(monitor))
+            .collect();
+        let mut polls: Vec<(u64, i64)> = Vec::new();
+        let mut want_queue = false;
+        let mut expired: Vec<u64> = Vec::new();
+        for (monitor, &new_items) in self.monitors.iter_mut().zip(new_counts.iter()) {
+            match monitor.tick(new_items) {
+                TickAction::Idle => {}
+                TickAction::Poll(command_id) => polls.push((monitor.generation, command_id)),
+                TickAction::FetchQueue => want_queue = true,
+                TickAction::Drop => expired.push(monitor.generation),
+            }
+        }
+        if !expired.is_empty() {
+            self.monitors
+                .retain(|monitor| !expired.contains(&monitor.generation));
+        }
+        if want_queue {
+            self.fetch_queue();
+        }
+        for (generation, command_id) in polls {
+            self.spawn_command_poll(generation, command_id);
+        }
+    }
+
+    /// Poll one tracked command's status; the result rides `AutoSearchPolled`,
+    /// matched back to its monitor by generation.
+    fn spawn_command_poll(&self, generation: u64, command_id: i64) {
+        let client = self.client.clone();
+        let sender = self.sender.clone();
+        tokio::spawn(async move {
+            let result = client.get_command(command_id).await;
+            sender.send(Msg::AutoSearchPolled {
+                auto_search_gen: generation,
+                result,
+            });
+        });
+    }
+
+    /// A tracked search command was created (or failed to start). Matched to
+    /// its monitor by generation; a result with no live monitor is dropped
+    /// (the monitor was cleared, or belongs to a superseded Browse).
+    #[must_use]
+    pub fn on_auto_search_started(
+        &mut self,
+        auto_search_gen: u64,
+        result: Result<Command, crate::radarr::Error>,
+    ) -> bool {
+        let Some(index) = self
+            .monitors
+            .iter()
+            .position(|monitor| monitor.generation == auto_search_gen)
+        else {
+            return false;
+        };
+        match result {
+            // A real *arr always returns a positive command id; guard against a
+            // malformed response so a defaulted 0 can't have us poll command 0.
+            Ok(command) if command.id > 0 => self.monitors[index].started(command.id),
+            Ok(_) => {
+                self.monitors[index].failed_to_start();
+                tracing::debug!("auto-search command created without an id");
+            }
+            Err(crate::radarr::Error::Unauthorized) => {
+                self.monitors.remove(index);
+                return true;
+            }
+            Err(err) => {
+                self.monitors[index].failed_to_start();
+                tracing::debug!(%err, "auto-search command failed to start");
+            }
+        }
+        false
+    }
+
+    /// A status poll for a tracked command landed. Same generation contract as
+    /// `on_auto_search_started`; on completion the queue is refreshed to
+    /// confirm whether a release was grabbed.
+    #[must_use]
+    pub fn on_auto_search_polled(
+        &mut self,
+        auto_search_gen: u64,
+        result: Result<Command, crate::radarr::Error>,
+    ) -> bool {
+        let Some(index) = self
+            .monitors
+            .iter()
+            .position(|monitor| monitor.generation == auto_search_gen)
+        else {
+            return false;
+        };
+        match result {
+            Ok(command) => {
+                if self.monitors[index].polled(command.status.as_deref()) {
+                    self.fetch_queue();
+                }
+            }
+            Err(crate::radarr::Error::Unauthorized) => {
+                self.monitors.remove(index);
+                return true;
+            }
+            Err(err) => {
+                self.monitors[index].clear_poll_inflight();
+                tracing::debug!(%err, "auto-search poll failed");
+            }
+        }
+        false
+    }
+
+    /// The cross-tab status line summarising this app's auto-search monitors.
+    pub fn status_line(&self) -> Option<Line<'static>> {
+        auto_search::status_line("Radarr", &self.monitors)
     }
 
     /// Return from the search level to the movie detail and refetch: the
@@ -780,7 +969,7 @@ impl Browse {
                 let id = movie.id;
                 let client = self.client.clone();
                 self.spawn_command(CommandKind::AutoSearch, async move {
-                    client.movie_search(id).await
+                    client.movie_search(id).await.map(|_| ())
                 });
             }
             1 => {
@@ -1011,11 +1200,15 @@ impl Browse {
                 "minimumAvailability".into(),
                 serde_json::json!(min_availability),
             );
+            // The search is run and tracked separately (see `start_auto_search`),
+            // so the server must not fire its own untracked one — otherwise the
+            // movie would be searched twice.
             object.insert(
                 "addOptions".into(),
-                serde_json::json!({ "searchForMovie": flow.search }),
+                serde_json::json!({ "searchForMovie": false }),
             );
         }
+        self.pending_search = flow.search;
         self.add_submitting = true;
         self.loading = true;
         self.error = None;

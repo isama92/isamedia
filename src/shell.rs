@@ -155,17 +155,40 @@ impl Shell {
     }
 }
 
+/// Upper bound on status-bar rows, so several apps reporting at once (e.g.
+/// Jellyfin now-playing plus a Radarr and a Sonarr auto-search) can never crush
+/// the body.
+const STATUS_BAR_MAX_ROWS: usize = 3;
+
 fn render(frame: &mut Frame, apps: &mut [Box<dyn MediaApp>], active: usize) {
+    // Each app's status line gets its own row, so a now-playing bar and an
+    // auto-search status show at the same time. Collected before the (mutable)
+    // body draw, since `status_line` borrows the apps immutably.
+    let status_lines = collect_status_lines(apps, active);
+    let status_rows = status_lines.len().clamp(1, STATUS_BAR_MAX_ROWS) as u16;
+
     let [tabs_area, body_area, status_area] = Layout::vertical([
         Constraint::Length(2),
         Constraint::Fill(1),
-        Constraint::Length(1),
+        Constraint::Length(status_rows),
     ])
     .areas(frame.area());
 
     render_app_tabs(frame, tabs_area, apps, active);
     apps[active].draw(frame, body_area);
-    render_status_bar(frame, status_area, apps, active);
+    render_status_bar(frame, status_area, status_lines);
+}
+
+/// Every app's status line, active app first so its row leads, then the others
+/// (so e.g. a now-playing bar stays visible from another tab). Capped at
+/// [`STATUS_BAR_MAX_ROWS`].
+fn collect_status_lines(apps: &[Box<dyn MediaApp>], active: usize) -> Vec<Line<'static>> {
+    let active_id = apps[active].id();
+    std::iter::once(&apps[active])
+        .chain(apps.iter().filter(|app| app.id() != active_id))
+        .filter_map(|app| app.status_line())
+        .take(STATUS_BAR_MAX_ROWS)
+        .collect()
 }
 
 fn render_app_tabs(frame: &mut Frame, area: Rect, apps: &[Box<dyn MediaApp>], active: usize) {
@@ -191,12 +214,15 @@ fn render_app_tabs(frame: &mut Frame, area: Rect, apps: &[Box<dyn MediaApp>], ac
         .render(rule_row, frame.buffer_mut());
 }
 
-fn render_status_bar(frame: &mut Frame, area: Rect, apps: &[Box<dyn MediaApp>], active: usize) {
-    // Prefer the active app's status line, then any other app's (so e.g. a
-    // now-playing bar stays visible from another tab).
-    let line = std::iter::once(&apps[active])
-        .chain(apps.iter().filter(|app| app.id() != apps[active].id()))
-        .find_map(|app| app.status_line())
-        .unwrap_or_else(|| Line::styled(" ctrl+←/→ or ctrl+1..4: switch app", theme::dim()));
-    line.render(area, frame.buffer_mut());
+fn render_status_bar(frame: &mut Frame, area: Rect, lines: Vec<Line<'static>>) {
+    if lines.is_empty() {
+        Line::styled(" ctrl+←/→ or ctrl+1..4: switch app", theme::dim())
+            .render(area, frame.buffer_mut());
+        return;
+    }
+    // One row per line; the area was sized to match in `render`.
+    let rows = Layout::vertical(vec![Constraint::Length(1); lines.len()]).split(area);
+    for (line, row) in lines.into_iter().zip(rows.iter()) {
+        line.render(*row, frame.buffer_mut());
+    }
 }

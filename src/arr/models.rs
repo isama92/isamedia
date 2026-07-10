@@ -141,6 +141,18 @@ pub struct QualityProfile {
     pub name: String,
 }
 
+/// A server command (the /command endpoint). A POST returns the created
+/// command with its id and initial `status`; polling GET /command/{id} tracks
+/// a background job (e.g. an auto-search) to a terminal state. Same shape on
+/// both backends.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Command {
+    pub id: i64,
+    /// "queued" | "started" | "completed" | "failed" | "aborted" | "cancelled".
+    pub status: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,6 +311,27 @@ mod tests {
             record.data.get("guid").and_then(|v| v.as_str()),
             Some("magnet-abc")
         );
+    }
+
+    #[test]
+    fn deserializes_command() {
+        // The POST /command response carries far more than these two fields;
+        // the extras must be ignored, and a terminal status parse cleanly.
+        let raw = r#"{
+            "id": 42,
+            "name": "MoviesSearch",
+            "status": "completed",
+            "queued": "2026-07-08T10:00:00Z",
+            "trigger": "manual"
+        }"#;
+        let command: Command = serde_json::from_str(raw).unwrap();
+        assert_eq!(command.id, 42);
+        assert_eq!(command.status.as_deref(), Some("completed"));
+
+        // A freshly created command comes back "queued".
+        let queued: Command = serde_json::from_str(r#"{ "id": 7, "status": "queued" }"#).unwrap();
+        assert_eq!(queued.id, 7);
+        assert_eq!(queued.status.as_deref(), Some("queued"));
     }
 
     #[test]

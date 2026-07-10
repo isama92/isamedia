@@ -1,3 +1,4 @@
+pub mod auto_search;
 pub mod delete_prompt;
 pub mod downloads;
 pub mod jellyfin;

@@ -5,7 +5,7 @@
 //! replaced and must not kick the fresh session).
 
 use crate::radarr::{
-    Client, Error, HistoryRecord, Movie, QualityProfile, QueueItem, Release, RootFolder,
+    Client, Command, Error, HistoryRecord, Movie, QualityProfile, QueueItem, Release, RootFolder,
 };
 
 pub enum Msg {
@@ -61,6 +61,22 @@ pub enum Msg {
         fetch_gen: u64,
         kind: CommandKind,
         result: Result<(), Error>,
+    },
+    /// The tracked auto-search command for a just-added movie was created
+    /// (carries its id, so it can be polled) or failed to start. `auto_search_gen`
+    /// is the monitor's own generation: it runs independently of the view, so
+    /// the monitor survives navigating away, and a result whose monitor has
+    /// been cleared (or belongs to a superseded Browse) finds no match and is
+    /// dropped.
+    AutoSearchStarted {
+        auto_search_gen: u64,
+        result: Result<Command, Error>,
+    },
+    /// One poll of a tracked auto-search command's status. Matched to its
+    /// monitor by `auto_search_gen`, same as `AutoSearchStarted`.
+    AutoSearchPolled {
+        auto_search_gen: u64,
+        result: Result<Command, Error>,
     },
     KeyringError(String),
 }
