@@ -15,7 +15,13 @@ pub enum Msg {
         fetch_gen: u64,
         result: Result<Vec<MediaItem>, Error>,
     },
-    WatchedToggled(Result<(), Error>),
+    /// Result of a watched/unwatched toggle; `fetch_gen` is the view
+    /// generation the toggle was issued from, so a result landing after the
+    /// user moved to another tab or series is dropped.
+    WatchedToggled {
+        fetch_gen: u64,
+        result: Result<(), Error>,
+    },
     /// Playback lifecycle from the mpv supervisor; `player_gen` distinguishes
     /// the current player from a replaced one that is still shutting down.
     Player {

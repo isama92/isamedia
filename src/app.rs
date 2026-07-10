@@ -1,9 +1,17 @@
 use std::any::Any;
 
 use ratatui::Frame;
-use ratatui::crossterm::event::KeyEvent;
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::text::Line;
+
+/// True for a character key carrying ctrl/alt/super-style modifiers. Such
+/// keys must not trigger single-letter shortcuts (ctrl+s is not `s`). Shift
+/// is exempt: shifted chars ('G', '?') already arrive as their own character
+/// with SHIFT set.
+pub fn modified_char(key: &KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char(_)) && !(key.modifiers - KeyModifiers::SHIFT).is_empty()
+}
 
 pub type AppId = &'static str;
 

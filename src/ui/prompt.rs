@@ -8,7 +8,11 @@ use crate::ui::theme;
 
 /// Centered modal yes/no prompt, drawn over whatever is below it.
 pub fn draw_confirm(frame: &mut Frame, area: Rect, question: &str) {
-    let width = (question.chars().count() as u16 + 6).clamp(24, area.width);
+    // max-then-min, not clamp(24, area.width): clamp panics when the
+    // terminal is narrower than the 24-column minimum.
+    let width = (question.chars().count() as u16 + 6)
+        .max(24)
+        .min(area.width);
     let [box_area] = Layout::horizontal([Constraint::Length(width)])
         .flex(Flex::Center)
         .areas(area);
@@ -36,4 +40,20 @@ pub fn draw_confirm(frame: &mut Frame, area: Rect, question: &str) {
     Line::styled("y: yes   n: no", theme::dim())
         .centered()
         .render(keys_row, buf);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn does_not_panic_on_narrow_terminals() {
+        for (width, height) in [(10, 5), (1, 1), (0, 0), (24, 3), (120, 40)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| draw_confirm(frame, frame.area(), "Replace current playback?"))
+                .unwrap();
+        }
+    }
 }

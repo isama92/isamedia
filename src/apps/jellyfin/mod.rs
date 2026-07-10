@@ -59,6 +59,10 @@ pub struct JellyfinApp {
     player_gen: u64,
     /// Item waiting behind the "replace current playback?" prompt.
     pending_play: Option<MediaItem>,
+    /// Fetch-generation allocator shared with every Browse instance, so
+    /// generations stay monotonic across re-logins (a fetch in flight from a
+    /// pre-relogin Browse can never match a new instance's generation).
+    browse_gen: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl JellyfinApp {
@@ -72,6 +76,7 @@ impl JellyfinApp {
             player: None,
             player_gen: 0,
             pending_play: None,
+            browse_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -214,6 +219,14 @@ impl JellyfinApp {
     /// Drop the stored token and return to the login form; used when the
     /// server starts answering 401 (token revoked/expired).
     fn on_session_expired(&mut self) {
+        // Stop playback: a revoked token breaks the stream's own requests
+        // and every playback report, and the login screen has no way to
+        // reach the stop key (its inputs swallow plain chars). Dropping the
+        // handle also clears the now-playing bar and its "s: stop" hint.
+        if let Some(player) = self.player.take() {
+            player.stop();
+        }
+        self.pending_play = None;
         {
             let mut config = self.config.lock().unwrap();
             config.jellyfin.user_id.clear();
@@ -250,7 +263,7 @@ impl JellyfinApp {
                         .map(|(h, u, p)| (h.as_str(), u.as_str(), p.as_str())),
                 );
                 let plain_http = crate::jellyfin::url::is_plain_http(&client.host);
-                let mut browse = Browse::new(client, self.sender.clone());
+                let mut browse = Browse::new(client, self.sender.clone(), self.browse_gen.clone());
                 if plain_http {
                     // The login form warns about this too, but auto-login
                     // (stored host + token) never shows the form.
@@ -297,6 +310,9 @@ impl MediaApp for JellyfinApp {
     fn on_key(&mut self, key: KeyEvent) -> Option<ShellRequest> {
         // The replace-playback prompt is modal.
         if self.pending_play.is_some() {
+            if crate::app::modified_char(&key) {
+                return None;
+            }
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                     let item = self.pending_play.take().unwrap();
@@ -315,6 +331,7 @@ impl MediaApp for JellyfinApp {
 
         // Global stop key, active whenever no text input has focus.
         if key.code == KeyCode::Char('s')
+            && key.modifiers.is_empty()
             && self.player.is_some()
             && matches!(&self.screen, Screen::Browse(browse) if !browse.input_focused())
         {
@@ -387,22 +404,23 @@ impl MediaApp for JellyfinApp {
                 }
                 self.on_auth_done(result);
             }
+            // For both result kinds, the browse checks staleness first and
+            // only reports a session expiry for a CURRENT-generation 401; a
+            // stale 401 belongs to an old token and must not kick a freshly
+            // re-authenticated session back to login. Results arriving while
+            // no browse is on screen are inherently stale and dropped.
             Msg::ItemsLoaded { fetch_gen, result } => {
-                if matches!(result, Err(crate::jellyfin::Error::Unauthorized)) {
+                if let Screen::Browse(browse) = &mut self.screen
+                    && browse.on_items_loaded(fetch_gen, result)
+                {
                     self.on_session_expired();
-                    return;
-                }
-                if let Screen::Browse(browse) = &mut self.screen {
-                    browse.on_items_loaded(fetch_gen, result);
                 }
             }
-            Msg::WatchedToggled(result) => {
-                if matches!(result, Err(crate::jellyfin::Error::Unauthorized)) {
+            Msg::WatchedToggled { fetch_gen, result } => {
+                if let Screen::Browse(browse) = &mut self.screen
+                    && browse.on_watched_toggled(fetch_gen, result)
+                {
                     self.on_session_expired();
-                    return;
-                }
-                if let Screen::Browse(browse) = &mut self.screen {
-                    browse.on_watched_toggled(result);
                 }
             }
             Msg::Player { player_gen, event } => {
