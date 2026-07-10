@@ -1,5 +1,5 @@
-pub mod coming_soon;
 pub mod jellyfin;
+pub mod radarr;
 pub mod settings;
 pub mod sonarr;
 
@@ -12,9 +12,9 @@ use crate::app::MediaApp;
 use crate::config::Config;
 use crate::event::{AppSender, Event};
 
-/// All apps shown in the top tab bar, in tab order. Adding a new app (Sonarr,
-/// Radarr) means writing its module and swapping its ComingSoonApp entry here;
-/// the shell needs no changes.
+/// All apps shown in the top tab bar, in tab order. Adding a new app means
+/// writing its module and registering it here (a placeholder can implement
+/// `status() -> AppStatus::ComingSoon`); the shell needs no changes.
 pub fn build_apps(
     config: Arc<Mutex<Config>>,
     config_path: PathBuf,
@@ -26,7 +26,11 @@ pub fn build_apps(
             config_path.clone(),
             AppSender::new("jellyfin", tx.clone()),
         )),
-        Box::new(coming_soon::ComingSoonApp::new("radarr", "Radarr")),
+        Box::new(radarr::RadarrApp::new(
+            config.clone(),
+            config_path.clone(),
+            AppSender::new("radarr", tx.clone()),
+        )),
         Box::new(sonarr::SonarrApp::new(
             config.clone(),
             config_path.clone(),

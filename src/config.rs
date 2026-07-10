@@ -17,6 +17,7 @@ pub struct Config {
     pub accent: Accent,
     pub jellyfin: JellyfinConfig,
     pub sonarr: SonarrConfig,
+    pub radarr: RadarrConfig,
 }
 
 /// Non-secret Jellyfin settings. The token and password live in the OS
@@ -37,6 +38,14 @@ pub struct JellyfinConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SonarrConfig {
+    pub host: String,
+}
+
+/// Non-secret Radarr settings. The API key lives in the OS keyring (see
+/// `crate::secrets`), never in this file.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RadarrConfig {
     pub host: String,
 }
 
@@ -122,6 +131,9 @@ mod tests {
             sonarr: SonarrConfig {
                 host: "https://sonarr.example.com".into(),
             },
+            radarr: RadarrConfig {
+                host: "https://radarr.example.com".into(),
+            },
         };
         let raw = toml::to_string_pretty(&config).unwrap();
         let parsed: Config = toml::from_str(&raw).unwrap();
@@ -131,6 +143,7 @@ mod tests {
         assert_eq!(parsed.jellyfin.host, config.jellyfin.host);
         assert_eq!(parsed.jellyfin.skip_segments, config.jellyfin.skip_segments);
         assert_eq!(parsed.sonarr.host, config.sonarr.host);
+        assert_eq!(parsed.radarr.host, config.radarr.host);
     }
 
     #[test]
@@ -139,6 +152,7 @@ mod tests {
         assert_eq!(parsed.jellyfin.host, "http://x");
         assert!(parsed.jellyfin.user_id.is_empty());
         assert!(parsed.sonarr.host.is_empty());
+        assert!(parsed.radarr.host.is_empty());
         assert!(parsed.last_app.is_none());
         // A config with no theme/accent keys defaults, so old files load unchanged.
         assert_eq!(parsed.theme, Theme::Latte);

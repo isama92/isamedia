@@ -7,6 +7,7 @@ mod event;
 mod jellyfin;
 mod net;
 mod player;
+mod radarr;
 mod secrets;
 mod shell;
 mod sonarr;
