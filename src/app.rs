@@ -45,6 +45,12 @@ pub trait MediaApp {
     /// Called when the app becomes the active tab (including at boot).
     fn activate(&mut self) {}
 
+    /// Called when the app stops being the active tab (the user switched
+    /// away). Apps should pause work that only matters while visible — e.g. a
+    /// periodic marker poll — here; background jobs the shell still surfaces
+    /// (a now-playing bar, an auto-search status line) must keep running.
+    fn deactivate(&mut self) {}
+
     fn on_key(&mut self, key: KeyEvent) -> Option<ShellRequest>;
 
     /// A message sent by one of this app's background tasks. The payload is

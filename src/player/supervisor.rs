@@ -281,7 +281,12 @@ pub(super) async fn run(
     };
 
     let mut child = match tokio::process::Command::new("mpv")
-        .arg("--idle")
+        // `once`, not `yes`: mpv idles waiting for the playlist we load over
+        // IPC, then quits when it finishes instead of idling forever. Plain
+        // `--idle` leaves mpv (and this supervisor) alive after the last
+        // entry ends, so `PlayerEvent::Exited` never fires and the now-playing
+        // bar freezes.
+        .arg("--idle=once")
         .arg(format!("--input-ipc-server={socket}"))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -340,8 +345,16 @@ pub(super) async fn run(
         }
     }
 
-    // Load the playlist; `playlist[entry_id - 1]` maps back to an item index.
+    // Load the playlist. mpv assigns `playlist_entry_id`s 1,2,3,... in the
+    // order entries are created — one per loadfile we actually dispatch, in
+    // send order, regardless of append/insert-at position. So `loaded` holds
+    // the item index behind each created entry, and `loaded[entry_id - 1]`
+    // maps a start-file back to its item. A skipped loadfile (unbuildable URL
+    // or a failed IPC write) creates no entry, so it is left out of `loaded`
+    // too — keeping the two in lockstep instead of letting one skipped entry
+    // offset every later mapping.
     let playlist = load_order(items.len(), index, !old_mpv);
+    let mut loaded: Vec<usize> = Vec::with_capacity(playlist.len());
     for (position, &item_index) in playlist.iter().enumerate() {
         let item = &items[item_index];
         let url = match stream_url(&client.host, &item.id) {
@@ -360,8 +373,9 @@ pub(super) async fn run(
         } else {
             ipc::prepend_file_cmd(&url, &title, &client.token)
         };
-        if let Err(err) = ipc.send(&command).await {
-            tracing::error!(%err, "failed to load file into mpv");
+        match ipc.send(&command).await {
+            Ok(()) => loaded.push(item_index),
+            Err(err) => tracing::error!(%err, "failed to load file into mpv"),
         }
     }
 
@@ -502,7 +516,7 @@ pub(super) async fn run(
                         let entry = msg.playlist_entry_id.unwrap_or(0) - 1;
                         let Some(&item_index) = usize::try_from(entry)
                             .ok()
-                            .and_then(|entry| playlist.get(entry))
+                            .and_then(|entry| loaded.get(entry))
                         else {
                             // jfsh aborted the whole session here; keep playing
                             // with the last known item instead.
