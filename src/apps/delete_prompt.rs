@@ -53,13 +53,13 @@ impl DeletePrompt {
         }
     }
 
-    /// Route a key: up/k and down/j move focus (clamped to 0..=1); space
-    /// toggles the focused option; enter commits; esc/q cancels. Same contract
-    /// as [`crate::apps::downloads::Downloads::handle_prompt_key`].
+    /// Route a key: up and down move focus (clamped to 0..=1); space toggles
+    /// the focused option; enter commits; esc/q cancels. Same contract as
+    /// [`crate::apps::downloads::Downloads::handle_prompt_key`].
     pub fn handle_key(&mut self, key: KeyEvent) -> DeleteAction {
         match key.code {
-            KeyCode::Up | KeyCode::Char('k') => self.focus = self.focus.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => self.focus = (self.focus + 1).min(1),
+            KeyCode::Up => self.focus = self.focus.saturating_sub(1),
+            KeyCode::Down => self.focus = (self.focus + 1).min(1),
             KeyCode::Char(' ') => {
                 if self.focus == 0 {
                     self.delete_files = !self.delete_files;

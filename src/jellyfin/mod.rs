@@ -218,7 +218,7 @@ impl Client {
             "/UserItems/Resume",
             &[
                 ("userId", self.user_id.as_str()),
-                ("fields", "MediaStreams,DateCreated"),
+                ("fields", "MediaStreams,DateCreated,Overview,Genres"),
             ],
         )
         .await
@@ -228,7 +228,7 @@ impl Client {
         self.get_items(
             "/Shows/NextUp",
             &[
-                ("fields", "MediaStreams"),
+                ("fields", "MediaStreams,Overview,Genres"),
                 ("enableTotalRecordCount", "false"),
                 ("disableFirstEpisode", "false"),
                 ("enableResumable", "false"),
@@ -244,7 +244,7 @@ impl Client {
             &[
                 ("recursive", "true"),
                 ("includeItemTypes", "Movie,Series"),
-                ("fields", "MediaStreams,DateCreated"),
+                ("fields", "MediaStreams,DateCreated,Overview,Genres"),
                 ("limit", "100"),
                 ("sortBy", "DateCreated"),
                 ("sortOrder", "Descending"),
@@ -260,7 +260,7 @@ impl Client {
                 ("searchTerm", query),
                 ("recursive", "true"),
                 ("includeItemTypes", "Movie,Series"),
-                ("fields", "MediaStreams,DateCreated"),
+                ("fields", "MediaStreams,DateCreated,Overview,Genres"),
                 ("limit", "100"),
             ],
         )
@@ -346,7 +346,10 @@ impl Client {
             ("limit", limit.as_str()),
             ("sortBy", query.sort_by),
             ("sortOrder", query.sort_order),
-            ("fields", "MediaStreams,DateCreated,ChildCount"),
+            (
+                "fields",
+                "MediaStreams,DateCreated,ChildCount,Overview,Genres",
+            ),
         ];
         if let Some(types) = query.include_item_types {
             params.push(("includeItemTypes", types));
@@ -366,7 +369,7 @@ impl Client {
         };
         self.get_items(
             &format!("/Shows/{series_id}/Episodes"),
-            &[("fields", "MediaStreams")],
+            &[("fields", "MediaStreams,Overview,Genres")],
         )
         .await
     }

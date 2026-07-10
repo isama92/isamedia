@@ -3,6 +3,21 @@
 
 use super::models::{HistoryRecord, QueueItem, Release};
 
+/// Row markers the Sonarr and Radarr lists render. Kept here as the single
+/// source so the glyph a row draws and the glyph the help legend documents
+/// cannot drift apart.
+pub const GLYPH_DOWNLOADING: &str = "↓";
+pub const GLYPH_REJECTED: &str = "!";
+pub const GLYPH_GRABBED: &str = "✓";
+
+/// The symbol legend, shown as its own labelled column in the expanded help so
+/// the glyphs are explained without being mistaken for keybindings.
+pub const SYMBOL_LEGEND: [(&str, &str); 3] = [
+    (GLYPH_DOWNLOADING, "downloading"),
+    (GLYPH_REJECTED, "rejected"),
+    (GLYPH_GRABBED, "grabbed before"),
+];
+
 /// Percent done, clamped; a queue item reporting no size counts as 0%.
 pub fn queue_progress(item: &QueueItem) -> u8 {
     if item.size <= 0.0 {
