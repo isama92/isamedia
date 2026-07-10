@@ -132,6 +132,30 @@ pub fn seek_cmd(pos: f64) -> Vec<Value> {
     vec![json!("seek"), json!(pos), json!("absolute")]
 }
 
+pub fn set_property_cmd(name: &str, value: Value) -> Vec<Value> {
+    vec![json!("set_property"), json!(name), value]
+}
+
+/// One entry of mpv's `track-list` property. `lang` is the container's tag,
+/// absent on untagged tracks (which are never persisted as a preference).
+#[derive(Debug, Clone, Deserialize)]
+pub struct Track {
+    pub id: i64,
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub lang: Option<String>,
+}
+
+/// Parse a `track-list` property value. Anything malformed yields an empty
+/// vec — a missed cache only means a track switch isn't remembered, which
+/// must never take playback down.
+pub fn parse_track_list(data: &Value) -> Vec<Track> {
+    serde_json::from_value(data.clone())
+        .map_err(|err| tracing::warn!(%err, "failed to parse mpv track-list"))
+        .unwrap_or_default()
+}
+
 pub fn sub_add_cmd(url: &str, title: &str, lang: &str) -> Vec<Value> {
     vec![
         json!("sub-add"),
@@ -376,5 +400,38 @@ mod tests {
             encode_request(&seek_cmd(90.0), 7),
             "{\"command\":[\"seek\",90.0,\"absolute\"],\"request_id\":7}\n"
         );
+    }
+
+    #[test]
+    fn set_property_shape() {
+        assert_eq!(
+            serde_json::to_string(&set_property_cmd("alang", json!("ita,it"))).unwrap(),
+            r#"["set_property","alang","ita,it"]"#
+        );
+        assert_eq!(
+            serde_json::to_string(&set_property_cmd("sid", json!("no"))).unwrap(),
+            r#"["set_property","sid","no"]"#
+        );
+    }
+
+    #[test]
+    fn parses_track_list() {
+        // The shape mpv sends: tagged audio, untagged audio, external sub.
+        let data = serde_json::json!([
+            {"id": 1, "type": "video", "selected": true},
+            {"id": 1, "type": "audio", "lang": "jpn", "selected": true, "default": true},
+            {"id": 2, "type": "audio", "selected": false},
+            {"id": 1, "type": "sub", "lang": "eng", "external": true, "title": "English"},
+        ]);
+        let tracks = parse_track_list(&data);
+        assert_eq!(tracks.len(), 4);
+        assert_eq!(tracks[1].kind, "audio");
+        assert_eq!(tracks[1].lang.as_deref(), Some("jpn"));
+        assert!(tracks[2].lang.is_none());
+        assert_eq!(tracks[3].kind, "sub");
+
+        // Malformed data degrades to empty, never panics.
+        assert!(parse_track_list(&serde_json::json!("garbage")).is_empty());
+        assert!(parse_track_list(&serde_json::json!([{"type": "audio"}])).is_empty());
     }
 }

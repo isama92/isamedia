@@ -203,6 +203,13 @@ impl Form {
         if self.show_cancel { 2 } else { 1 }
     }
 
+    /// Whether focus sits on the Save/Cancel rows rather than a field. Lets a
+    /// caller give printable keys ('q' to quit) an app-level meaning there,
+    /// where they cannot be input.
+    pub fn action_row_focused(&self) -> bool {
+        self.focus >= self.visible_indices().len()
+    }
+
     /// The current choice index of the select field with `id` (0 if absent or
     /// not a select).
     pub fn selected(&self, id: FieldId) -> usize {
@@ -284,6 +291,9 @@ impl Form {
                 }
             }
             KeyCode::Esc => FormEvent::Cancel,
+            // Backspace means "back" everywhere it can't edit text — i.e. on
+            // the action rows; on a field it falls through to the control.
+            KeyCode::Backspace if self.focus >= save_row => FormEvent::Cancel,
             // Everything else is routed to the focused field's control (cycle a
             // select, or type into a text input).
             _ => self.edit_focused(&visible, key),
@@ -517,6 +527,30 @@ mod tests {
     fn esc_always_cancels() {
         let mut form = sample();
         assert!(matches!(form.on_key(key(KeyCode::Esc)), FormEvent::Cancel));
+    }
+
+    #[test]
+    fn backspace_cancels_only_on_action_rows() {
+        let mut form = Form::new(vec![Field::text(0, "Host", "ab")], "Save");
+        // On a text field it edits the value like any other editing key.
+        assert!(!form.action_row_focused());
+        assert!(matches!(
+            form.on_key(key(KeyCode::Backspace)),
+            FormEvent::Changed(0)
+        ));
+        assert_eq!(form.text(0), "a");
+        // On Save and Cancel it means "back".
+        form.on_key(key(KeyCode::Down));
+        assert!(form.action_row_focused());
+        assert!(matches!(
+            form.on_key(key(KeyCode::Backspace)),
+            FormEvent::Cancel
+        ));
+        form.on_key(key(KeyCode::Down));
+        assert!(matches!(
+            form.on_key(key(KeyCode::Backspace)),
+            FormEvent::Cancel
+        ));
     }
 
     #[test]

@@ -5,6 +5,7 @@ mod cli;
 mod config;
 mod event;
 mod jellyfin;
+mod lang;
 mod net;
 mod player;
 mod radarr;
