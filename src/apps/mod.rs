@@ -23,11 +23,17 @@ pub fn build_apps(
     config_path: PathBuf,
     tx: mpsc::UnboundedSender<Event>,
 ) -> Vec<Box<dyn MediaApp>> {
+    // Bumped by the Settings tab whenever it re-authenticates Jellyfin, so the
+    // running Jellyfin tab reconnects with the freshly stored token instead of
+    // dropping to the login form (which would make the user type the password
+    // twice). Shared between exactly those two apps.
+    let jellyfin_reauth = Arc::new(std::sync::atomic::AtomicU64::new(0));
     vec![
         Box::new(jellyfin::JellyfinApp::new(
             config.clone(),
             config_path.clone(),
             AppSender::new("jellyfin", tx.clone()),
+            jellyfin_reauth.clone(),
         )),
         Box::new(radarr::RadarrApp::new(
             config.clone(),
@@ -46,6 +52,7 @@ pub fn build_apps(
             config,
             config_path,
             AppSender::new("settings", tx),
+            jellyfin_reauth,
         )),
     ]
 }

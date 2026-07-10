@@ -103,6 +103,16 @@ impl Field {
         self
     }
 
+    /// Mask this text field's value (rendered as bullets), so a secret never
+    /// shows in the clear. A no-op on a select field. Readback via
+    /// [`Form::text`] still returns the real, unmasked value.
+    pub fn masked(mut self) -> Self {
+        if let Control::Text { input, .. } = &mut self.control {
+            input.masked = true;
+        }
+        self
+    }
+
     /// Whether the current value differs from the one it opened on.
     pub fn changed(&self) -> bool {
         match &self.control {
@@ -141,11 +151,14 @@ pub enum FormEvent {
 }
 
 /// A modal form. Focus runs over the visible fields in order, then the Save and
-/// Cancel action rows.
+/// (optionally) Cancel action rows.
 pub struct Form {
     fields: Vec<Field>,
     focus: usize,
     save_label: &'static str,
+    /// Whether a Cancel action row is shown. `false` drops it for entry screens
+    /// that have nowhere to cancel back to (Esc still yields `Cancel`).
+    show_cancel: bool,
 }
 
 impl Form {
@@ -155,9 +168,18 @@ impl Form {
             fields,
             focus: 0,
             save_label,
+            show_cancel: true,
         };
         form.sync_focus();
         form
+    }
+
+    /// Render only the confirm button (no Cancel row) — for entry screens with
+    /// nowhere to cancel back to. Esc still yields [`FormEvent::Cancel`]; the
+    /// caller decides what, if anything, that means.
+    pub fn without_cancel(mut self) -> Self {
+        self.show_cancel = false;
+        self
     }
 
     /// Indices into `fields` of the currently visible fields, in order.
@@ -170,9 +192,15 @@ impl Form {
             .collect()
     }
 
-    /// Number of focusable rows: visible fields plus Save and Cancel.
+    /// Number of focusable rows: visible fields plus Save and, unless
+    /// suppressed, Cancel.
     fn nav_len(&self) -> usize {
-        self.visible_indices().len() + 2
+        self.visible_indices().len() + self.action_rows()
+    }
+
+    /// Number of action rows below the fields: Save always, Cancel optionally.
+    fn action_rows(&self) -> usize {
+        if self.show_cancel { 2 } else { 1 }
     }
 
     /// The current choice index of the select field with `id` (0 if absent or
@@ -226,8 +254,10 @@ impl Form {
 
     pub fn on_key(&mut self, key: KeyEvent) -> FormEvent {
         let visible = self.visible_indices();
-        let nav = visible.len() + 2;
-        let (save_row, cancel_row) = (visible.len(), visible.len() + 1);
+        let nav = visible.len() + self.action_rows();
+        let save_row = visible.len();
+        // Cancel exists only when shown; its absence never shifts the Save row.
+        let cancel_row = self.show_cancel.then_some(visible.len() + 1);
         // Visibility may have changed since the last key; keep focus in range.
         if self.focus >= nav {
             self.focus = nav - 1;
@@ -244,7 +274,7 @@ impl Form {
             KeyCode::Enter => {
                 if self.focus == save_row {
                     FormEvent::Save
-                } else if self.focus == cancel_row {
+                } else if Some(self.focus) == cancel_row {
                     FormEvent::Cancel
                 } else {
                     // Enter on a field advances, so the form can be walked to
@@ -330,7 +360,7 @@ impl Form {
         let rows_height = bottom.saturating_sub(rows_top);
 
         let visible = self.visible_indices();
-        let nav_len = visible.len() + 2;
+        let nav_len = visible.len() + self.action_rows();
         // Width over EVERY field, visible or not, so revealing a conditional
         // field (e.g. Move files) never shifts the value column.
         let label_w = self
@@ -359,7 +389,7 @@ impl Form {
                 self.draw_field(&self.fields[idx], label_w, row == self.focus, rect, buf);
             } else if row == visible.len() {
                 button_line(self.save_label, self.focus == visible.len()).render(rect, buf);
-            } else {
+            } else if self.show_cancel {
                 button_line("Cancel", self.focus == visible.len() + 1).render(rect, buf);
             }
         }
@@ -559,6 +589,51 @@ mod tests {
         form.reset(0);
         assert_eq!(form.text(0), "/movies");
         assert!(!form.changed(0));
+    }
+
+    /// The whole rendered screen as text, for content assertions.
+    fn rendered(form: &Form, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| form.draw(frame, frame.area(), "Title"))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let area = *buf.area();
+        let mut out = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn masked_text_field_renders_bullets() {
+        let form = Form::new(vec![Field::text(0, "Secret", "abcd").masked()], "Save");
+        // Readback returns the real value; only the rendering is masked.
+        assert_eq!(form.text(0), "abcd");
+        let text = rendered(&form, 40, 8);
+        assert!(text.contains('\u{2022}'), "expected bullets in:\n{text}");
+        assert!(!text.contains("abcd"), "secret leaked in:\n{text}");
+    }
+
+    #[test]
+    fn without_cancel_has_no_cancel_row() {
+        let mut form =
+            Form::new(vec![Field::text(0, "Host", "example")], "Connect").without_cancel();
+        // Nav is field(0) then Save only: Down twice wraps back to the field,
+        // never landing on a Cancel row.
+        form.on_key(key(KeyCode::Down)); // -> Save
+        assert!(matches!(form.on_key(key(KeyCode::Enter)), FormEvent::Save));
+        form.on_key(key(KeyCode::Down)); // Save -> field 0 (wrap)
+        assert_eq!(form.focus, 0);
+        // Esc still cancels even without a Cancel button.
+        assert!(matches!(form.on_key(key(KeyCode::Esc)), FormEvent::Cancel));
+        // The rendered form shows Save but no Cancel button.
+        let text = rendered(&form, 40, 8);
+        assert!(text.contains("Connect"), "missing Save button in:\n{text}");
+        assert!(!text.contains("Cancel"), "unexpected Cancel in:\n{text}");
     }
 
     #[test]
