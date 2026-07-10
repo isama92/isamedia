@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::ui::theme::Theme;
+use crate::ui::theme::{Accent, Theme};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -12,6 +12,9 @@ pub struct Config {
     // Declared before the `jellyfin` table: TOML puts bare keys before tables,
     // so a field placed after it would serialise into the wrong section.
     pub theme: Theme,
+    // Only applied for themes that offer accents (Catppuccin Latte); persisted
+    // regardless so switching back to such a theme restores the choice.
+    pub accent: Accent,
     pub jellyfin: JellyfinConfig,
 }
 
@@ -101,6 +104,7 @@ mod tests {
         let config = Config {
             last_app: Some("jellyfin".into()),
             theme: Theme::SolarizedLight,
+            accent: Accent::Mauve,
             jellyfin: JellyfinConfig {
                 host: "https://demo.jellyfin.org".into(),
                 skip_segments: vec!["Intro".into(), "Outro".into()],
@@ -111,6 +115,7 @@ mod tests {
         let parsed: Config = toml::from_str(&raw).unwrap();
         assert_eq!(parsed.last_app.as_deref(), Some("jellyfin"));
         assert_eq!(parsed.theme, Theme::SolarizedLight);
+        assert_eq!(parsed.accent, Accent::Mauve);
         assert_eq!(parsed.jellyfin.host, config.jellyfin.host);
         assert_eq!(parsed.jellyfin.skip_segments, config.jellyfin.skip_segments);
     }
@@ -121,27 +126,32 @@ mod tests {
         assert_eq!(parsed.jellyfin.host, "http://x");
         assert!(parsed.jellyfin.user_id.is_empty());
         assert!(parsed.last_app.is_none());
-        // A config with no theme key defaults, so old files load unchanged.
+        // A config with no theme/accent keys defaults, so old files load unchanged.
         assert_eq!(parsed.theme, Theme::Latte);
+        assert_eq!(parsed.accent, Accent::Rosewater);
     }
 
     #[test]
     fn theme_serialises_kebab_case() {
         let config = Config {
             theme: Theme::SolarizedLight,
+            accent: Accent::Sky,
             ..Config::default()
         };
         let raw = toml::to_string_pretty(&config).unwrap();
         assert!(raw.contains("theme = \"solarized-light\""));
-        let parsed: Config = toml::from_str("theme = \"latte\"\n").unwrap();
+        assert!(raw.contains("accent = \"sky\""));
+        let parsed: Config = toml::from_str("theme = \"latte\"\naccent = \"lavender\"\n").unwrap();
         assert_eq!(parsed.theme, Theme::Latte);
+        assert_eq!(parsed.accent, Accent::Lavender);
     }
 
     #[test]
     fn unknown_theme_is_rejected() {
-        // The enum is strict: a hand-edited unknown value fails to parse like
+        // The enums are strict: a hand-edited unknown value fails to parse like
         // any other malformed TOML, rather than silently resetting.
         assert!(toml::from_str::<Config>("theme = \"nord\"\n").is_err());
+        assert!(toml::from_str::<Config>("accent = \"turquoise\"\n").is_err());
     }
 
     #[test]
