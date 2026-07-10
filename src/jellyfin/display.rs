@@ -74,6 +74,8 @@ pub fn item_title(item: &MediaItem) -> String {
             title
         }
         ItemKind::Video => format!("{name} ({})", year(item)),
+        // Libraries and collections list by bare name only.
+        ItemKind::BoxSet | ItemKind::CollectionFolder => name.to_string(),
         ItemKind::Other => String::new(),
     }
 }
@@ -93,7 +95,7 @@ pub fn item_description(item: &MediaItem) -> String {
             rating(item),
             runtime(item.run_time_ticks.unwrap_or(0)),
         ),
-        ItemKind::Other => String::new(),
+        ItemKind::BoxSet | ItemKind::CollectionFolder | ItemKind::Other => String::new(),
     }
 }
 
@@ -214,6 +216,20 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(item_title(&item), "The Expanse (2015) [12]");
+    }
+
+    #[test]
+    fn box_set_lists_by_name_only() {
+        let item = MediaItem {
+            id: "b1".into(),
+            name: Some("Trilogy".into()),
+            kind: ItemKind::BoxSet,
+            production_year: Some(1999),
+            community_rating: Some(7.5),
+            ..Default::default()
+        };
+        assert_eq!(item_title(&item), "Trilogy");
+        assert_eq!(item_description(&item), "");
     }
 
     #[test]
