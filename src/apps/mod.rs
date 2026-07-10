@@ -34,9 +34,15 @@ pub fn build_apps(
         Box::new(sonarr::SonarrApp::new(
             config.clone(),
             config_path.clone(),
-            AppSender::new("sonarr", tx),
+            AppSender::new("sonarr", tx.clone()),
         )),
-        // Purely local: owns the config to read/write settings, needs no sender.
-        Box::new(settings::SettingsApp::new(config, config_path)),
+        // Owns the config to read/write settings; the backend credential forms
+        // connect to a server and write the keyring, so it needs a sender to
+        // report those async results back.
+        Box::new(settings::SettingsApp::new(
+            config,
+            config_path,
+            AppSender::new("settings", tx),
+        )),
     ]
 }
