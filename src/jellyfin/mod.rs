@@ -29,6 +29,18 @@ pub enum Error {
     Http(#[from] reqwest::Error),
 }
 
+/// What opening a library lists, as (includeItemTypes, recursive): movie and
+/// show libraries recurse into their folders for a single item type, any
+/// other library lists its direct children (e.g. the collections). Item
+/// counts use the same scope so the number matches what opening shows.
+pub fn library_scope(collection_type: Option<&str>) -> (Option<&'static str>, bool) {
+    match collection_type {
+        Some("movies") => (Some("Movie"), true),
+        Some("tvshows") => (Some("Series"), true),
+        _ => (None, false),
+    }
+}
+
 /// Parameters for one page of an `/Items` listing under a parent (a library
 /// view or a collection). Owned strings so a query built on the render
 /// thread moves cleanly into the spawned request task.
@@ -255,10 +267,67 @@ impl Client {
         .await
     }
 
-    /// The user's library views (Movies, Shows, Collections, ...).
+    /// The user's library views (Movies, Shows, Collections, ...), with
+    /// `child_count` replaced by a real count per view. The ChildCount that
+    /// /Views itself returns is unreliable (it can disagree with the item
+    /// list and vary between calls), so each view gets a limit=0 count
+    /// request instead, all issued concurrently.
     pub async fn get_libraries(&self) -> Result<ItemsResponse, Error> {
-        self.request(Method::GET, &format!("/Users/{}/Views", self.user_id), &[])
-            .await
+        let mut response: ItemsResponse = self
+            .request(Method::GET, &format!("/Users/{}/Views", self.user_id), &[])
+            .await?;
+        let handles: Vec<_> = response
+            .items
+            .iter()
+            .map(|item| {
+                let client = self.clone();
+                let parent_id = item.id.clone();
+                let collection_type = item.collection_type.clone();
+                tokio::spawn(async move {
+                    client
+                        .count_library_items(&parent_id, collection_type.as_deref())
+                        .await
+                })
+            })
+            .collect();
+        for (item, handle) in response.items.iter_mut().zip(handles) {
+            // A failed count is cosmetic (the row just shows no number);
+            // the view list itself already loaded fine.
+            item.child_count = match handle.await {
+                Ok(Ok(count)) => Some(count),
+                Ok(Err(err)) => {
+                    tracing::debug!(%err, "library count request failed");
+                    None
+                }
+                Err(err) => {
+                    tracing::debug!(%err, "library count task failed");
+                    None
+                }
+            };
+        }
+        Ok(response)
+    }
+
+    /// Number of items opening this library would list, read from the
+    /// server-side TotalRecordCount. `limit=1` rather than `limit=0`: the
+    /// one throwaway item is cheap, and 0 is too easily reinterpreted as
+    /// "no limit" by a future server version.
+    async fn count_library_items(
+        &self,
+        parent_id: &str,
+        collection_type: Option<&str>,
+    ) -> Result<i32, Error> {
+        let (include_item_types, recursive) = library_scope(collection_type);
+        let mut params: Vec<(&str, &str)> = vec![
+            ("parentId", parent_id),
+            ("recursive", if recursive { "true" } else { "false" }),
+            ("limit", "1"),
+        ];
+        if let Some(types) = include_item_types {
+            params.push(("includeItemTypes", types));
+        }
+        let response: ItemsResponse = self.request(Method::GET, "/Items", &params).await?;
+        Ok(response.total_record_count.clamp(0, i32::MAX as i64) as i32)
     }
 
     /// One page of items under a library or collection. Returns the full
@@ -378,6 +447,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn library_scope_matches_what_opening_lists() {
+        assert_eq!(library_scope(Some("movies")), (Some("Movie"), true));
+        assert_eq!(library_scope(Some("tvshows")), (Some("Series"), true));
+        assert_eq!(library_scope(Some("boxsets")), (None, false));
+        assert_eq!(library_scope(Some("music")), (None, false));
+        assert_eq!(library_scope(None), (None, false));
+    }
+
+    #[test]
     fn debug_never_prints_secrets() {
         let creds = Credentials {
             host: "https://jf.example.com".into(),
@@ -439,6 +517,10 @@ mod tests {
 
         let libraries = client.get_libraries().await.expect("libraries");
         assert!(!libraries.items.is_empty(), "demo server should have views");
+        assert!(
+            libraries.items.iter().all(|lib| lib.child_count.is_some()),
+            "every view should get a real item count"
+        );
         let page = client
             .get_library_items(&LibraryItemsQuery {
                 parent_id: libraries.items[0].id.clone(),
