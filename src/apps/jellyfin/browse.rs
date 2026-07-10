@@ -1552,20 +1552,21 @@ impl Browse {
             } else {
                 Style::new().fg(theme::fg())
             };
+            // Show the watched/total ratio inline next to the name (with a
+            // check once the whole season is watched) rather than in a
+            // far-right column, so the count reads as part of the season.
+            let count = if fully_watched {
+                format!("  {}/{} ✓", season.watched_count, season.episode_count)
+            } else {
+                format!("  {}/{}", season.watched_count, season.episode_count)
+            };
             let row_area = Rect::new(area.x, area.y + row as u16, area.width.saturating_sub(1), 1);
-            let [left, right] =
-                Layout::horizontal([Constraint::Fill(1), Constraint::Length(10)]).areas(row_area);
             Line::from(vec![
                 gutter,
                 Span::styled(display::season_name(season.number), name_style),
+                Span::styled(count, theme::dim()),
             ])
-            .render(left, buf);
-            Line::from(Span::styled(
-                format!("{}/{} ", season.watched_count, season.episode_count),
-                theme::dim(),
-            ))
-            .right_aligned()
-            .render(right, buf);
+            .render(row_area, buf);
         }
         if self.seasons.len() > per_page {
             list::draw_scrollbar(buf, area, self.season_cursor, self.seasons.len());
@@ -1616,21 +1617,10 @@ impl Browse {
                 Span::raw("   ")
             };
             let code = display::episode_code(item);
-            let row_area = Rect::new(area.x, area.y + row as u16, area.width.saturating_sub(1), 1);
-            let [left, right] =
-                Layout::horizontal([Constraint::Fill(1), Constraint::Length(6)]).areas(row_area);
-            let title_width = (left.width as usize)
-                .saturating_sub(3 + code.len() + 2)
-                .max(4);
-            let title = truncate(item.name.as_deref().unwrap_or(""), title_width);
-            Line::from(vec![
-                gutter,
-                Span::styled(format!("{code}  "), base_style),
-                Span::styled(title, base_style),
-            ])
-            .render(left, buf);
+            // Watched check / progress marker sits inline after the title
+            // (like movies/videos) instead of in a far-right column.
             let marker = if watched {
-                Span::styled("✓ ", theme::dim())
+                "  ✓".to_string()
             } else {
                 let pct = item
                     .user_data
@@ -1638,12 +1628,25 @@ impl Browse {
                     .and_then(|data| data.played_percentage)
                     .unwrap_or(0.0);
                 if pct > 0.0 {
-                    Span::styled(format!("{pct:.0}% "), theme::dim())
+                    format!("  {pct:.0}%")
                 } else {
-                    Span::raw("")
+                    String::new()
                 }
             };
-            Line::from(marker).right_aligned().render(right, buf);
+            let row_area = Rect::new(area.x, area.y + row as u16, area.width.saturating_sub(1), 1);
+            // Reserve the gutter (3), the code plus its two spaces, and a fixed
+            // slot (6) for the marker so a long title never pushes it off-screen.
+            let title_width = (row_area.width as usize)
+                .saturating_sub(3 + code.len() + 2 + 6)
+                .max(4);
+            let title = truncate(item.name.as_deref().unwrap_or(""), title_width);
+            Line::from(vec![
+                gutter,
+                Span::styled(format!("{code}  "), base_style),
+                Span::styled(title, base_style),
+                Span::styled(marker, theme::dim()),
+            ])
+            .render(row_area, buf);
         }
         if self.items.len() > per_page {
             list::draw_scrollbar(buf, area, self.cursor, self.items.len());

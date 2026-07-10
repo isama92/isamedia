@@ -67,6 +67,18 @@ pub fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
     lines
 }
 
+/// A faint connector exactly `width` columns wide: a horizontal rule padded
+/// with a space at each end so it never touches the text it bridges. Used to
+/// link a left label to a right-aligned value across the empty middle of a
+/// list row. Widths below 2 collapse to plain spaces, since the padding alone
+/// already fills them.
+pub fn leader_line(width: usize) -> String {
+    match width {
+        0 | 1 => " ".repeat(width),
+        _ => format!(" {} ", "─".repeat(width - 2)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,5 +122,25 @@ mod tests {
         // Double-width chars never straddle the boundary.
         let lines = wrap_text("こんにちはこんにちは", 5);
         assert!(lines.iter().all(|line| line.width() <= 5), "{lines:?}");
+    }
+
+    #[test]
+    fn leader_line_fills_exact_width() {
+        use unicode_width::UnicodeWidthStr;
+
+        for width in 0..=40 {
+            assert_eq!(leader_line(width).width(), width, "width {width}");
+        }
+    }
+
+    #[test]
+    fn leader_line_pads_and_collapses() {
+        // Below 2 columns there is only room for the padding spaces.
+        assert_eq!(leader_line(0), "");
+        assert_eq!(leader_line(1), " ");
+        // A rule never touches the text on either side.
+        let line = leader_line(6);
+        assert!(line.starts_with(' ') && line.ends_with(' '), "{line:?}");
+        assert_eq!(line, " ──── ");
     }
 }
