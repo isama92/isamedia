@@ -90,8 +90,13 @@ enum Confirm {
 enum FormMode {
     /// Editing the series with this id (options change via the bulk editor).
     Edit { id: i64 },
-    /// Adding the lookup result at this index into `add_results_raw`.
-    Add { result: usize },
+    /// Adding a new series from this raw lookup object, cloned when the form
+    /// opened. Snapshotting the body (rather than an index into
+    /// `add_results_raw`) means a lookup that lands under the open modal form
+    /// cannot swap the list out from under Save, which would POST a different
+    /// series than the form title showed. Mirrors how the delete prompts
+    /// capture their id at open time.
+    Add { body: serde_json::Value },
 }
 
 /// The open full-body form: the reusable widget, what it commits to, and the
@@ -1290,6 +1295,12 @@ impl Browse {
                 Some("add options unavailable: need a root folder and a quality profile".into());
             return;
         }
+        // Snapshot the raw lookup object now, index-aligned with the title
+        // below, so Save commits this series even if a still-in-flight lookup
+        // replaces `add_results_raw` while the form is open.
+        let Some(body) = self.add_results_raw.get(self.add_cursor).cloned() else {
+            return;
+        };
         let title = format!(
             "Add series — {}",
             series_label(&self.add_results[self.add_cursor])
@@ -1304,9 +1315,7 @@ impl Browse {
         ];
         self.form = Some(ActiveForm {
             form: Form::new(fields, "Add"),
-            mode: FormMode::Add {
-                result: self.add_cursor,
-            },
+            mode: FormMode::Add { body },
             title,
         });
     }
@@ -1315,7 +1324,7 @@ impl Browse {
     /// to POST /series. The whole object is forwarded (not a subset) because
     /// Sonarr requires fields the typed model drops (titleSlug, images, the
     /// seasons array).
-    fn commit_add(&mut self, result: usize, form: &Form) {
+    fn commit_add(&mut self, mut body: serde_json::Value, form: &Form) {
         // The root folder is typed free-text; the quality profile is still a
         // pick from the configured list.
         let root_folder = form.text(field::ROOT).trim().to_string();
@@ -1325,9 +1334,6 @@ impl Browse {
             .map(|p| p.id);
         let (false, Some(quality_profile_id)) = (root_folder.is_empty(), quality_profile_id) else {
             self.notice = Some("add cancelled: no root folder or quality profile".into());
-            return;
-        };
-        let Some(mut body) = self.add_results_raw.get(result).cloned() else {
             return;
         };
         let series_type = SERIES_TYPE
@@ -1495,7 +1501,7 @@ impl Browse {
         };
         match active.mode {
             FormMode::Edit { id } => self.commit_edit(id, &active.form),
-            FormMode::Add { result } => self.commit_add(result, &active.form),
+            FormMode::Add { body } => self.commit_add(body, &active.form),
         }
     }
 
