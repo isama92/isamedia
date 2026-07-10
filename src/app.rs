@@ -54,10 +54,18 @@ pub trait MediaApp {
     fn on_tick(&mut self) {}
 
     /// Called once before the program exits; stop background work here.
-    /// Return true to ask the shell for a brief grace period so shutdown
-    /// work (e.g. telling mpv to quit, final playback report) can flush.
+    /// Return true to ask the shell for a grace period so shutdown work
+    /// (e.g. telling mpv to quit, final playback report) can flush.
     fn on_quit(&mut self) -> bool {
         false
+    }
+
+    /// Polled during the shutdown grace period; return false while shutdown
+    /// work started by `on_quit` is still in flight. The shell keeps routing
+    /// events (so completion messages still arrive) until every app reports
+    /// true or the grace deadline passes.
+    fn ready_to_quit(&self) -> bool {
+        true
     }
 
     /// One-line status shown in the shell status bar even when another app's
