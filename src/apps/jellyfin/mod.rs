@@ -1,3 +1,4 @@
+mod browse;
 mod login;
 mod msg;
 
@@ -17,6 +18,7 @@ use crate::event::AppSender;
 use crate::jellyfin::{Client, Credentials};
 use crate::ui::theme;
 
+use browse::{Browse, BrowseAction};
 use login::{LoginAction, LoginForm};
 use msg::Msg;
 
@@ -29,11 +31,6 @@ enum Screen {
     Connecting,
     Login(LoginForm),
     Browse(Browse),
-}
-
-/// Placeholder until M3; proves the login flow works end to end.
-struct Browse {
-    client: Client,
 }
 
 pub struct JellyfinApp {
@@ -103,6 +100,23 @@ impl JellyfinApp {
         }
     }
 
+    /// Drop the stored token and return to the login form; used when the
+    /// server starts answering 401 (token revoked/expired).
+    fn on_session_expired(&mut self) {
+        {
+            let mut config = self.config.lock().unwrap();
+            config.jellyfin.token.clear();
+            config.jellyfin.user_id.clear();
+            if let Err(err) = config.save(&self.config_path) {
+                tracing::warn!(%err, "failed to persist cleared token");
+            }
+        }
+        self.auth_gen += 1;
+        let mut form = self.login_form();
+        form.error = Some("session expired, please log in again".into());
+        self.screen = Screen::Login(form);
+    }
+
     fn on_auth_done(&mut self, result: Result<Client, crate::jellyfin::Error>) {
         match result {
             Ok(client) => {
@@ -120,7 +134,7 @@ impl JellyfinApp {
                         .as_ref()
                         .map(|(h, u, p)| (h.as_str(), u.as_str(), p.as_str())),
                 );
-                self.screen = Screen::Browse(Browse { client });
+                self.screen = Screen::Browse(Browse::new(client, self.sender.clone()));
             }
             Err(err) => {
                 tracing::warn!(%err, "authentication failed");
@@ -190,10 +204,24 @@ impl MediaApp for JellyfinApp {
                 }
                 None
             }
-            Screen::Browse(_) => match key.code {
-                KeyCode::Char('q') => Some(ShellRequest::Quit),
-                _ => None,
+            Screen::Browse(browse) => match browse.on_key(key) {
+                Some(BrowseAction::Quit) => Some(ShellRequest::Quit),
+                Some(BrowseAction::Play(item)) => {
+                    // Playback lands in M4.
+                    browse.error = Some(format!(
+                        "playback not implemented yet ({})",
+                        crate::jellyfin::display::item_title(&item)
+                    ));
+                    None
+                }
+                None => None,
             },
+        }
+    }
+
+    fn on_tick(&mut self) {
+        if let Screen::Browse(browse) = &mut self.screen {
+            browse.on_tick();
         }
     }
 
@@ -208,11 +236,29 @@ impl MediaApp for JellyfinApp {
                 }
                 self.on_auth_done(result);
             }
+            Msg::ItemsLoaded { fetch_gen, result } => {
+                if matches!(result, Err(crate::jellyfin::Error::Unauthorized)) {
+                    self.on_session_expired();
+                    return;
+                }
+                if let Screen::Browse(browse) = &mut self.screen {
+                    browse.on_items_loaded(fetch_gen, result);
+                }
+            }
+            Msg::WatchedToggled(result) => {
+                if matches!(result, Err(crate::jellyfin::Error::Unauthorized)) {
+                    self.on_session_expired();
+                    return;
+                }
+                if let Screen::Browse(browse) = &mut self.screen {
+                    browse.on_watched_toggled(result);
+                }
+            }
         }
     }
 
     fn draw(&mut self, frame: &mut Frame, area: Rect) {
-        match &self.screen {
+        match &mut self.screen {
             Screen::Boot => {}
             Screen::Connecting => {
                 Line::styled("connecting...", theme::dim())
@@ -220,14 +266,7 @@ impl MediaApp for JellyfinApp {
                     .render(area, frame.buffer_mut());
             }
             Screen::Login(form) => form.draw(frame, area),
-            Screen::Browse(browse) => {
-                Line::styled(
-                    format!("connected to {} (browse UI coming in M3)", browse.client.host),
-                    theme::accent(),
-                )
-                .centered()
-                .render(area, frame.buffer_mut());
-            }
+            Screen::Browse(browse) => browse.draw(frame, area),
         }
     }
 }
