@@ -10,15 +10,15 @@ pub struct Config {
     pub jellyfin: JellyfinConfig,
 }
 
+/// Non-secret Jellyfin settings. The token and password live in the OS
+/// keyring (see `crate::secrets`), never in this file.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct JellyfinConfig {
     pub host: String,
     pub username: String,
-    pub password: String,
     pub device: String,
     pub device_id: String,
-    pub token: String,
     pub user_id: String,
     pub skip_segments: Vec<String>,
 }
@@ -62,7 +62,8 @@ impl Config {
         let raw = toml::to_string_pretty(self).context("serializing config")?;
         std::fs::write(path, raw)
             .with_context(|| format!("writing config file {}", path.display()))?;
-        // The file holds credentials; keep it private to the user.
+        // No secrets in here, but the file still names your server and
+        // account; keep it private to the user.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -97,8 +98,20 @@ mod tests {
     fn parses_partial_config() {
         let parsed: Config = toml::from_str("[jellyfin]\nhost = \"http://x\"\n").unwrap();
         assert_eq!(parsed.jellyfin.host, "http://x");
-        assert!(parsed.jellyfin.token.is_empty());
+        assert!(parsed.jellyfin.user_id.is_empty());
         assert!(parsed.last_app.is_none());
     }
 
+    #[test]
+    fn ignores_legacy_secret_fields() {
+        // Configs written before secrets moved to the keyring may still have
+        // token/password keys; they must parse (and be dropped on next save).
+        let parsed: Config =
+            toml::from_str("[jellyfin]\nhost = \"http://x\"\ntoken = \"t\"\npassword = \"p\"\n")
+                .unwrap();
+        assert_eq!(parsed.jellyfin.host, "http://x");
+        let saved = toml::to_string_pretty(&parsed).unwrap();
+        assert!(!saved.contains("token"));
+        assert!(!saved.contains("password"));
+    }
 }

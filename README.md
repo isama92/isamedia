@@ -20,12 +20,15 @@ runs).
   the current item and position, `s` stops playback
 - **Multi-app shell**: switch apps with `ctrl+←/→` or `ctrl+1..3`
   (Sonarr/Radarr are placeholders for now)
-- Log in once; the token is stored and reused on later runs.
+- Log in once; the token is stored in the OS keyring (Secret Service on
+  Linux, Credential Manager on Windows) and reused on later runs.
 
 ## Requirements
 
 - mpv in `PATH`
 - A Jellyfin server (10.9+)
+- On Linux: a Secret Service keyring (GNOME Keyring or KWallet — present on
+  any normal desktop) for storing the login token
 
 ## Build
 
@@ -73,13 +76,17 @@ last_app = "jellyfin"
 [jellyfin]
 host = "https://jellyfin.example.com"   # http(s), base paths supported
 username = "me"
-password = ""              # optional; only used when the token expires
 device = "hostname"
 device_id = "..."          # generated
-token = "..."              # managed automatically
 user_id = "..."            # managed automatically
 skip_segments = []         # e.g. ["Intro", "Outro", "Recap", "Preview", "Commercial"]
 ```
+
+The config file holds no secrets. The session token — and the password, if
+you enter one at login — are stored in the OS keyring under the `isamedia`
+service (`jellyfin-token` / `jellyfin-password`). The password is optional
+and only used to re-authenticate automatically when the token expires; leave
+the field empty at login to not store one.
 
 ## Development
 

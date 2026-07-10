@@ -38,7 +38,9 @@ impl LoginForm {
         let mut form = Self {
             host: TextInput::with_value(&config.host),
             username: TextInput::with_value(&config.username),
-            password: TextInput::with_value(&config.password),
+            // Never prefilled: the stored password lives in the OS keyring
+            // and is only read by the auto-login task.
+            password: TextInput::default(),
             focus: 0,
             error: None,
             busy: false,
