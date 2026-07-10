@@ -940,7 +940,7 @@ impl Browse {
             let selected = i == self.movie_cursor;
 
             let title = truncate(movie.title.as_deref().unwrap_or("(untitled)"), title_width);
-            let overview = truncate(movie.overview.as_deref().unwrap_or_default(), text_width);
+            let meta = truncate(&display::movie_meta(movie), text_width);
 
             let title_style = if selected {
                 Style::new()
@@ -969,16 +969,12 @@ impl Browse {
                 Line::from(vec![Self::status_span(&status), Span::raw(" ")])
                     .right_aligned()
                     .render(right, buf);
-                let overview_style = if selected {
+                let meta_style = if selected {
                     Style::new().fg(theme::accent_color())
                 } else {
                     theme::dim()
                 };
-                Line::from(vec![
-                    gutter(selected),
-                    Span::styled(overview, overview_style),
-                ])
-                .render(
+                Line::from(vec![gutter(selected), Span::styled(meta, meta_style)]).render(
                     Rect::new(area.x, y + 1, area.width.saturating_sub(1), 1),
                     buf,
                 );
@@ -1019,22 +1015,10 @@ impl Browse {
             )),
             &mut y,
         );
-        let mut meta = Vec::new();
-        if let Some(year) = movie.year {
-            meta.push(year.to_string());
-        }
-        if let Some(rating) = display::rating(movie) {
-            meta.push(format!("{rating:.1}"));
-        }
-        if let Some(runtime) = display::format_runtime(movie.runtime) {
-            meta.push(runtime);
-        }
+        let meta = display::movie_meta(movie);
         if !meta.is_empty() {
             line(
-                Line::from(Span::styled(
-                    format!("  {}", meta.join(" • ")),
-                    theme::dim(),
-                )),
+                Line::from(Span::styled(format!("  {meta}"), theme::dim())),
                 &mut y,
             );
         }
