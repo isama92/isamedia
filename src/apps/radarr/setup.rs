@@ -1,33 +1,31 @@
-//! First-run / re-auth form: server host plus API key. Deliberate duplicate
-//! of the Sonarr setup form — the app layer is never generalised.
+//! First-run / re-auth form: server host plus API key. A thin facade over the
+//! shared [`Form`] widget (a single Connect button, no Cancel — there is
+//! nowhere to cancel back to on the entry screen). Deliberate duplicate of the
+//! Sonarr setup form — the app layer is never generalised.
 
 use ratatui::Frame;
-use ratatui::crossterm::event::{KeyCode, KeyEvent};
+use ratatui::crossterm::event::KeyEvent;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
-use ratatui::style::Style;
-use ratatui::text::{Line, Span};
+use ratatui::text::Line;
 use ratatui::widgets::Widget;
 
 use crate::config::RadarrConfig;
-use crate::ui::input::TextInput;
+use crate::ui::form::{Field, Form, FormEvent};
 use crate::ui::theme;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Field {
-    Host,
-    ApiKey,
+/// Stable field ids; values are read by id.
+mod field {
+    use crate::ui::form::FieldId;
+    pub const HOST: FieldId = 0;
+    pub const API_KEY: FieldId = 1;
 }
-
-const FIELDS: [Field; 2] = [Field::Host, Field::ApiKey];
 
 pub enum SetupAction {
     Submit,
 }
 
 pub struct SetupForm {
-    pub host: TextInput,
-    pub api_key: TextInput,
-    focus: usize,
+    form: Form,
     pub error: Option<String>,
     /// Set while a connect attempt is in flight; input is ignored.
     pub busy: bool,
@@ -35,25 +33,34 @@ pub struct SetupForm {
 
 impl SetupForm {
     pub fn from_config(config: &RadarrConfig) -> Self {
-        let mut form = Self {
-            host: TextInput::with_value(&config.host),
+        let fields = vec![
+            Field::text(field::HOST, "Host", config.host.clone()),
             // Never prefilled: the stored key lives in the OS keyring and is
             // only read by the auto-connect task.
-            api_key: TextInput::default(),
-            focus: 0,
+            Field::text(field::API_KEY, "API key", "").masked(),
+        ];
+        Self {
+            // A single Connect button: an entry screen has nowhere to cancel to.
+            form: Form::new(fields, "Connect").without_cancel(),
             error: None,
             busy: false,
-        };
-        form.api_key.masked = true;
-        form.host.focused = true;
-        form
+        }
+    }
+
+    pub fn host(&self) -> String {
+        self.form.text(field::HOST)
+    }
+
+    pub fn api_key(&self) -> String {
+        self.form.text(field::API_KEY)
     }
 
     fn host_error(&self) -> Option<String> {
-        if self.host.value().is_empty() {
+        let host = self.host();
+        if host.is_empty() {
             return None;
         }
-        crate::net::normalize_host(self.host.value())
+        crate::net::normalize_host(&host)
             .err()
             .map(|err| err.to_string())
     }
@@ -61,51 +68,46 @@ impl SetupForm {
     /// Plain http means the API key crosses the network unencrypted.
     /// Legitimate on a trusted LAN, but worth a visible nudge.
     fn plain_http(&self) -> bool {
-        crate::net::is_plain_http(self.host.value())
+        crate::net::is_plain_http(&self.host())
     }
 
-    fn valid(&self) -> bool {
-        !self.host.value().is_empty()
-            && self.host_error().is_none()
-            && !self.api_key.value().is_empty()
-    }
-
-    fn focused_input(&mut self) -> &mut TextInput {
-        match FIELDS[self.focus] {
-            Field::Host => &mut self.host,
-            Field::ApiKey => &mut self.api_key,
+    /// Why the form can't be submitted yet, or `None` when it's ready. Unlike
+    /// the Settings form, the API key is required here (nothing is stored yet).
+    fn invalid_reason(&self) -> Option<String> {
+        if self.host().is_empty() {
+            return Some("enter the host".into());
         }
-    }
-
-    fn set_focus(&mut self, focus: usize) {
-        self.focus = focus;
-        self.host.focused = false;
-        self.api_key.focused = false;
-        self.focused_input().focused = true;
+        if let Some(err) = self.host_error() {
+            return Some(err);
+        }
+        if self.api_key().is_empty() {
+            return Some("enter the API key".into());
+        }
+        None
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> Option<SetupAction> {
         if self.busy {
             return None;
         }
-        match key.code {
-            KeyCode::Enter => {
-                if self.focus == FIELDS.len() - 1 && self.valid() {
-                    return Some(SetupAction::Submit);
+        match self.form.on_key(key) {
+            FormEvent::Save => {
+                if let Some(reason) = self.invalid_reason() {
+                    self.error = Some(reason);
+                    None
+                } else {
+                    Some(SetupAction::Submit)
                 }
-                self.set_focus((self.focus + 1) % FIELDS.len());
             }
-            KeyCode::Tab | KeyCode::Down => {
-                self.set_focus((self.focus + 1) % FIELDS.len());
+            // Editing a field clears a stale validation error.
+            FormEvent::Changed(_) => {
+                self.error = None;
+                None
             }
-            KeyCode::BackTab | KeyCode::Up => {
-                self.set_focus((self.focus + FIELDS.len() - 1) % FIELDS.len());
-            }
-            _ => {
-                self.focused_input().on_key(key);
-            }
+            // Esc has nowhere to go on the entry screen; ignore it (matching
+            // the pre-widget behaviour).
+            FormEvent::Cancel | FormEvent::Consumed => None,
         }
-        None
     }
 
     pub fn draw(&self, frame: &mut Frame, area: Rect) {
@@ -113,55 +115,35 @@ impl SetupForm {
         let [content] = Layout::horizontal([Constraint::Length(width)])
             .flex(Flex::Center)
             .areas(area);
-        let rows = Layout::vertical([
-            Constraint::Length(1), // title
-            Constraint::Length(1),
-            Constraint::Length(1), // host
-            Constraint::Length(1), // host error / plain-http nudge
-            Constraint::Length(1), // api key
-            Constraint::Length(1),
-            Constraint::Length(1), // status/error
-        ])
-        .flex(Flex::Center)
-        .split(content);
+        // The form (title + 2 fields + Connect) plus a status/nudge row below,
+        // centred vertically like the pre-widget card.
+        let [form_area, status_area] =
+            Layout::vertical([Constraint::Length(6), Constraint::Length(2)])
+                .flex(Flex::Center)
+                .areas(content);
 
-        let buf = frame.buffer_mut();
-        Line::from(Span::styled(
-            " isamedia · radarr ",
-            Style::new()
-                .bg(theme::accent_color())
-                .fg(theme::on_accent()),
-        ))
-        .render(rows[0], buf);
+        self.form.draw(frame, form_area, "isamedia · radarr");
 
-        let label = |text: &'static str| Span::styled(format!(" {text:<9}"), theme::selected());
-
-        let field_area = |row: Rect| {
-            let [label_area, input_area] =
-                Layout::horizontal([Constraint::Length(11), Constraint::Fill(1)]).areas(row);
-            (label_area, input_area)
-        };
-
-        let (label_area, input_area) = field_area(rows[2]);
-        label("Host").render(label_area, buf);
-        self.host.render(input_area, buf);
-        if let Some(err) = self.host_error() {
-            Line::styled(format!(" {err}"), theme::dim()).render(rows[3], buf);
+        if status_area.height == 0 {
+            return;
+        }
+        let row = Rect::new(
+            status_area.x,
+            status_area.y + status_area.height - 1,
+            status_area.width,
+            1,
+        );
+        let line = if self.busy {
+            Line::styled(" connecting...", theme::dim())
+        } else if let Some(err) = &self.error {
+            Line::styled(format!(" {err}"), theme::error())
+        } else if let Some(err) = self.host_error() {
+            Line::styled(format!(" {err}"), theme::dim())
         } else if self.plain_http() {
             Line::styled(" http:// is unencrypted; prefer https://", theme::dim())
-                .render(rows[3], buf);
-        }
-
-        let (label_area, input_area) = field_area(rows[4]);
-        label("API key").render(label_area, buf);
-        self.api_key.render(input_area, buf);
-
-        if self.busy {
-            Line::styled(" connecting...", theme::dim()).render(rows[6], buf);
-        } else if let Some(err) = &self.error {
-            Line::styled(format!(" {err}"), theme::error()).render(rows[6], buf);
         } else {
-            Line::styled(" enter: next/submit  tab: next field", theme::dim()).render(rows[6], buf);
-        }
+            Line::styled(" enter: connect   tab: next field", theme::dim())
+        };
+        line.render(row, frame.buffer_mut());
     }
 }

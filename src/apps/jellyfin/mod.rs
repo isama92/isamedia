@@ -4,6 +4,7 @@ mod msg;
 
 use std::any::Any;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use ratatui::Frame;
@@ -63,10 +64,21 @@ pub struct JellyfinApp {
     /// generations stay monotonic across re-logins (a fetch in flight from a
     /// pre-relogin Browse can never match a new instance's generation).
     browse_gen: Arc<std::sync::atomic::AtomicU64>,
+    /// Bumped by the Settings tab when it re-authenticates Jellyfin. Compared
+    /// against `seen_reauth` on activate so a live session reconnects with the
+    /// freshly stored token instead of being forced back to the login form.
+    reauth: Arc<std::sync::atomic::AtomicU64>,
+    seen_reauth: u64,
 }
 
 impl JellyfinApp {
-    pub fn new(config: Arc<Mutex<Config>>, config_path: PathBuf, sender: AppSender) -> Self {
+    pub fn new(
+        config: Arc<Mutex<Config>>,
+        config_path: PathBuf,
+        sender: AppSender,
+        reauth: Arc<std::sync::atomic::AtomicU64>,
+    ) -> Self {
+        let seen_reauth = reauth.load(Ordering::Relaxed);
         Self {
             config,
             config_path,
@@ -77,6 +89,8 @@ impl JellyfinApp {
             player_gen: 0,
             pending_play: None,
             browse_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            reauth,
+            seen_reauth,
         }
     }
 
@@ -250,11 +264,7 @@ impl JellyfinApp {
         match result {
             Ok(client) => {
                 let from_form = match &self.screen {
-                    Screen::Login(form) => Some((
-                        form.host.value().to_string(),
-                        form.username.value().to_string(),
-                        form.password.value().to_string(),
-                    )),
+                    Screen::Login(form) => Some((form.host(), form.username(), form.password())),
                     _ => None,
                 };
                 self.persist_auth(
@@ -304,6 +314,22 @@ impl MediaApp for JellyfinApp {
                 self.spawn_connect(creds, true);
             } else {
                 self.screen = Screen::Login(self.login_form());
+            }
+            return;
+        }
+
+        // The Settings tab re-authenticated Jellyfin while we were away, so the
+        // token this session holds is now stale. Reconnect with the freshly
+        // stored one so the user isn't sent back to the login form (and asked
+        // for the password a second time). Only a live Browse is rescued here;
+        // other screens are left to their own auth path.
+        let reauth = self.reauth.load(Ordering::Relaxed);
+        if reauth != self.seen_reauth {
+            self.seen_reauth = reauth;
+            if matches!(self.screen, Screen::Browse(_)) {
+                self.screen = Screen::Connecting;
+                let creds = self.credentials();
+                self.spawn_connect(creds, true);
             }
         }
     }
@@ -358,11 +384,8 @@ impl MediaApp for JellyfinApp {
                 if let Some(LoginAction::Submit) = form.on_key(key) {
                     form.busy = true;
                     form.error = None;
-                    let (host, username, password) = (
-                        form.host.value().to_string(),
-                        form.username.value().to_string(),
-                        form.password.value().to_string(),
-                    );
+                    let (host, username, password) =
+                        (form.host(), form.username(), form.password());
                     let mut creds = self.credentials();
                     creds.host = host;
                     creds.username = username;
@@ -496,5 +519,45 @@ impl MediaApp for JellyfinApp {
         if self.pending_play.is_some() {
             prompt::draw_confirm(frame, area, "Replace current playback?");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A live Browse can't be built without a connected Client (the app layer
+    // deliberately keeps Client out of tests, see browse.rs), so the consumer
+    // side of the reauth signal is covered where it can be offline: the signal
+    // is consumed exactly once and never disturbs a non-Browse screen. The
+    // Browse -> Connecting rescue itself is exercised manually.
+    #[test]
+    fn reauth_signal_is_consumed_without_disturbing_non_browse() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let reauth = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut jf = JellyfinApp::new(
+            Arc::new(Mutex::new(Config::default())),
+            PathBuf::from("jellyfin-test-config.toml"),
+            AppSender::new("jellyfin", tx),
+            reauth.clone(),
+        );
+        // Sit on the login screen, as after a prior session-expiry.
+        let form = jf.login_form();
+        jf.screen = Screen::Login(form);
+
+        // Settings re-authenticated while we were away; returning to the tab
+        // must consume the signal but leave the login form in place.
+        reauth.fetch_add(1, Ordering::Relaxed);
+        jf.activate();
+        assert!(
+            matches!(jf.screen, Screen::Login(_)),
+            "a non-Browse screen must be left alone"
+        );
+        assert_eq!(jf.seen_reauth, 1, "the signal must be consumed once");
+
+        // Idempotent: with no new signal, activate is a no-op.
+        jf.activate();
+        assert!(matches!(jf.screen, Screen::Login(_)));
+        assert_eq!(jf.seen_reauth, 1);
     }
 }

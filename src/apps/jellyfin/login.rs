@@ -1,33 +1,32 @@
+//! First-run / re-auth form: host, username and password. A thin facade over
+//! the shared [`Form`] widget (a single Connect button, no Cancel — there is
+//! nowhere to cancel back to on the entry screen).
+
 use ratatui::Frame;
-use ratatui::crossterm::event::{KeyCode, KeyEvent};
+use ratatui::crossterm::event::KeyEvent;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
-use ratatui::style::Style;
-use ratatui::text::{Line, Span};
+use ratatui::text::Line;
 use ratatui::widgets::Widget;
 
 use crate::config::JellyfinConfig;
 use crate::jellyfin::url::normalize_host;
-use crate::ui::input::TextInput;
+use crate::ui::form::{Field, Form, FormEvent};
 use crate::ui::theme;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Field {
-    Host,
-    Username,
-    Password,
+/// Stable field ids; values are read by id.
+mod field {
+    use crate::ui::form::FieldId;
+    pub const HOST: FieldId = 0;
+    pub const USERNAME: FieldId = 1;
+    pub const PASSWORD: FieldId = 2;
 }
-
-const FIELDS: [Field; 3] = [Field::Host, Field::Username, Field::Password];
 
 pub enum LoginAction {
     Submit,
 }
 
 pub struct LoginForm {
-    pub host: TextInput,
-    pub username: TextInput,
-    pub password: TextInput,
-    focus: usize,
+    form: Form,
     pub error: Option<String>,
     /// Set while an auth attempt is in flight; input is ignored except esc.
     pub busy: bool,
@@ -35,80 +34,85 @@ pub struct LoginForm {
 
 impl LoginForm {
     pub fn from_config(config: &JellyfinConfig) -> Self {
-        let mut form = Self {
-            host: TextInput::with_value(&config.host),
-            username: TextInput::with_value(&config.username),
-            // Never prefilled: the stored password lives in the OS keyring
-            // and is only read by the auto-login task.
-            password: TextInput::default(),
-            focus: 0,
+        let fields = vec![
+            Field::text(field::HOST, "Host", config.host.clone()),
+            Field::text(field::USERNAME, "Username", config.username.clone()),
+            // Never prefilled: the stored password lives in the OS keyring and
+            // is only read by the auto-login task.
+            Field::text(field::PASSWORD, "Password", "").masked(),
+        ];
+        Self {
+            // A single Connect button: an entry screen has nowhere to cancel to.
+            form: Form::new(fields, "Connect").without_cancel(),
             error: None,
             busy: false,
-        };
-        form.password.masked = true;
-        form.host.focused = true;
-        form
+        }
+    }
+
+    pub fn host(&self) -> String {
+        self.form.text(field::HOST)
+    }
+
+    pub fn username(&self) -> String {
+        self.form.text(field::USERNAME)
+    }
+
+    pub fn password(&self) -> String {
+        self.form.text(field::PASSWORD)
     }
 
     fn host_error(&self) -> Option<String> {
-        if self.host.value().is_empty() {
+        let host = self.host();
+        if host.is_empty() {
             return None;
         }
-        normalize_host(self.host.value())
-            .err()
-            .map(|e| e.to_string())
+        normalize_host(&host).err().map(|e| e.to_string())
     }
 
     /// Plain http means the password and token cross the network unencrypted.
     /// Legitimate on a trusted LAN, but worth a visible nudge.
     fn plain_http(&self) -> bool {
-        crate::jellyfin::url::is_plain_http(self.host.value())
+        crate::jellyfin::url::is_plain_http(&self.host())
     }
 
-    fn valid(&self) -> bool {
-        !self.host.value().is_empty()
-            && self.host_error().is_none()
-            && !self.username.value().is_empty()
-    }
-
-    fn focused_input(&mut self) -> &mut TextInput {
-        match FIELDS[self.focus] {
-            Field::Host => &mut self.host,
-            Field::Username => &mut self.username,
-            Field::Password => &mut self.password,
+    /// Why the form can't be submitted yet, or `None` when it's ready. The
+    /// password may be left blank — an empty one means "don't keep a stored
+    /// password" (see `mod.rs`), so only host and username are required.
+    fn invalid_reason(&self) -> Option<String> {
+        if self.host().is_empty() {
+            return Some("enter the host".into());
         }
-    }
-
-    fn set_focus(&mut self, focus: usize) {
-        self.focus = focus;
-        self.host.focused = false;
-        self.username.focused = false;
-        self.password.focused = false;
-        self.focused_input().focused = true;
+        if let Some(err) = self.host_error() {
+            return Some(err);
+        }
+        if self.username().is_empty() {
+            return Some("enter the username".into());
+        }
+        None
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> Option<LoginAction> {
         if self.busy {
             return None;
         }
-        match key.code {
-            KeyCode::Enter => {
-                if self.focus == FIELDS.len() - 1 && self.valid() {
-                    return Some(LoginAction::Submit);
+        match self.form.on_key(key) {
+            FormEvent::Save => {
+                if let Some(reason) = self.invalid_reason() {
+                    self.error = Some(reason);
+                    None
+                } else {
+                    Some(LoginAction::Submit)
                 }
-                self.set_focus((self.focus + 1) % FIELDS.len());
             }
-            KeyCode::Tab | KeyCode::Down => {
-                self.set_focus((self.focus + 1) % FIELDS.len());
+            // Editing a field clears a stale validation error.
+            FormEvent::Changed(_) => {
+                self.error = None;
+                None
             }
-            KeyCode::BackTab | KeyCode::Up => {
-                self.set_focus((self.focus + FIELDS.len() - 1) % FIELDS.len());
-            }
-            _ => {
-                self.focused_input().on_key(key);
-            }
+            // Esc has nowhere to go on the entry screen; ignore it (matching
+            // the pre-widget behaviour).
+            FormEvent::Cancel | FormEvent::Consumed => None,
         }
-        None
     }
 
     pub fn draw(&self, frame: &mut Frame, area: Rect) {
@@ -116,62 +120,36 @@ impl LoginForm {
         let [content] = Layout::horizontal([Constraint::Length(width)])
             .flex(Flex::Center)
             .areas(area);
-        let rows = Layout::vertical([
-            Constraint::Length(1), // title
-            Constraint::Length(1),
-            Constraint::Length(1), // host
-            Constraint::Length(1), // host error
-            Constraint::Length(1), // username
-            Constraint::Length(1),
-            Constraint::Length(1), // password
-            Constraint::Length(1),
-            Constraint::Length(1), // status/error
-        ])
-        .flex(Flex::Center)
-        .split(content);
+        // The form (title + 3 fields + Connect) plus a status/nudge row below,
+        // centred vertically like the pre-widget card.
+        let [form_area, status_area] =
+            Layout::vertical([Constraint::Length(7), Constraint::Length(2)])
+                .flex(Flex::Center)
+                .areas(content);
 
-        let buf = frame.buffer_mut();
-        Line::from(Span::styled(
-            " isamedia ",
-            Style::new()
-                .bg(theme::accent_color())
-                .fg(theme::on_accent()),
-        ))
-        .render(rows[0], buf);
+        self.form.draw(frame, form_area, "isamedia");
 
-        let label = |text: &'static str| Span::styled(format!(" {text:<9}"), theme::selected());
-
-        let field_area = |row: Rect| {
-            let [label_area, input_area] =
-                Layout::horizontal([Constraint::Length(11), Constraint::Fill(1)]).areas(row);
-            (label_area, input_area)
-        };
-
-        let (label_area, input_area) = field_area(rows[2]);
-        label("Host").render(label_area, buf);
-        self.host.render(input_area, buf);
-        if let Some(err) = self.host_error() {
-            Line::styled(format!(" {err}"), theme::dim()).render(rows[3], buf);
+        if status_area.height == 0 {
+            return;
+        }
+        let row = Rect::new(
+            status_area.x,
+            status_area.y + status_area.height - 1,
+            status_area.width,
+            1,
+        );
+        let line = if self.busy {
+            Line::styled(" authenticating...", theme::dim())
+        } else if let Some(err) = &self.error {
+            Line::styled(format!(" {err}"), theme::error())
+        } else if let Some(err) = self.host_error() {
+            Line::styled(format!(" {err}"), theme::dim())
         } else if self.plain_http() {
             // Short enough to fit the half-width form box on 80 columns.
             Line::styled(" http:// is unencrypted; prefer https://", theme::dim())
-                .render(rows[3], buf);
-        }
-
-        let (label_area, input_area) = field_area(rows[4]);
-        label("Username").render(label_area, buf);
-        self.username.render(input_area, buf);
-
-        let (label_area, input_area) = field_area(rows[6]);
-        label("Password").render(label_area, buf);
-        self.password.render(input_area, buf);
-
-        if self.busy {
-            Line::styled(" authenticating...", theme::dim()).render(rows[8], buf);
-        } else if let Some(err) = &self.error {
-            Line::styled(format!(" {err}"), theme::error()).render(rows[8], buf);
         } else {
-            Line::styled(" enter: next/submit  tab: next field", theme::dim()).render(rows[8], buf);
-        }
+            Line::styled(" enter: connect   tab: next field", theme::dim())
+        };
+        line.render(row, frame.buffer_mut());
     }
 }
