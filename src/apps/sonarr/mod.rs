@@ -131,7 +131,7 @@ impl SonarrApp {
         match result {
             Ok(client) => {
                 let form_key = match &self.screen {
-                    Screen::Setup(form) => Some(form.api_key.value().to_string()),
+                    Screen::Setup(form) => Some(form.api_key()),
                     _ => None,
                 };
                 self.persist_auth(&client, form_key);
@@ -203,8 +203,8 @@ impl MediaApp for SonarrApp {
                 if let Some(SetupAction::Submit) = form.on_key(key) {
                     form.busy = true;
                     form.error = None;
-                    let host = form.host.value().to_string();
-                    let api_key = form.api_key.value().to_string();
+                    let host = form.host();
+                    let api_key = form.api_key();
                     self.spawn_connect(host, Some(api_key));
                 }
                 None

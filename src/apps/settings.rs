@@ -1,5 +1,6 @@
 use std::any::Any;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ratatui::Frame;
@@ -13,8 +14,17 @@ use ratatui::widgets::Widget;
 use crate::app::{AppId, MediaApp, ShellRequest};
 use crate::config::Config;
 use crate::event::AppSender;
-use crate::ui::input::TextInput;
+use crate::ui::form::{Field, Form, FormEvent};
 use crate::ui::theme::{self, Theme};
+
+/// Stable field ids for the backend credentials form; values are read by id so
+/// the absent Username row (Radarr/Sonarr) never shifts what the others read.
+mod field {
+    use crate::ui::form::FieldId;
+    pub const HOST: FieldId = 0;
+    pub const USERNAME: FieldId = 1;
+    pub const SECRET: FieldId = 2;
+}
 
 /// Which setting a row edits. Theme/Accent open a choice list; the backend
 /// rows open a URL + credentials form.
@@ -40,7 +50,7 @@ struct Editing {
 enum Editor {
     None,
     Choice(Editing),
-    Backend(BackendForm),
+    Backend(BackendEditor),
 }
 
 /// Result of a submitted backend form, reported back from the connect task.
@@ -67,10 +77,18 @@ pub struct SettingsApp {
     /// lands after the user moved on is dropped (the generation-counter
     /// convention every async path in this app follows).
     save_gen: u64,
+    /// Bumped after a successful Jellyfin save so the running Jellyfin tab
+    /// reconnects with the freshly stored token (see `apps::build_apps`).
+    jellyfin_reauth: Arc<AtomicU64>,
 }
 
 impl SettingsApp {
-    pub fn new(config: Arc<Mutex<Config>>, config_path: PathBuf, sender: AppSender) -> Self {
+    pub fn new(
+        config: Arc<Mutex<Config>>,
+        config_path: PathBuf,
+        sender: AppSender,
+        jellyfin_reauth: Arc<AtomicU64>,
+    ) -> Self {
         Self {
             config,
             config_path,
@@ -78,6 +96,7 @@ impl SettingsApp {
             cursor: 0,
             editor: Editor::None,
             save_gen: 0,
+            jellyfin_reauth,
         }
     }
 
@@ -110,8 +129,8 @@ impl SettingsApp {
                 });
             }
             Setting::Jellyfin | Setting::Radarr | Setting::Sonarr => {
-                let form = BackendForm::from_config(setting, &self.config.lock().unwrap());
-                self.editor = Editor::Backend(form);
+                let editor = BackendEditor::from_config(setting, &self.config.lock().unwrap());
+                self.editor = Editor::Backend(editor);
             }
         }
     }
@@ -178,11 +197,12 @@ impl SettingsApp {
     /// (connect, config write, keyring write) runs off the render thread and
     /// reports back one `Msg::SaveDone`.
     fn submit_backend(&mut self) {
-        let Editor::Backend(form) = &mut self.editor else {
+        let Editor::Backend(editor) = &mut self.editor else {
             return;
         };
-        form.busy = true;
-        form.error = None;
+        editor.busy = true;
+        editor.error = None;
+        let backend = editor.backend;
 
         // The Jellyfin auth header needs the device identity; snapshot it here
         // so the task never locks the config just to read it.
@@ -194,10 +214,11 @@ impl SettingsApp {
             )
         };
         let request = SaveRequest {
-            backend: form.backend,
-            host: form.host.value().to_string(),
-            username: form.username.as_ref().map(|u| u.value().to_string()),
-            typed_secret: form.secret.value().to_string(),
+            backend,
+            host: editor.form.text(field::HOST),
+            // Username only exists (and is read) for Jellyfin.
+            username: (backend == Setting::Jellyfin).then(|| editor.form.text(field::USERNAME)),
+            typed_secret: editor.form.text(field::SECRET),
             device,
             device_id,
         };
@@ -298,24 +319,12 @@ async fn validate_and_persist(
         device,
         device_id,
     } = request;
-    // Fall back to the stored secret when the field was left blank, so the user
-    // can change only the host without re-typing a credential.
-    let secret = if !typed_secret.is_empty() {
-        typed_secret.clone()
-    } else {
-        let key = secret_key(backend);
-        tokio::task::spawn_blocking(move || crate::secrets::get(key))
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_default()
-    };
-    if secret.is_empty() {
-        return Err(match backend {
-            Setting::Jellyfin => "enter the password".into(),
-            _ => "enter the API key".into(),
-        });
-    }
+    // The typed credential is authoritative: it is never backfilled from the
+    // keyring. A blank field is sent as-is, so the server rejects it with an
+    // auth error instead of the save silently re-authenticating with the stored
+    // secret (which for Jellyfin would mint a new session token and boot the
+    // live tab).
+    let secret = typed_secret;
 
     match backend {
         Setting::Jellyfin => {
@@ -343,10 +352,11 @@ async fn validate_and_persist(
                 config.jellyfin.user_id = client.user_id.clone();
                 config.save(&config_path).map_err(|err| err.to_string())?;
             }
-            // Store the fresh token (so the next launch reuses the session) and
-            // the password only when the user typed a new one.
+            // Store the fresh token (so the next launch reuses the session), and
+            // the password unless it was left blank (a passwordless account
+            // re-auths on the token alone).
             let token = client.token.clone();
-            let store_password = !typed_secret.is_empty();
+            let store_password = !secret.is_empty();
             tokio::task::spawn_blocking(move || -> Result<(), String> {
                 crate::secrets::set(crate::secrets::JELLYFIN_TOKEN, &token)
                     .map_err(|err| err.to_string())?;
@@ -382,7 +392,7 @@ async fn validate_and_persist(
                 }
                 config.save(&config_path).map_err(|err| err.to_string())?;
             }
-            if !typed_secret.is_empty() {
+            if !secret.is_empty() {
                 let key = secret_key(backend);
                 tokio::task::spawn_blocking(move || crate::secrets::set(key, &secret))
                     .await
@@ -521,77 +531,63 @@ fn current_choice_index(setting: Setting) -> usize {
     }
 }
 
-/// Draw a `label + input` row, guarded so it never overruns a short area.
-fn draw_field(area: Rect, y: u16, label: &str, input: &TextInput, buf: &mut Buffer) {
-    if y >= area.y + area.height {
-        return;
+/// The credential's label: the password for Jellyfin, the API key for the *arr.
+fn secret_label(backend: Setting) -> &'static str {
+    match backend {
+        Setting::Jellyfin => "Password",
+        _ => "API key",
     }
-    let row = Rect::new(area.x, y, area.width, 1);
-    let [label_area, input_area] =
-        Layout::horizontal([Constraint::Length(11), Constraint::Fill(1)]).areas(row);
-    Line::from(Span::styled(format!(" {label:<9}"), theme::selected())).render(label_area, buf);
-    input.render(input_area, buf);
 }
 
-/// Which action a submitted backend form is asking for.
-enum FormAction {
-    Submit,
-}
-
-/// A URL + credentials form for one backend, opened from its settings row.
-/// Modelled on the per-app setup forms, but rendered inline in the Settings
-/// body and validated against the server on save. The username row is present
-/// only for Jellyfin.
-struct BackendForm {
+/// The open backend credentials form: the shared [`Form`] widget plus the async
+/// state the widget is deliberately ignorant of (a connect is in flight; the
+/// last connect failed). Modelled on `radarr::browse`'s active-form wrapper.
+struct BackendEditor {
     backend: Setting,
-    host: TextInput,
-    username: Option<TextInput>,
-    /// Masked: the Jellyfin password or the *arr API key.
-    secret: TextInput,
-    focus: usize,
+    form: Form,
     error: Option<String>,
-    /// Set while a connect attempt is in flight; typing is ignored.
+    /// Set while a connect attempt is in flight; keys other than Esc are ignored.
     busy: bool,
 }
 
-impl BackendForm {
-    fn from_config(backend: Setting, config: &Config) -> BackendForm {
+impl BackendEditor {
+    fn from_config(backend: Setting, config: &Config) -> BackendEditor {
         let (host, username) = match backend {
             Setting::Jellyfin => (
                 config.jellyfin.host.clone(),
-                Some(TextInput::with_value(&config.jellyfin.username)),
+                Some(config.jellyfin.username.clone()),
             ),
             Setting::Radarr => (config.radarr.host.clone(), None),
             Setting::Sonarr => (config.sonarr.host.clone(), None),
             Setting::Theme | Setting::Accent => (String::new(), None),
         };
-        let mut secret = TextInput::default();
-        // Never prefilled: the stored secret lives in the OS keyring and is
-        // only read by the connect task when the field is left blank.
-        secret.masked = true;
-        let mut form = BackendForm {
+        let mut fields = vec![Field::text(field::HOST, "Host", host)];
+        if let Some(username) = username {
+            fields.push(Field::text(field::USERNAME, "Username", username));
+        }
+        // Never prefilled, never backfilled: the typed value is used as-is on
+        // every save, so leaving it blank fails auth rather than reusing the
+        // stored secret (a bare re-save would otherwise re-authenticate and, for
+        // Jellyfin, invalidate the live session token).
+        fields.push(Field::text(field::SECRET, secret_label(backend), "").masked());
+        BackendEditor {
             backend,
-            host: TextInput::with_value(&host),
-            username,
-            secret,
-            focus: 0,
+            form: Form::new(fields, "Save"),
             error: None,
             busy: false,
-        };
-        form.host.focused = true;
-        form
+        }
     }
 
-    /// The number of focusable fields: 3 for Jellyfin (with username), else 2.
-    fn fields(&self) -> usize {
-        if self.username.is_some() { 3 } else { 2 }
+    fn host_value(&self) -> String {
+        self.form.text(field::HOST)
     }
 
     fn host_error(&self) -> Option<String> {
-        if self.host.value().is_empty() {
+        let host = self.host_value();
+        if host.is_empty() {
             return None;
         }
-        crate::net::normalize_host(self.host.value())
+        crate::net::normalize_host(&host)
             .err()
             .map(|err| err.to_string())
     }
@@ -599,117 +595,57 @@ impl BackendForm {
     /// Plain http means the credential crosses the network unencrypted.
     /// Legitimate on a trusted LAN, but worth a visible nudge.
     fn plain_http(&self) -> bool {
-        crate::net::is_plain_http(self.host.value())
+        crate::net::is_plain_http(&self.host_value())
     }
 
-    /// The secret may be left blank (reuse the stored one), so only the host
-    /// and, for Jellyfin, the username are required.
-    fn valid(&self) -> bool {
-        !self.host.value().is_empty()
-            && self.host_error().is_none()
-            && self
-                .username
-                .as_ref()
-                .map(|u| !u.value().is_empty())
-                .unwrap_or(true)
-    }
-
-    fn secret_label(&self) -> &'static str {
-        match self.backend {
-            Setting::Jellyfin => "Password",
-            _ => "API key",
+    /// Why the form can't be submitted yet, or `None` when it's ready. The
+    /// secret may be left blank (reuse the stored one), so only the host and,
+    /// for Jellyfin, the username are required.
+    fn invalid_reason(&self) -> Option<String> {
+        if self.host_value().is_empty() {
+            return Some("enter the host".into());
         }
-    }
-
-    fn focused_input(&mut self) -> &mut TextInput {
-        if self.focus == 0 {
-            &mut self.host
-        } else if self.focus == 1 && self.username.is_some() {
-            self.username.as_mut().expect("username present at focus 1")
-        } else {
-            &mut self.secret
+        if let Some(err) = self.host_error() {
+            return Some(err);
         }
-    }
-
-    fn set_focus(&mut self, focus: usize) {
-        self.focus = focus;
-        self.host.focused = false;
-        if let Some(username) = self.username.as_mut() {
-            username.focused = false;
-        }
-        self.secret.focused = false;
-        self.focused_input().focused = true;
-    }
-
-    fn on_key(&mut self, key: KeyEvent) -> Option<FormAction> {
-        if self.busy {
-            return None;
-        }
-        let fields = self.fields();
-        match key.code {
-            KeyCode::Enter => {
-                if self.focus == fields - 1 && self.valid() {
-                    return Some(FormAction::Submit);
-                }
-                self.set_focus((self.focus + 1) % fields);
-            }
-            KeyCode::Tab | KeyCode::Down => {
-                self.set_focus((self.focus + 1) % fields);
-            }
-            KeyCode::BackTab | KeyCode::Up => {
-                self.set_focus((self.focus + fields - 1) % fields);
-            }
-            _ => {
-                self.focused_input().on_key(key);
-            }
+        if self.backend == Setting::Jellyfin && self.form.text(field::USERNAME).is_empty() {
+            return Some("enter the username".into());
         }
         None
     }
 
-    fn draw(&self, area: Rect, buf: &mut Buffer) {
-        let bottom = area.y + area.height;
-        let title = backend_label(self.backend);
+    /// Draw the form full-body, then a status line below it. This folds the old
+    /// inter-field host nudge into a prioritised line under the buttons, since
+    /// the `Form` now owns the contiguous field rows.
+    fn draw(&self, frame: &mut Frame, area: Rect) {
+        // Split first (no buffer borrow), draw the form (needs &mut Frame), THEN
+        // take the buffer for the status line — the two frame borrows never overlap.
+        let [form_area, status_area] =
+            Layout::vertical([Constraint::Fill(1), Constraint::Length(2)]).areas(area);
+        self.form
+            .draw(frame, form_area, backend_label(self.backend));
 
-        // Header.
-        if area.y < bottom {
-            Line::styled(format!("  {title}"), theme::selected())
-                .render(Rect::new(area.x, area.y, area.width, 1), buf);
+        if status_area.height == 0 {
+            return;
         }
-
-        // Host, then its validation nudge one row below.
-        let host_y = area.y + 2;
-        draw_field(area, host_y, "Host", &self.host, buf);
-        let nudge_y = host_y + 1;
-        if nudge_y < bottom {
-            if let Some(err) = self.host_error() {
-                Line::styled(format!(" {err}"), theme::dim())
-                    .render(Rect::new(area.x, nudge_y, area.width, 1), buf);
-            } else if self.plain_http() {
-                Line::styled(" http:// is unencrypted; prefer https://", theme::dim())
-                    .render(Rect::new(area.x, nudge_y, area.width, 1), buf);
-            }
-        }
-
-        // Username (Jellyfin only), then the masked secret.
-        let mut y = nudge_y + 1;
-        if let Some(username) = &self.username {
-            draw_field(area, y, "Username", username, buf);
-            y += 1;
-        }
-        draw_field(area, y, self.secret_label(), &self.secret, buf);
-
-        // Status line, one blank row below the last field.
-        let status_y = y + 2;
-        if status_y < bottom {
-            let line = if self.busy {
-                Line::styled(" connecting...", theme::dim())
-            } else if let Some(err) = &self.error {
-                Line::styled(format!(" {err}"), theme::error())
-            } else {
-                Line::styled(" enter: save   esc: back", theme::dim())
-            };
-            line.render(Rect::new(area.x, status_y, area.width, 1), buf);
-        }
+        let row = Rect::new(
+            status_area.x,
+            status_area.y + status_area.height - 1,
+            status_area.width,
+            1,
+        );
+        let line = if self.busy {
+            Line::styled("  connecting...", theme::dim())
+        } else if let Some(err) = &self.error {
+            Line::styled(format!("  {err}"), theme::error())
+        } else if let Some(err) = self.host_error() {
+            Line::styled(format!("  {err}"), theme::dim())
+        } else if self.plain_http() {
+            Line::styled("  http:// is unencrypted; prefer https://", theme::dim())
+        } else {
+            Line::styled("  enter: save   esc: back", theme::dim())
+        };
+        line.render(row, frame.buffer_mut());
     }
 }
 
@@ -731,15 +667,34 @@ impl MediaApp for SettingsApp {
 
         // Backend credentials form: decide the outcome while the form is
         // borrowed, then act once the borrow has ended.
-        if let Editor::Backend(form) = &mut self.editor {
-            let outcome = if key.code == KeyCode::Esc {
-                // Esc cancels even mid-connect; the in-flight result is dropped
-                // by the save_gen guard in on_event.
-                BackendOutcome::Cancel
-            } else if let Some(FormAction::Submit) = form.on_key(key) {
-                BackendOutcome::Submit
-            } else {
-                BackendOutcome::Ignore
+        if let Editor::Backend(editor) = &mut self.editor {
+            // Mid-connect: only Esc cancels (the in-flight result is dropped by
+            // the save_gen guard in on_event); every other key is ignored.
+            if editor.busy {
+                if key.code == KeyCode::Esc {
+                    self.save_gen += 1;
+                    self.editor = Editor::None;
+                }
+                return None;
+            }
+            let outcome = match editor.form.on_key(key) {
+                // Save gates on validity: an invalid form stays open with the
+                // reason shown, rather than firing a doomed connect.
+                FormEvent::Save => match editor.invalid_reason() {
+                    Some(reason) => {
+                        editor.error = Some(reason);
+                        BackendOutcome::Ignore
+                    }
+                    None => BackendOutcome::Submit,
+                },
+                // Esc or the Cancel button.
+                FormEvent::Cancel => BackendOutcome::Cancel,
+                // Editing a field clears a stale validation/connect error.
+                FormEvent::Changed(_) => {
+                    editor.error = None;
+                    BackendOutcome::Ignore
+                }
+                FormEvent::Consumed => BackendOutcome::Ignore,
             };
             match outcome {
                 BackendOutcome::Cancel => {
@@ -781,20 +736,27 @@ impl MediaApp for SettingsApp {
         }
         match result {
             Ok(()) => {
+                // A Jellyfin save minted a fresh token in the keyring; signal
+                // the running Jellyfin tab to adopt it instead of dropping to a
+                // re-login. (*arr keys are stateless, so they need no signal.)
+                if let Editor::Backend(editor) = &self.editor
+                    && editor.backend == Setting::Jellyfin
+                {
+                    self.jellyfin_reauth.fetch_add(1, Ordering::Relaxed);
+                }
                 self.editor = Editor::None;
                 self.clamp_cursor();
             }
             Err(message) => {
-                if let Editor::Backend(form) = &mut self.editor {
-                    form.busy = false;
-                    form.error = Some(message);
+                if let Editor::Backend(editor) = &mut self.editor {
+                    editor.busy = false;
+                    editor.error = Some(message);
                 }
             }
         }
     }
 
     fn draw(&mut self, frame: &mut Frame, area: Rect) {
-        let buf = frame.buffer_mut();
         let [_, title_row, _, body] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Length(1),
@@ -802,11 +764,13 @@ impl MediaApp for SettingsApp {
             Constraint::Fill(1),
         ])
         .areas(area);
-        Line::styled("  Settings", theme::selected()).render(title_row, buf);
+        Line::styled("  Settings", theme::selected()).render(title_row, frame.buffer_mut());
+        // A fresh statement-scoped buffer borrow per arm, so the Backend arm can
+        // hand the whole frame to the `Form`-based editor (it needs &mut Frame).
         match &self.editor {
-            Editor::None => self.draw_list(body, buf),
-            Editor::Choice(editing) => draw_editor(editing, body, buf),
-            Editor::Backend(form) => form.draw(body, buf),
+            Editor::None => self.draw_list(body, frame.buffer_mut()),
+            Editor::Choice(editing) => draw_editor(editing, body, frame.buffer_mut()),
+            Editor::Backend(editor) => editor.draw(frame, body),
         }
     }
 }
@@ -822,6 +786,7 @@ mod tests {
             Arc::new(Mutex::new(Config::default())),
             PathBuf::from("settings-test-config.toml"),
             AppSender::new("settings", tx),
+            Arc::new(AtomicU64::new(0)),
         )
     }
 
@@ -854,7 +819,7 @@ mod tests {
             // The backend credentials forms (host summary uses a placeholder).
             for backend in [Setting::Jellyfin, Setting::Radarr, Setting::Sonarr] {
                 settings.editor =
-                    Editor::Backend(BackendForm::from_config(backend, &Config::default()));
+                    Editor::Backend(BackendEditor::from_config(backend, &Config::default()));
                 terminal.draw(|f| settings.draw(f, f.area())).unwrap();
             }
             settings.editor = Editor::None;
@@ -883,10 +848,18 @@ mod tests {
             Arc::new(Mutex::new(config)),
             PathBuf::from("settings-test-config.toml"),
             AppSender::new("settings", tx),
+            Arc::new(AtomicU64::new(0)),
         );
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
         terminal.draw(|f| settings.draw(f, f.area())).unwrap();
         assert!(screen(&terminal).contains("https://radarr.example"));
+    }
+
+    /// Render the current settings screen (with whatever editor is open) to text.
+    fn draw_to_text(settings: &mut SettingsApp) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|f| settings.draw(f, f.area())).unwrap();
+        screen(&terminal)
     }
 
     #[test]
@@ -895,18 +868,98 @@ mod tests {
         settings.open(Setting::Jellyfin);
         assert!(matches!(settings.editor, Editor::Backend(_)));
 
-        // The Jellyfin form has the username row; the *arr forms do not.
-        if let Editor::Backend(form) = &settings.editor {
-            assert_eq!(form.fields(), 3);
-            assert!(form.secret.masked);
+        // The Jellyfin form shows host, username and password fields plus the
+        // Save/Cancel action rows.
+        let text = draw_to_text(&mut settings);
+        for label in ["Jellyfin", "Host", "Username", "Password", "Save", "Cancel"] {
+            assert!(text.contains(label), "missing {label} in:\n{text}");
         }
+
+        // The *arr forms show an API key field and omit the username row.
         settings.open(Setting::Radarr);
-        if let Editor::Backend(form) = &settings.editor {
-            assert_eq!(form.fields(), 2);
-            assert_eq!(form.secret_label(), "API key");
-        }
+        let text = draw_to_text(&mut settings);
+        assert!(text.contains("API key"), "missing API key in:\n{text}");
+        assert!(
+            !text.contains("Username"),
+            "unexpected Username in:\n{text}"
+        );
 
         settings.on_key(KeyEvent::from(KeyCode::Esc));
         assert!(matches!(settings.editor, Editor::None));
+    }
+
+    #[test]
+    fn save_with_empty_host_shows_error() {
+        let mut settings = app();
+        // Default config has an empty Jellyfin host.
+        settings.open(Setting::Jellyfin);
+        // Walk Host -> Username -> Password -> Save, then confirm.
+        for _ in 0..3 {
+            settings.on_key(KeyEvent::from(KeyCode::Down));
+        }
+        settings.on_key(KeyEvent::from(KeyCode::Enter));
+        // Still open, with an error and no in-flight connect (no task spawned).
+        match &settings.editor {
+            Editor::Backend(editor) => {
+                assert!(editor.error.is_some(), "expected a validation error");
+                assert!(!editor.busy, "must not start connecting on an invalid form");
+            }
+            _ => panic!("form should stay open on an invalid save"),
+        }
+    }
+
+    #[test]
+    fn blank_secret_is_left_to_the_server() {
+        // The credential is validated by the server, not by the form: a blank
+        // secret still submits (and then fails auth), so the form only requires
+        // the host and, for Jellyfin, the username. The stored secret is never
+        // reused, so a bare re-save cannot silently re-authenticate.
+        let mut config = Config::default();
+        config.radarr.host = "https://radarr.example".into();
+        let radarr = BackendEditor::from_config(Setting::Radarr, &config);
+        assert!(
+            radarr.invalid_reason().is_none(),
+            "the form must not require the API key itself"
+        );
+
+        config.jellyfin.host = "https://jelly.example".into();
+        config.jellyfin.username = "alice".into();
+        let jellyfin = BackendEditor::from_config(Setting::Jellyfin, &config);
+        assert!(
+            jellyfin.invalid_reason().is_none(),
+            "the form must not require the password itself"
+        );
+    }
+
+    #[test]
+    fn successful_jellyfin_save_signals_reauth() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let reauth = Arc::new(AtomicU64::new(0));
+        let mut settings = SettingsApp::new(
+            Arc::new(Mutex::new(Config::default())),
+            PathBuf::from("settings-test-config.toml"),
+            AppSender::new("settings", tx),
+            reauth.clone(),
+        );
+
+        // A successful Jellyfin save bumps the counter so the Jellyfin tab picks
+        // up the fresh token instead of forcing a re-login.
+        settings.open(Setting::Jellyfin);
+        let save_gen = settings.save_gen;
+        settings.on_event(Box::new(Msg::SaveDone {
+            save_gen,
+            result: Ok(()),
+        }));
+        assert_eq!(reauth.load(Ordering::Relaxed), 1);
+
+        // An *arr save must not signal it: API-key auth is stateless, so the
+        // running tab keeps working.
+        settings.open(Setting::Radarr);
+        let save_gen = settings.save_gen;
+        settings.on_event(Box::new(Msg::SaveDone {
+            save_gen,
+            result: Ok(()),
+        }));
+        assert_eq!(reauth.load(Ordering::Relaxed), 1);
     }
 }
