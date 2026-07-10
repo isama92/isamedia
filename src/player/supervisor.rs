@@ -280,11 +280,11 @@ pub(super) async fn run(
 ) {
     let old_mpv = is_old_mpv().await;
 
-    let unique = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0)
-        ^ (std::process::id() as u128);
+    // Random per-run id for the IPC endpoint. A guessable name (time XOR pid)
+    // would let a local squatter on Windows win the pipe-name race and receive
+    // the loadfile commands with their auth token; a v4 UUID removes that. On
+    // Unix the 0700 dir already guards the socket.
+    let unique = uuid::Uuid::new_v4().as_u128();
     let socket = match ipc::socket_path(unique) {
         Ok(socket) => socket,
         Err(err) => {
@@ -443,7 +443,12 @@ pub(super) async fn run(
                 // Command replies: surface failures (e.g. a rejected loadfile).
                 if msg.event.is_none() {
                     if let Some(error) = msg.error.as_deref().filter(|&e| e != "success") {
-                        tracing::warn!(error, line, "mpv command failed");
+                        // error is one of mpv's fixed IPC status strings
+                        // ("invalid parameter", etc.), never a token or
+                        // user-derived value, so it is safe to log raw. Only
+                        // line (the full reply) can carry the subtitle api_key
+                        // or X-Emby-Token.
+                        tracing::warn!(error, line = %ipc::redact_secrets(&line), "mpv command failed");
                     }
                     continue;
                 }
