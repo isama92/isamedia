@@ -182,6 +182,21 @@ fn should_fetch_more(cursor: usize, loaded: usize, total: usize, loading: bool) 
     !loading && loaded < total && cursor + FETCH_AHEAD >= loaded
 }
 
+/// Whether this level's `/` filter runs server-side (`searchTerm` on the
+/// paginated request). Only levels that query with `recursive=true` qualify:
+/// Jellyfin silently ignores `searchTerm` on non-recursive queries, so the
+/// Other-library levels (collections list, collection contents) filter
+/// client-side over a fully loaded list instead.
+fn server_filter_level(level: &LibraryLevel) -> bool {
+    matches!(
+        level,
+        LibraryLevel::Library {
+            kind: LibraryKind::Movies | LibraryKind::Shows,
+            ..
+        }
+    )
+}
+
 /// The request for one page of the current library level; `None` at the
 /// root, which is served by `get_libraries` instead. Free function (not a
 /// method) so it can be unit-tested without a `Client`.
@@ -324,13 +339,13 @@ impl Browse {
     }
 
     /// Whether `/` filters server-side (`searchTerm` on the paginated
-    /// request) instead of narrowing the already-loaded items. True inside
-    /// any Libraries drill level except the episodes view, which is a plain
-    /// unpaginated list like everywhere else.
+    /// request) instead of narrowing the already-loaded items. True only in
+    /// movie/show library listings; see `server_filter_level`. The episodes
+    /// drill and the client-filtered levels behave like every other tab.
     fn uses_server_filter(&self) -> bool {
         self.tab == Tab::Libraries
             && self.current_series.is_none()
-            && !matches!(self.lib_level, LibraryLevel::Root)
+            && server_filter_level(&self.lib_level)
     }
 
     /// Only videos inside a collection are user-sortable; every other
@@ -403,7 +418,11 @@ impl Browse {
         let fetch_gen = self.begin_fetch();
         let client = self.client.clone();
         let sender = self.sender.clone();
-        let filter = self.filter_active.then(|| self.filter.value().to_string());
+        // Client-filtered levels always fetch unfiltered pages: the server
+        // would ignore the searchTerm anyway, and the local filter needs the
+        // complete list.
+        let filter = (self.filter_active && self.uses_server_filter())
+            .then(|| self.filter.value().to_string());
         match build_library_query(
             &self.lib_level,
             self.current_sort(),
@@ -453,6 +472,22 @@ impl Browse {
         }
     }
 
+    /// Kick off loading the rest of a client-filtered list the moment its
+    /// filter activates, so the filter sees every item, not just the pages
+    /// scrolled past so far. No-op in server-filter mode and while a fetch
+    /// is in flight (`on_library_items_loaded` continues the chain).
+    fn maybe_start_filter_load(&mut self) {
+        if self.tab == Tab::Libraries
+            && self.current_series.is_none()
+            && !matches!(self.lib_level, LibraryLevel::Root)
+            && !self.uses_server_filter()
+            && !self.loading
+            && self.all_items.len() < self.lib_total
+        {
+            self.fetch_library_page(self.all_items.len());
+        }
+    }
+
     /// Reset per-level list state after moving between library levels, then
     /// load the first page of the level just entered. The previous level's
     /// items stay visible until it arrives, like every other fetch.
@@ -494,8 +529,9 @@ impl Browse {
     }
 
     /// Same contract as `on_items_loaded`, for Libraries-tab pages. Unlike
-    /// `on_items_loaded` this must NOT clear the filter: the request was
-    /// issued with it (server-side filtering), so the result matches it.
+    /// `on_items_loaded` this must NOT clear the filter: either the request
+    /// was issued with it (server-side filtering) or the client-side filter
+    /// is applied to the accumulated pages right here.
     #[must_use]
     pub fn on_library_items_loaded(
         &mut self,
@@ -510,16 +546,24 @@ impl Browse {
         match result {
             Ok(page) => {
                 self.lib_total = page.total_record_count.max(0) as usize;
+                let page_len = page.items.len();
                 if start_index == 0 {
                     self.all_items = page.items;
                 } else {
                     self.all_items.extend(page.items);
                 }
-                // The fetched list is already filtered and sorted; it IS the
-                // visible list.
-                self.items = self.all_items.clone();
-                if self.cursor >= self.items.len() {
-                    self.cursor = self.items.len().saturating_sub(1);
+                // Mirrors the page in server-filter mode, narrows it in
+                // client-filter mode, so appends respect an active filter.
+                self.apply_filter();
+                // A client-side filter must see the whole list: keep
+                // chain-loading pages while it is active. The non-empty-page
+                // guard stops the chain if the server misreports the total.
+                if self.filter_active
+                    && !self.uses_server_filter()
+                    && page_len > 0
+                    && self.all_items.len() < self.lib_total
+                {
+                    self.fetch_library_page(self.all_items.len());
                 }
             }
             Err(crate::jellyfin::Error::Unauthorized) => return true,
@@ -769,6 +813,7 @@ impl Browse {
                     self.filter_active = true;
                     self.filter_focused = true;
                     self.filter.focused = true;
+                    self.maybe_start_filter_load();
                 }
             }
             KeyCode::Esc | KeyCode::Backspace => {
@@ -1269,6 +1314,37 @@ mod tests {
         assert!(should_fetch_more(80, 100, 500, false));
         // An empty list has nothing to page.
         assert!(!should_fetch_more(0, 0, 0, false));
+    }
+
+    #[test]
+    fn server_filter_only_in_recursive_library_listings() {
+        // Jellyfin ignores searchTerm on non-recursive queries, so only the
+        // recursive movie/show listings may filter server-side.
+        let movies = LibraryLevel::Library {
+            library: library("m", Some("movies")),
+            kind: LibraryKind::Movies,
+        };
+        let shows = LibraryLevel::Library {
+            library: library("t", Some("tvshows")),
+            kind: LibraryKind::Shows,
+        };
+        let other = LibraryLevel::Library {
+            library: library("o", Some("boxsets")),
+            kind: LibraryKind::Other,
+        };
+        let collection = LibraryLevel::Collection {
+            library: library("o", Some("boxsets")),
+            collection: MediaItem {
+                id: "box1".into(),
+                kind: ItemKind::BoxSet,
+                ..Default::default()
+            },
+        };
+        assert!(server_filter_level(&movies));
+        assert!(server_filter_level(&shows));
+        assert!(!server_filter_level(&other));
+        assert!(!server_filter_level(&collection));
+        assert!(!server_filter_level(&LibraryLevel::Root));
     }
 
     #[test]
