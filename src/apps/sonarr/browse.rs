@@ -24,7 +24,7 @@ use crate::sonarr::{
 };
 use crate::ui::form::{Field, Form, FormEvent};
 use crate::ui::input::TextInput;
-use crate::ui::text::{truncate, wrap_text};
+use crate::ui::text::{leader_line, truncate, wrap_text};
 use crate::ui::{help, list, prompt, theme};
 
 use super::msg::{CommandKind, Msg};
@@ -2436,6 +2436,8 @@ impl Browse {
     }
 
     fn draw_episodes(&self, frame: &mut Frame, area: Rect) {
+        use unicode_width::UnicodeWidthStr;
+
         let Level::Episodes { series, .. } = &self.level else {
             return;
         };
@@ -2494,16 +2496,14 @@ impl Browse {
                         .map(|utc| utc.chars().take(10).collect())
                 })
                 .unwrap_or_else(|| "TBA".to_string());
-            let status_span = match &status {
-                EpStatus::Downloaded(quality) => {
-                    Span::styled(quality.clone(), Style::new().fg(theme::fg()))
-                }
-                EpStatus::Downloading(percent) => Span::styled(
+            let (status_text, status_style) = match &status {
+                EpStatus::Downloaded(quality) => (quality.clone(), Style::new().fg(theme::fg())),
+                EpStatus::Downloading(percent) => (
                     format!("{} {percent}%", display::GLYPH_DOWNLOADING),
                     Style::new().fg(theme::accent_bright()),
                 ),
-                EpStatus::Missing => Span::styled("missing".to_string(), theme::error()),
-                EpStatus::Unaired => Span::styled("unaired".to_string(), theme::dim()),
+                EpStatus::Missing => ("missing".to_string(), theme::error()),
+                EpStatus::Unaired => ("unaired".to_string(), theme::dim()),
             };
 
             let selected = i == self.episode_cursor;
@@ -2516,30 +2516,34 @@ impl Browse {
             } else {
                 Style::new().fg(theme::fg())
             };
-            let gutter = if selected {
-                Span::styled(" │ ", Style::new().fg(theme::accent_bright()))
+            let gutter_str = if selected { " │ " } else { "   " };
+            let gutter_style = if selected {
+                Style::new().fg(theme::accent_bright())
             } else {
-                Span::raw("   ")
+                Style::new()
             };
+            let code_part = format!("{code}  ");
+            let date_part = format!("{air_date}  ");
 
+            // Render the row as one full-width line so a faint rule can bridge
+            // the gap between the episode title and the right-aligned meta
+            // column; a two-chunk split leaves the meta's left edge floating,
+            // with nothing to connect the eye across the empty middle.
             let row_area = Rect::new(area.x, area.y + row as u16, area.width.saturating_sub(1), 1);
-            let [left, right] =
-                Layout::horizontal([Constraint::Fill(1), Constraint::Length(EPISODE_META_WIDTH)])
-                    .areas(row_area);
+            let left_w = gutter_str.width() + code_part.width() + title.width() + mon_tag.width();
+            let right_w = date_part.width() + status_text.width() + 1; // + trailing space
+            let gap = (row_area.width as usize).saturating_sub(left_w + right_w);
             Line::from(vec![
-                gutter,
-                Span::styled(format!("{code}  "), base_style),
+                Span::styled(gutter_str, gutter_style),
+                Span::styled(code_part, base_style),
                 Span::styled(title, base_style),
                 Span::styled(mon_tag, theme::dim()),
-            ])
-            .render(left, buf);
-            Line::from(vec![
-                Span::styled(format!("{air_date}  "), theme::dim()),
-                status_span,
+                Span::styled(leader_line(gap), theme::dim()),
+                Span::styled(date_part, theme::dim()),
+                Span::styled(status_text, status_style),
                 Span::raw(" "),
             ])
-            .right_aligned()
-            .render(right, buf);
+            .render(row_area, buf);
         }
         if self.episodes.len() > per_page {
             list::draw_scrollbar(buf, area, self.episode_cursor, self.episodes.len());
