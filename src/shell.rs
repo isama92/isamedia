@@ -55,7 +55,12 @@ impl Shell {
                 break;
             };
             match event {
-                Event::Term(TermEvent::Key(key)) if key.kind == KeyEventKind::Press => {
+                // Held keys arrive as `Repeat` on Windows and kitty-protocol
+                // terminals; treat them like `Press` so auto-repeat drives the
+                // UI. `Release` is still dropped (it would double every press).
+                Event::Term(TermEvent::Key(key))
+                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+                {
                     self.on_key(key);
                 }
                 Event::Term(_) => {}
@@ -90,7 +95,11 @@ impl Shell {
     /// or cut the final report short; this leaves as soon as the work is
     /// actually done.
     async fn drain_shutdown(&mut self) {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        // Match the supervisor's own worst case (mpv-quit grace + report
+        // flush) so a slow quit is not abandoned mid-flush, which would leak
+        // the IPC socket and lose the final playback report. Normal quits still
+        // exit the loop the instant every app reports `ready_to_quit`.
+        let deadline = tokio::time::Instant::now() + crate::player::SHUTDOWN_BUDGET;
         while !self.apps.iter().all(|app| app.ready_to_quit()) {
             match tokio::time::timeout_at(deadline, self.rx.recv()).await {
                 Ok(Some(Event::App(app_event))) => {
