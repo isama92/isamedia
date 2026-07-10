@@ -193,6 +193,8 @@ is I/O-bound on network calls, not compute-bound).
   ...). Because PRs are squash-merged, the title becomes the commit on `main`
   that release-plz reads to decide the next version. See "Continuous
   integration and releases".
+- Assign every PR you open to `isama92` (`gh pr create --assignee isama92`, or
+  `gh pr edit <n> --add-assignee isama92` for one already open).
 - Clear, descriptive commit messages.
 - No commented-out code, no debug `println!`/`dbg!` left behind.
 - Don't leave a newly introduced `.unwrap()` in code that ships.
