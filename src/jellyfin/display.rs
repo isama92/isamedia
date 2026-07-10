@@ -40,6 +40,48 @@ pub fn watched(item: &MediaItem) -> bool {
         .unwrap_or(false)
 }
 
+/// The date part of an ISO timestamp ("2019-11-04T03:08:41Z" -> "2019-11-04").
+fn short_date(value: &str) -> &str {
+    // split always yields at least one element, so this cannot fail.
+    value.split('T').next().unwrap_or(value)
+}
+
+/// " | Added: ... | Released: ..." plus the watched checkmark, appended to
+/// Movie and Video descriptions. Each segment is omitted when its data is
+/// absent (e.g. a fetch that did not request DateCreated in its fields).
+fn date_suffix(item: &MediaItem) -> String {
+    let mut suffix = String::new();
+    if let Some(added) = &item.date_created {
+        suffix.push_str(&format!(" | Added: {}", short_date(added)));
+    }
+    if let Some(released) = &item.premiere_date {
+        suffix.push_str(&format!(" | Released: {}", short_date(released)));
+    }
+    if watched(item) {
+        suffix.push_str(" ✓");
+    }
+    suffix
+}
+
+/// Human label for a library view's CollectionType.
+fn library_label(collection_type: Option<&str>) -> String {
+    match collection_type {
+        Some("movies") => "Movies".to_string(),
+        Some("tvshows") => "Shows".to_string(),
+        Some("boxsets") => "Collections".to_string(),
+        Some("music") => "Music".to_string(),
+        Some("homevideos") => "Home videos".to_string(),
+        Some(other) => {
+            let mut label = other.to_string();
+            if let Some(first) = label.get_mut(0..1) {
+                first.make_ascii_uppercase();
+            }
+            label
+        }
+        None => "Library".to_string(),
+    }
+}
+
 /// List row title, e.g. "The Expanse S01E02 (2015) [45%]".
 pub fn item_title(item: &MediaItem) -> String {
     let name = item.name.as_deref().unwrap_or("");
@@ -84,18 +126,33 @@ pub fn item_title(item: &MediaItem) -> String {
 pub fn item_description(item: &MediaItem) -> String {
     match item.kind {
         ItemKind::Movie => format!(
-            "Movie  | Rating: {:.1} | Runtime: {}",
+            "Movie  | Rating: {:.1} | Runtime: {}{}",
             rating(item),
             runtime(item.run_time_ticks.unwrap_or(0)),
+            date_suffix(item),
         ),
         ItemKind::Series => format!("Series | Rating: {:.1}", rating(item)),
         ItemKind::Episode => item.name.clone().unwrap_or_default(),
         ItemKind::Video => format!(
-            "Video  | Rating: {:.1} | Runtime: {}",
+            "Video  | Rating: {:.1} | Runtime: {}{}",
             rating(item),
             runtime(item.run_time_ticks.unwrap_or(0)),
+            date_suffix(item),
         ),
-        ItemKind::BoxSet | ItemKind::CollectionFolder | ItemKind::Other => String::new(),
+        ItemKind::BoxSet => match item.child_count {
+            Some(1) => "1 video".to_string(),
+            Some(count) => format!("{count} videos"),
+            None => String::new(),
+        },
+        ItemKind::CollectionFolder => {
+            let label = library_label(item.collection_type.as_deref());
+            match item.child_count {
+                Some(1) => format!("{label} | 1 item"),
+                Some(count) => format!("{label} | {count} items"),
+                None => label,
+            }
+        }
+        ItemKind::Other => String::new(),
     }
 }
 
@@ -220,7 +277,7 @@ mod tests {
 
     #[test]
     fn box_set_lists_by_name_only() {
-        let item = MediaItem {
+        let mut item = MediaItem {
             id: "b1".into(),
             name: Some("Trilogy".into()),
             kind: ItemKind::BoxSet,
@@ -230,6 +287,88 @@ mod tests {
         };
         assert_eq!(item_title(&item), "Trilogy");
         assert_eq!(item_description(&item), "");
+        item.child_count = Some(12);
+        assert_eq!(item_description(&item), "12 videos");
+        item.child_count = Some(1);
+        assert_eq!(item_description(&item), "1 video");
+    }
+
+    #[test]
+    fn short_date_takes_date_part() {
+        assert_eq!(short_date("2019-11-04T03:08:41.0000000Z"), "2019-11-04");
+        assert_eq!(short_date("not a date"), "not a date");
+    }
+
+    #[test]
+    fn video_description_with_dates_and_watched() {
+        let mut item = MediaItem {
+            id: "v1".into(),
+            name: Some("Holiday".into()),
+            kind: ItemKind::Video,
+            community_rating: Some(7.5),
+            run_time_ticks: Some(93 * 600_000_000),
+            date_created: Some("2024-03-01T10:00:00.0000000Z".into()),
+            premiere_date: Some("1999-06-11T00:00:00.0000000Z".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            item_description(&item),
+            "Video  | Rating: 7.5 | Runtime: 1h33m | Added: 2024-03-01 | Released: 1999-06-11"
+        );
+        item.user_data = Some(UserData {
+            played: Some(true),
+            ..Default::default()
+        });
+        assert_eq!(
+            item_description(&item),
+            "Video  | Rating: 7.5 | Runtime: 1h33m | Added: 2024-03-01 | Released: 1999-06-11 ✓"
+        );
+        // Absent dates leave the description exactly as before.
+        item.date_created = None;
+        item.premiere_date = None;
+        item.user_data = None;
+        assert_eq!(
+            item_description(&item),
+            "Video  | Rating: 7.5 | Runtime: 1h33m"
+        );
+    }
+
+    #[test]
+    fn movie_description_gets_the_same_suffix() {
+        let mut item = movie();
+        item.date_created = Some("2024-03-01T10:00:00.0000000Z".into());
+        item.user_data = Some(UserData {
+            played: Some(true),
+            ..Default::default()
+        });
+        assert_eq!(
+            item_description(&item),
+            "Movie  | Rating: 8.0 | Runtime: 1h33m | Added: 2024-03-01 ✓"
+        );
+    }
+
+    #[test]
+    fn library_view_description() {
+        let mut item = MediaItem {
+            id: "lib1".into(),
+            name: Some("Movies".into()),
+            kind: ItemKind::CollectionFolder,
+            collection_type: Some("movies".into()),
+            child_count: Some(250),
+            ..Default::default()
+        };
+        assert_eq!(item_description(&item), "Movies | 250 items");
+        item.collection_type = Some("tvshows".into());
+        item.child_count = Some(1);
+        assert_eq!(item_description(&item), "Shows | 1 item");
+        item.collection_type = Some("boxsets".into());
+        item.child_count = None;
+        assert_eq!(item_description(&item), "Collections");
+        // Unknown types fall back to a capitalized CollectionType.
+        item.collection_type = Some("playlists".into());
+        assert_eq!(item_description(&item), "Playlists");
+        item.collection_type = None;
+        assert_eq!(item_description(&item), "Library");
     }
 
     #[test]

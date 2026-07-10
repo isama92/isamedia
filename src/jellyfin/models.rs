@@ -36,6 +36,13 @@ pub struct MediaItem {
     /// `Type` alone cannot tell library kinds apart, since every view is a
     /// `CollectionFolder`.
     pub collection_type: Option<String>,
+    /// ISO timestamp; only returned when `fields=DateCreated` is requested.
+    pub date_created: Option<String>,
+    /// ISO timestamp; returned by default, unlike `DateCreated`.
+    pub premiere_date: Option<String>,
+    /// Number of children of a folder-ish item (library view, box set);
+    /// views include it natively, box sets need `fields=ChildCount`.
+    pub child_count: Option<i32>,
     pub path: Option<String>,
     pub user_data: Option<UserData>,
     pub media_streams: Vec<MediaStream>,
@@ -144,9 +151,12 @@ mod tests {
 
     #[test]
     fn deserializes_box_set() {
-        let item: MediaItem =
-            serde_json::from_str(r#"{"Id": "b1", "Name": "Trilogy", "Type": "BoxSet"}"#).unwrap();
+        let item: MediaItem = serde_json::from_str(
+            r#"{"Id": "b1", "Name": "Trilogy", "Type": "BoxSet", "ChildCount": 3}"#,
+        )
+        .unwrap();
         assert_eq!(item.kind, ItemKind::BoxSet);
+        assert_eq!(item.child_count, Some(3));
     }
 
     #[test]
@@ -155,11 +165,37 @@ mod tests {
             "Id": "lib1",
             "Name": "Movies",
             "Type": "CollectionFolder",
-            "CollectionType": "movies"
+            "CollectionType": "movies",
+            "ChildCount": 7
         }"#;
         let item: MediaItem = serde_json::from_str(raw).unwrap();
         assert_eq!(item.kind, ItemKind::CollectionFolder);
         assert_eq!(item.collection_type.as_deref(), Some("movies"));
+        assert_eq!(item.child_count, Some(7));
+    }
+
+    #[test]
+    fn deserializes_item_dates() {
+        let raw = r#"{
+            "Id": "v1",
+            "Type": "Video",
+            "DateCreated": "2019-11-04T03:08:41.0000000Z",
+            "PremiereDate": "1976-11-12T00:00:00.0000000Z"
+        }"#;
+        let item: MediaItem = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            item.date_created.as_deref(),
+            Some("2019-11-04T03:08:41.0000000Z")
+        );
+        assert_eq!(
+            item.premiere_date.as_deref(),
+            Some("1976-11-12T00:00:00.0000000Z")
+        );
+        // Both are optional: absent fields stay None.
+        let bare: MediaItem = serde_json::from_str(r#"{"Id": "v2", "Type": "Video"}"#).unwrap();
+        assert_eq!(bare.date_created, None);
+        assert_eq!(bare.premiere_date, None);
+        assert_eq!(bare.child_count, None);
     }
 
     #[test]
