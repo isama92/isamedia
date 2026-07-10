@@ -86,6 +86,22 @@ pub fn rating(movie: &Movie) -> Option<f64> {
         .find(|value| *value > 0.0)
 }
 
+/// "2014 • 8.7 • 2h 49m" — the movie meta line shown under list rows and in
+/// the detail header; pieces the server doesn't know are skipped.
+pub fn movie_meta(movie: &Movie) -> String {
+    let mut parts = Vec::new();
+    if let Some(year) = movie.year {
+        parts.push(year.to_string());
+    }
+    if let Some(rating) = rating(movie) {
+        parts.push(format!("{rating:.1}"));
+    }
+    if let Some(runtime) = format_runtime(movie.runtime) {
+        parts.push(runtime);
+    }
+    parts.join(" • ")
+}
+
 /// "1h 52m" / "52m"; 0 minutes means the runtime is unknown.
 pub fn format_runtime(minutes: i64) -> Option<String> {
     if minutes <= 0 {
@@ -283,6 +299,29 @@ mod tests {
         };
         assert_eq!(rating(&zero_tmdb), Some(5.5));
         assert_eq!(rating(&Movie::default()), None);
+    }
+
+    #[test]
+    fn meta_line_skips_unknown_pieces() {
+        let full = Movie {
+            year: Some(2014),
+            runtime: 169,
+            ratings: Some(Ratings {
+                tmdb: Some(Rating { value: 8.4 }),
+                imdb: None,
+            }),
+            ..Movie::default()
+        };
+        assert_eq!(movie_meta(&full), "2014 • 8.4 • 2h 49m");
+
+        let bare = Movie::default();
+        assert_eq!(movie_meta(&bare), "");
+
+        let year_only = Movie {
+            year: Some(2027),
+            ..Movie::default()
+        };
+        assert_eq!(movie_meta(&year_only), "2027");
     }
 
     #[test]
