@@ -173,6 +173,31 @@ impl Client {
         Ok(())
     }
 
+    /// Edit a movie's add-time options via the same bulk editor endpoint. Only
+    /// the changed fields are sent (a `None` leaves that option untouched);
+    /// `move_files` rides only when `root_folder_path` is set, telling Radarr
+    /// whether to relocate existing files on disk to the new root.
+    pub async fn edit_movie_options(
+        &self,
+        movie_id: i64,
+        root_folder_path: Option<&str>,
+        move_files: bool,
+        quality_profile_id: Option<i64>,
+        minimum_availability: Option<&str>,
+    ) -> Result<(), Error> {
+        let body = movie_editor_body(
+            movie_id,
+            root_folder_path,
+            move_files,
+            quality_profile_id,
+            minimum_availability,
+        );
+        self.transport
+            .send(Method::PUT, "/api/v3/movie/editor", &[], Some(&body), None)
+            .await?;
+        Ok(())
+    }
+
     /// Past grab/import/delete events of one movie, for the "grabbed before"
     /// marker in interactive search results. Unlike Sonarr's paginated
     /// /history, Radarr's /history/movie returns a plain array.
@@ -186,5 +211,71 @@ impl Client {
                 None,
             )
             .await
+    }
+}
+
+/// Build the `movie/editor` bulk-update body: always the id, plus only the
+/// fields that were supplied. `moveFiles` rides only alongside `rootFolderPath`,
+/// so an edit that doesn't change the root never asks Radarr to relocate files.
+fn movie_editor_body(
+    movie_id: i64,
+    root_folder_path: Option<&str>,
+    move_files: bool,
+    quality_profile_id: Option<i64>,
+    minimum_availability: Option<&str>,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({ "movieIds": [movie_id] });
+    let object = body
+        .as_object_mut()
+        .expect("json! object literal is always an object");
+    if let Some(path) = root_folder_path {
+        object.insert("rootFolderPath".into(), serde_json::json!(path));
+        object.insert("moveFiles".into(), serde_json::json!(move_files));
+    }
+    if let Some(id) = quality_profile_id {
+        object.insert("qualityProfileId".into(), serde_json::json!(id));
+    }
+    if let Some(min) = minimum_availability {
+        object.insert("minimumAvailability".into(), serde_json::json!(min));
+    }
+    body
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn editor_body_sends_only_supplied_fields() {
+        // Quality only: no root, so neither rootFolderPath nor moveFiles ride.
+        assert_eq!(
+            movie_editor_body(42, None, true, Some(7), None),
+            serde_json::json!({ "movieIds": [42], "qualityProfileId": 7 })
+        );
+        // Root change carries moveFiles alongside it.
+        assert_eq!(
+            movie_editor_body(42, Some("/movies4k"), true, None, None),
+            serde_json::json!({
+                "movieIds": [42],
+                "rootFolderPath": "/movies4k",
+                "moveFiles": true,
+            })
+        );
+        // All fields; moveFiles=false is still sent with the path.
+        assert_eq!(
+            movie_editor_body(1, Some("/movies"), false, Some(3), Some("released")),
+            serde_json::json!({
+                "movieIds": [1],
+                "rootFolderPath": "/movies",
+                "moveFiles": false,
+                "qualityProfileId": 3,
+                "minimumAvailability": "released",
+            })
+        );
+        // Nothing supplied: just the id (the caller guards against this).
+        assert_eq!(
+            movie_editor_body(9, None, false, None, None),
+            serde_json::json!({ "movieIds": [9] })
+        );
     }
 }

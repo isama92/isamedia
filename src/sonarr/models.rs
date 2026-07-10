@@ -27,6 +27,14 @@ pub struct Series {
     pub next_airing: Option<String>,
     pub ratings: Option<Ratings>,
     pub seasons: Vec<Season>,
+    /// Add-time options, editable via the `o` wizard. Present on library
+    /// GET /series; absent (defaulted) on lookup results, where the edit
+    /// wizard never opens.
+    pub quality_profile_id: i64,
+    pub root_folder_path: Option<String>,
+    /// "standard" | "daily" | "anime".
+    pub series_type: Option<String>,
+    pub season_folder: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -105,6 +113,10 @@ mod tests {
             "added": "2020-01-05T18:22:00Z",
             "nextAiring": "2026-07-12T14:25:00Z",
             "ratings": { "votes": 512, "value": 7.9 },
+            "qualityProfileId": 4,
+            "rootFolderPath": "/tv",
+            "seriesType": "anime",
+            "seasonFolder": true,
             "seasons": [
                 { "seasonNumber": 0, "monitored": false },
                 {
@@ -126,6 +138,10 @@ mod tests {
         assert_eq!(series.title.as_deref(), Some("Black Clover"));
         assert_eq!(series.year, Some(2017));
         assert!((series.ratings.unwrap().value - 7.9).abs() < f64::EPSILON);
+        assert_eq!(series.quality_profile_id, 4);
+        assert_eq!(series.root_folder_path.as_deref(), Some("/tv"));
+        assert_eq!(series.series_type.as_deref(), Some("anime"));
+        assert!(series.season_folder);
         assert_eq!(series.seasons.len(), 2);
         assert!(series.seasons[0].statistics.is_none());
         let stats = series.seasons[1].statistics.as_ref().unwrap();

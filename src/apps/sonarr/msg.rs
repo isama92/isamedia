@@ -100,4 +100,8 @@ pub enum CommandKind {
     /// is the only feedback, so this carries no payload and sets no notice. The
     /// refetch is driven by the current level.
     SetMonitored,
+    /// An add-time options edit (root folder / quality profile / series type /
+    /// season folder) via the bulk editor. A refetch repaints the change and a
+    /// one-line notice confirms it.
+    SetOptions,
 }
