@@ -2,6 +2,7 @@
 name = "isamedia"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 # Publishing to crates.io is disabled in .github/release-plz.toml
 # (publish = false), NOT here. A `publish = false` in this manifest marks the
 # package non-publishable, which makes release-plz skip creating the git tag
