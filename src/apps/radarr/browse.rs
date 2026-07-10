@@ -21,11 +21,23 @@ use crate::radarr::display::{self, MOVIE_SORTS, MovieSort, MovieStatus};
 use crate::radarr::{
     Client, Command, HistoryRecord, Movie, QualityProfile, QueueItem, Release, RootFolder,
 };
+use crate::ui::form::{Field, Form, FormEvent};
 use crate::ui::input::TextInput;
 use crate::ui::text::{truncate, wrap_text};
 use crate::ui::{help, list, prompt, theme};
 
 use super::msg::{CommandKind, Msg};
+
+/// Stable field ids for the add/edit forms; results are read by id.
+mod field {
+    use crate::ui::form::FieldId;
+    pub const ROOT: FieldId = 0;
+    pub const QUALITY: FieldId = 1;
+    pub const MIN_AVAIL: FieldId = 2;
+    pub const MOVE_FILES: FieldId = 3;
+    pub const MONITORED: FieldId = 4;
+    pub const SEARCH: FieldId = 5;
+}
 
 const SPINNER_FRAMES: [&str; 8] = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
 
@@ -64,43 +76,30 @@ enum Confirm {
     Grab { index: usize },
 }
 
-/// One step of the add wizard, in order. Radarr walks all five; each opens
-/// pre-selected on a sensible default (first root folder, a 1080p quality
-/// profile, "Released" availability) that the user can still change.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum AddStep {
-    RootFolder,
-    QualityProfile,
-    MinAvailability,
-    Monitored,
-    Download,
+/// Whether the open form is adding a new movie or editing a library one.
+enum FormMode {
+    /// Editing the movie with this id (options change via the bulk editor).
+    Edit { id: i64 },
+    /// Adding the lookup result at this index into `add_results_raw`.
+    Add { result: usize },
 }
 
-impl AddStep {
-    /// The step after this one, or `None` to commit the add.
-    fn next(self) -> Option<AddStep> {
-        match self {
-            AddStep::RootFolder => Some(AddStep::QualityProfile),
-            AddStep::QualityProfile => Some(AddStep::MinAvailability),
-            AddStep::MinAvailability => Some(AddStep::Monitored),
-            AddStep::Monitored => Some(AddStep::Download),
-            AddStep::Download => None,
-        }
-    }
+/// The open full-body form: the reusable widget, what it commits to, and the
+/// header line. Modal while `Some`.
+struct ActiveForm {
+    form: Form,
+    mode: FormMode,
+    title: String,
 }
 
-/// The in-progress add wizard: which result is being added, the current step
-/// with its selection cursor, and the choices gathered so far. Modal while
-/// `Some`.
-struct AddFlow {
-    result: usize,
-    step: AddStep,
-    cursor: usize,
-    root_folder: Option<String>,
-    quality_profile_id: Option<i64>,
-    min_availability: usize,
-    monitored: bool,
-    search: bool,
+/// An `o` press captured while the picker lists were still loading: the movie
+/// and its current values, held until `AddOptionsLoaded` lands so the form can
+/// open by itself instead of asking the user to press `o` again.
+struct PendingEdit {
+    id: i64,
+    root: Option<String>,
+    quality: i64,
+    avail: Option<String>,
 }
 
 /// What the browse screen wants its parent (the Radarr app) to do.
@@ -175,7 +174,13 @@ pub struct Browse {
     add_gen: u64,
     /// An add POST is in flight; blocks a second submit until it lands.
     add_submitting: bool,
-    add_flow: Option<AddFlow>,
+    /// The open add/edit form (opened with `a` / `o`); modal while set and
+    /// drawn full-body in place of the level content.
+    form: Option<ActiveForm>,
+    /// An `o` press waiting on the picker lists to load; the form opens
+    /// automatically once `AddOptionsLoaded` arrives. Dropped if the user
+    /// leaves the level meanwhile (see `pop_level`).
+    pending_edit: Option<PendingEdit>,
     /// The just-committed add asked for an auto-search; read once its
     /// `MovieAdded` lands, to start a background monitor. Only one add is ever
     /// in flight (`add_submitting` guards a second submit), so one flag suffices.
@@ -253,7 +258,8 @@ impl Browse {
             add_prereq_gen: 0,
             add_gen: 0,
             add_submitting: false,
-            add_flow: None,
+            form: None,
+            pending_edit: None,
             pending_search: false,
             monitors: Vec::new(),
             overview_expanded: false,
@@ -545,6 +551,12 @@ impl Browse {
                 // the server; the flipped indicator is feedback enough.
                 self.fetch_movies();
             }
+            CommandKind::SetOptions => {
+                // Refetch so the list and detail repaint the new options, then
+                // (after the fetch clears the notice row) confirm.
+                self.fetch_movies();
+                self.notice = Some("options updated".into());
+            }
         }
         false
     }
@@ -599,9 +611,31 @@ impl Browse {
             Ok((folders, profiles)) => {
                 self.root_folders = folders;
                 self.quality_profiles = profiles;
+                // A deferred `o` press was waiting on these: open its wizard
+                // now, unless the user has since left an editable level.
+                if let Some(pending) = self.pending_edit.take() {
+                    self.loading = false;
+                    self.notice = None;
+                    if matches!(self.level, Level::MovieList | Level::MovieDetail { .. }) {
+                        self.open_edit_form(
+                            pending.id,
+                            pending.root.as_deref(),
+                            pending.quality,
+                            pending.avail.as_deref(),
+                        );
+                    }
+                }
             }
             Err(crate::radarr::Error::Unauthorized) => return true,
-            Err(err) => tracing::debug!(%err, "add options fetch failed"),
+            Err(err) => {
+                if self.pending_edit.take().is_some() {
+                    self.loading = false;
+                    self.notice = None;
+                    self.error = Some(err.to_string());
+                } else {
+                    tracing::debug!(%err, "add options fetch failed");
+                }
+            }
         }
         false
     }
@@ -901,6 +935,8 @@ impl Browse {
     /// Pop one level; returns false at the movie list so the caller can
     /// give Esc its list-level meaning (clear filter) instead.
     fn pop_level(&mut self) -> bool {
+        // Esc/back while the pickers are still loading cancels a deferred `o`.
+        self.pending_edit = None;
         match std::mem::replace(&mut self.level, Level::MovieList) {
             Level::MovieList => false,
             Level::Downloads => {
@@ -925,7 +961,7 @@ impl Browse {
                 self.add_results_raw.clear();
                 self.add_search.clear();
                 self.add_search_focused = false;
-                self.add_flow = None;
+                self.form = None;
                 self.add_submitting = false;
                 // Supersede any in-flight lookup and add so a late result
                 // can't surface an error on, or navigate away from, the list.
@@ -1011,7 +1047,7 @@ impl Browse {
         self.add_results.clear();
         self.add_results_raw.clear();
         self.add_cursor = 0;
-        self.add_flow = None;
+        self.form = None;
         self.add_submitting = false;
         self.loading = false;
         self.error = None;
@@ -1062,8 +1098,10 @@ impl Browse {
         });
     }
 
-    /// Open the add wizard for the highlighted result; refuses if the
-    /// prerequisites haven't loaded (or none are configured).
+    /// Open the add form for the highlighted result; refuses if the
+    /// prerequisites haven't loaded (or none are configured). Each field opens
+    /// on a sensible default (first root folder, a 1080p quality profile,
+    /// "Released" availability, monitored + search on).
     fn start_add_flow(&mut self) {
         if self.add_submitting {
             self.notice = Some("an add is already in progress".into());
@@ -1077,145 +1115,67 @@ impl Browse {
                 Some("add options unavailable: need a root folder and a quality profile".into());
             return;
         }
-        // Each step opens pre-selected on a sensible default; the cursor for
-        // the quality and availability steps is set as they open (see
-        // `advance_add_flow`), the root folder simply starts on the first.
-        self.add_flow = Some(AddFlow {
-            result: self.add_cursor,
-            step: AddStep::RootFolder,
-            cursor: 0,
-            root_folder: None,
-            quality_profile_id: None,
-            min_availability: released_availability_index(),
-            monitored: true,
-            search: true,
+        let title = format!(
+            "Add movie — {}",
+            movie_label(&self.add_results[self.add_cursor])
+        );
+        let fields = vec![
+            Field::text(field::ROOT, "Root folder", self.default_root_folder()),
+            Field::select(
+                field::QUALITY,
+                "Quality profile",
+                self.quality_choices(),
+                preferred_quality_index(&self.quality_profiles),
+            ),
+            Field::select(
+                field::MIN_AVAIL,
+                "Minimum availability",
+                availability_choices(),
+                released_availability_index(),
+            ),
+            Field::toggle(field::MONITORED, "Monitor this movie?", true),
+            Field::toggle(field::SEARCH, "Search & download now?", true),
+        ];
+        self.form = Some(ActiveForm {
+            form: Form::new(fields, "Add"),
+            mode: FormMode::Add {
+                result: self.add_cursor,
+            },
+            title,
         });
     }
 
-    /// Title and option labels for the wizard's current step; the labels
-    /// borrow from the prerequisite lists (rebuilt cheaply per draw, no
-    /// allocation) and their count clamps the cursor.
-    fn add_step_menu(&self) -> (&'static str, Vec<&str>) {
-        let Some(flow) = &self.add_flow else {
-            return ("", Vec::new());
-        };
-        match flow.step {
-            AddStep::RootFolder => (
-                "Root folder",
-                self.root_folders.iter().map(|f| f.path.as_str()).collect(),
-            ),
-            AddStep::QualityProfile => (
-                "Quality profile",
-                self.quality_profiles
-                    .iter()
-                    .map(|p| p.name.as_str())
-                    .collect(),
-            ),
-            AddStep::MinAvailability => (
-                "Minimum availability",
-                MIN_AVAILABILITY.iter().map(|(label, _)| *label).collect(),
-            ),
-            AddStep::Monitored => ("Monitor this movie?", vec!["Yes", "No"]),
-            AddStep::Download => ("Search & download now?", vec!["Yes", "No"]),
-        }
-    }
-
-    fn add_step_option_count(&self) -> usize {
-        let Some(flow) = &self.add_flow else {
-            return 0;
-        };
-        match flow.step {
-            AddStep::RootFolder => self.root_folders.len(),
-            AddStep::QualityProfile => self.quality_profiles.len(),
-            AddStep::MinAvailability => MIN_AVAILABILITY.len(),
-            AddStep::Monitored | AddStep::Download => 2,
-        }
-    }
-
-    /// Record the current step's selection and move to the next; commit once
-    /// the last step is answered.
-    fn advance_add_flow(&mut self) {
-        let Some(flow) = self.add_flow.as_ref() else {
-            return;
-        };
-        let (step, cursor) = (flow.step, flow.cursor);
-        match step {
-            AddStep::RootFolder => {
-                let path = self.root_folders.get(cursor).map(|f| f.path.clone());
-                if let Some(flow) = self.add_flow.as_mut() {
-                    flow.root_folder = path;
-                }
-            }
-            AddStep::QualityProfile => {
-                let id = self.quality_profiles.get(cursor).map(|p| p.id);
-                if let Some(flow) = self.add_flow.as_mut() {
-                    flow.quality_profile_id = id;
-                }
-            }
-            AddStep::MinAvailability => {
-                if let Some(flow) = self.add_flow.as_mut() {
-                    flow.min_availability = cursor;
-                }
-            }
-            AddStep::Monitored => {
-                if let Some(flow) = self.add_flow.as_mut() {
-                    flow.monitored = cursor == 0;
-                }
-            }
-            AddStep::Download => {
-                if let Some(flow) = self.add_flow.as_mut() {
-                    flow.search = cursor == 0;
-                }
-            }
-        }
-        match step.next() {
-            Some(next) => {
-                // Open each step on its smart default; unlisted steps start
-                // at their first option.
-                let next_cursor = match next {
-                    AddStep::QualityProfile => preferred_quality_index(&self.quality_profiles),
-                    AddStep::MinAvailability => released_availability_index(),
-                    _ => 0,
-                };
-                if let Some(flow) = self.add_flow.as_mut() {
-                    flow.step = next;
-                    flow.cursor = next_cursor;
-                }
-            }
-            None => self.commit_add(),
-        }
-    }
-
-    /// Forward the finished wizard's lookup object, augmented with the user's
-    /// choices, to POST /movie. The whole object is forwarded (not a subset)
-    /// because Radarr requires fields the typed model drops (titleSlug,
-    /// images).
-    fn commit_add(&mut self) {
-        let Some(flow) = self.add_flow.take() else {
-            return;
-        };
-        // Both required choices must have resolved; if a prerequisite list
-        // was empty under the cursor the payload would carry nulls.
-        let (Some(root_folder), Some(quality_profile_id)) =
-            (flow.root_folder.as_ref(), flow.quality_profile_id)
-        else {
+    /// Forward the add form's lookup object, augmented with the chosen fields,
+    /// to POST /movie. The whole object is forwarded (not a subset) because
+    /// Radarr requires fields the typed model drops (titleSlug, images).
+    fn commit_add(&mut self, result: usize, form: &Form) {
+        // The root folder is typed free-text; the quality profile is still a
+        // pick from the configured list.
+        let root_folder = form.text(field::ROOT).trim().to_string();
+        let quality_profile_id = self
+            .quality_profiles
+            .get(form.selected(field::QUALITY))
+            .map(|p| p.id);
+        let (false, Some(quality_profile_id)) = (root_folder.is_empty(), quality_profile_id) else {
             self.notice = Some("add cancelled: no root folder or quality profile".into());
             return;
         };
-        let Some(mut body) = self.add_results_raw.get(flow.result).cloned() else {
+        let Some(mut body) = self.add_results_raw.get(result).cloned() else {
             return;
         };
         let min_availability = MIN_AVAILABILITY
-            .get(flow.min_availability)
+            .get(form.selected(field::MIN_AVAIL))
             .map(|(_, value)| *value)
             .unwrap_or("announced");
+        let monitored = form.selected(field::MONITORED) == 0;
+        let search = form.selected(field::SEARCH) == 0;
         if let Some(object) = body.as_object_mut() {
             object.insert(
                 "qualityProfileId".into(),
                 serde_json::json!(quality_profile_id),
             );
             object.insert("rootFolderPath".into(), serde_json::json!(root_folder));
-            object.insert("monitored".into(), serde_json::json!(flow.monitored));
+            object.insert("monitored".into(), serde_json::json!(monitored));
             object.insert(
                 "minimumAvailability".into(),
                 serde_json::json!(min_availability),
@@ -1228,7 +1188,7 @@ impl Browse {
                 serde_json::json!({ "searchForMovie": false }),
             );
         }
-        self.pending_search = flow.search;
+        self.pending_search = search;
         self.add_submitting = true;
         self.loading = true;
         self.error = None;
@@ -1240,6 +1200,160 @@ impl Browse {
         tokio::spawn(async move {
             let result = client.add_movie(&body).await.map(Box::new);
             sender.send(Msg::MovieAdded { add_gen, result });
+        });
+    }
+
+    /// The first configured root folder's path, used to pre-fill the add form's
+    /// editable Root folder field (empty when none is configured).
+    fn default_root_folder(&self) -> String {
+        self.root_folders
+            .first()
+            .map(|folder| folder.path.clone())
+            .unwrap_or_default()
+    }
+
+    /// Owned quality-profile labels for the picker, built once when a form opens
+    /// (so the `Form` never borrows the caches).
+    fn quality_choices(&self) -> Vec<String> {
+        self.quality_profiles
+            .iter()
+            .map(|p| p.name.clone())
+            .collect()
+    }
+
+    /// Open the options-edit wizard for the movie under the cursor (list) or
+    /// the one the detail is showing, seeding each step on the movie's current
+    /// value. Copies the id/values out before touching the caches so the
+    /// `self.level` borrow ends first. When the pickers haven't loaded yet,
+    /// fetch them and stash the request so the wizard opens by itself once
+    /// they land (the breadcrumb spinner covers the wait), rather than making
+    /// the user press `o` twice.
+    fn start_edit_flow(&mut self) {
+        let (id, cur_root, cur_quality, cur_avail) = match &self.level {
+            Level::MovieList => match self.selected_movie() {
+                Some(movie) => (
+                    movie.id,
+                    movie.root_folder_path.clone(),
+                    movie.quality_profile_id,
+                    movie.minimum_availability.clone(),
+                ),
+                None => return,
+            },
+            Level::MovieDetail { movie } => (
+                movie.id,
+                movie.root_folder_path.clone(),
+                movie.quality_profile_id,
+                movie.minimum_availability.clone(),
+            ),
+            // `o` is a no-op on search/add/downloads.
+            _ => return,
+        };
+        if self.root_folders.is_empty() || self.quality_profiles.is_empty() {
+            self.pending_edit = Some(PendingEdit {
+                id,
+                root: cur_root,
+                quality: cur_quality,
+                avail: cur_avail,
+            });
+            self.fetch_add_options();
+            self.loading = true;
+            self.notice = Some("loading options...".into());
+            return;
+        }
+        self.open_edit_form(id, cur_root.as_deref(), cur_quality, cur_avail.as_deref());
+    }
+
+    /// Build and open the edit form, each field opened on the movie's current
+    /// value. Assumes the picker lists are loaded. The Move-files toggle starts
+    /// hidden and is revealed by the key handler once the root folder changes.
+    fn open_edit_form(&mut self, id: i64, root: Option<&str>, quality: i64, avail: Option<&str>) {
+        let seed_quality = current_quality_index(&self.quality_profiles, quality)
+            .unwrap_or_else(|| preferred_quality_index(&self.quality_profiles));
+        let seed_avail = current_availability_index(avail);
+        let title = format!(
+            "Edit options — {}",
+            self.all_movies
+                .iter()
+                .find(|movie| movie.id == id)
+                .map(movie_label)
+                .unwrap_or_else(|| "movie".into())
+        );
+        let fields = vec![
+            Field::text(field::ROOT, "Root folder", root.unwrap_or_default()),
+            // Right after the root, since it only matters when the root changes.
+            Field::toggle(field::MOVE_FILES, "Move existing files?", false).hidden(),
+            Field::select(
+                field::QUALITY,
+                "Quality profile",
+                self.quality_choices(),
+                seed_quality,
+            ),
+            Field::select(
+                field::MIN_AVAIL,
+                "Minimum availability",
+                availability_choices(),
+                seed_avail,
+            ),
+        ];
+        self.form = Some(ActiveForm {
+            form: Form::new(fields, "Save"),
+            mode: FormMode::Edit { id },
+            title,
+        });
+    }
+
+    /// Commit the open form: dispatch to the add or edit path.
+    fn commit_form(&mut self) {
+        let Some(active) = self.form.take() else {
+            return;
+        };
+        match active.mode {
+            FormMode::Edit { id } => self.commit_edit(id, &active.form),
+            FormMode::Add { result } => self.commit_add(result, &active.form),
+        }
+    }
+
+    /// Resolve each field to the value to send, sending only genuinely changed
+    /// fields. A root cleared to empty counts as no change (the client ties
+    /// moveFiles to rootFolderPath being present, so it sends neither).
+    fn commit_edit(&mut self, id: i64, form: &Form) {
+        let typed_root = form.text(field::ROOT).trim().to_string();
+        let root_folder =
+            (form.changed(field::ROOT) && !typed_root.is_empty()).then_some(typed_root);
+        let quality_profile_id = form
+            .changed(field::QUALITY)
+            .then(|| {
+                self.quality_profiles
+                    .get(form.selected(field::QUALITY))
+                    .map(|p| p.id)
+            })
+            .flatten();
+        let minimum_availability = form
+            .changed(field::MIN_AVAIL)
+            .then(|| {
+                MIN_AVAILABILITY
+                    .get(form.selected(field::MIN_AVAIL))
+                    .map(|(_, v)| v.to_string())
+            })
+            .flatten();
+        // Guard on the resolved body, not the raw changed flags, so clearing the
+        // root (or any other no-op) never fires an empty editor PUT.
+        if root_folder.is_none() && quality_profile_id.is_none() && minimum_availability.is_none() {
+            self.notice = Some("no changes".into());
+            return;
+        }
+        let move_files = form.selected(field::MOVE_FILES) == 0;
+        let client = self.client.clone();
+        self.spawn_command(CommandKind::SetOptions, async move {
+            client
+                .edit_movie_options(
+                    id,
+                    root_folder.as_deref(),
+                    move_files,
+                    quality_profile_id,
+                    minimum_availability.as_deref(),
+                )
+                .await
         });
     }
 
@@ -1294,23 +1408,35 @@ impl Browse {
             return None;
         }
 
-        // The add wizard is modal: while open it owns every key.
-        if self.add_flow.is_some() {
-            let count = self.add_step_option_count();
-            match key.code {
-                KeyCode::Up => {
-                    if let Some(flow) = self.add_flow.as_mut() {
-                        flow.cursor = flow.cursor.saturating_sub(1);
+        // The add/edit form is modal: while open it owns every key. Feed the key
+        // to the form under a short borrow that yields the event by value, so
+        // the arms below can touch `self` freely.
+        if self.form.is_some() {
+            let event = self
+                .form
+                .as_mut()
+                .map(|active| active.form.on_key(key))
+                .unwrap_or(FormEvent::Consumed);
+            match event {
+                FormEvent::Consumed => {}
+                FormEvent::Changed(field::ROOT) => {
+                    // Edit only: reveal (and default to No) the Move-files row
+                    // once the root folder differs from the movie's current one.
+                    if let Some(active) = self.form.as_mut()
+                        && matches!(active.mode, FormMode::Edit { .. })
+                    {
+                        let moved = active.form.changed(field::ROOT);
+                        if !moved {
+                            active.form.reset(field::MOVE_FILES);
+                        }
+                        active.form.set_visible(field::MOVE_FILES, moved);
                     }
                 }
-                KeyCode::Down => {
-                    if let Some(flow) = self.add_flow.as_mut() {
-                        flow.cursor = (flow.cursor + 1).min(count.saturating_sub(1));
-                    }
-                }
-                KeyCode::Enter => self.advance_add_flow(),
-                KeyCode::Esc | KeyCode::Char('q') => self.add_flow = None,
-                _ => {}
+                FormEvent::Changed(_) => {}
+                FormEvent::Save => self.commit_form(),
+                // Edit returns to the movie list/detail, add to the results
+                // list; the underlying `Level` is untouched either way.
+                FormEvent::Cancel => self.form = None,
             }
             return None;
         }
@@ -1584,6 +1710,7 @@ impl Browse {
                 }
             }
             KeyCode::Char('m') => self.toggle_monitored(),
+            KeyCode::Char('o') => self.start_edit_flow(),
             KeyCode::Char('r') => self.refresh(),
             KeyCode::Char('?') => self.show_full_help = !self.show_full_help,
             KeyCode::Char('q') => return Some(BrowseAction::Quit),
@@ -1616,7 +1743,8 @@ impl Browse {
         self.downloads.clamp(self.queue.len());
         let has_message = self.error.is_some() || self.notice.is_some();
         let show_filter = self.filter_active && matches!(self.level, Level::MovieList);
-        let show_add_input = matches!(self.level, Level::Add);
+        // The add search box gives way to the add form once it opens.
+        let show_add_input = matches!(self.level, Level::Add) && self.form.is_none();
         let show_input = show_filter || show_add_input;
         let help_height = if self.show_full_help {
             help::rows(&self.help_sections())
@@ -1645,12 +1773,17 @@ impl Browse {
         } else if show_add_input {
             self.draw_add_row(frame, rows[2]);
         }
-        match &self.level {
-            Level::MovieList => self.draw_movie_list(frame, rows[3]),
-            Level::MovieDetail { .. } => self.draw_movie_detail(frame, rows[3]),
-            Level::Search { .. } => self.draw_search(frame, rows[3]),
-            Level::Add => self.draw_add_results(frame, rows[3]),
-            Level::Downloads => self.draw_downloads(frame, rows[3]),
+        // An open form replaces the level content full-body.
+        if let Some(active) = &self.form {
+            active.form.draw(frame, rows[3], &active.title);
+        } else {
+            match &self.level {
+                Level::MovieList => self.draw_movie_list(frame, rows[3]),
+                Level::MovieDetail { .. } => self.draw_movie_detail(frame, rows[3]),
+                Level::Search { .. } => self.draw_search(frame, rows[3]),
+                Level::Add => self.draw_add_results(frame, rows[3]),
+                Level::Downloads => self.draw_downloads(frame, rows[3]),
+            }
         }
         self.draw_help(frame, rows[4]);
 
@@ -1684,11 +1817,6 @@ impl Browse {
                 }
             };
             prompt::draw_confirm(frame, area, question);
-        }
-        if self.add_flow.is_some() {
-            let cursor = self.add_flow.as_ref().map(|flow| flow.cursor).unwrap_or(0);
-            let (title, labels) = self.add_step_menu();
-            prompt::draw_menu(frame, area, title, &labels, cursor);
         }
         if let Some(prompt) = &self.delete_prompt {
             prompt.draw(frame, area);
@@ -2274,8 +2402,13 @@ impl Browse {
         if self.add_search_focused {
             return vec![("esc", "unfocus"), ("enter", "search")];
         }
-        if self.add_flow.is_some() {
-            return vec![("↑/↓", "move"), ("enter", "next"), ("esc", "cancel")];
+        if self.form.is_some() {
+            return vec![
+                ("↑/↓", "move"),
+                ("←/→", "change"),
+                ("enter", "select"),
+                ("esc", "cancel"),
+            ];
         }
         if self.confirm.is_some() {
             return vec![("y/enter", "confirm"), ("n/esc", "cancel")];
@@ -2314,6 +2447,7 @@ impl Browse {
                 }
                 entries.push(("s", "sort"));
                 entries.push(("m", "monitor"));
+                entries.push(("o", "options"));
             }
             Level::Downloads => {
                 entries.push(("esc", "back"));
@@ -2328,6 +2462,7 @@ impl Browse {
                 }
                 entries.push(("z", "delete"));
                 entries.push(("m", "monitor"));
+                entries.push(("o", "options"));
                 // Only offered when the overview is actually capped.
                 if self.overview_truncatable {
                     entries.push((
@@ -2412,13 +2547,21 @@ impl Browse {
 
 const SEARCH_MENU_OPTIONS: [&str; 3] = ["Auto search", "Interactive search", "Cancel"];
 
-/// Radarr's minimumAvailability options for the add wizard: (menu label, API
-/// value).
+/// Radarr's minimumAvailability options for the add/edit forms: (menu label,
+/// API value).
 const MIN_AVAILABILITY: [(&str, &str); 3] = [
     ("Announced", "announced"),
     ("In Cinemas", "inCinemas"),
     ("Released", "released"),
 ];
+
+/// The minimum-availability labels as owned strings for a form field.
+fn availability_choices() -> Vec<String> {
+    MIN_AVAILABILITY
+        .iter()
+        .map(|(label, _)| label.to_string())
+        .collect()
+}
 
 /// The add wizard pre-selects the first quality profile whose name contains
 /// "1080" (case-insensitive) so the common HD choice needs no scrolling,
@@ -2437,6 +2580,20 @@ fn released_availability_index() -> usize {
         .iter()
         .position(|(_, value)| *value == "released")
         .unwrap_or(0)
+}
+
+/// Index of the movie's current quality profile, or `None` if it no longer
+/// exists in the profile list.
+fn current_quality_index(profiles: &[QualityProfile], id: i64) -> Option<usize> {
+    profiles.iter().position(|p| p.id == id)
+}
+
+/// Index into `MIN_AVAILABILITY` for the movie's current value, falling back
+/// to "Released" (the add-wizard default) when unset or unrecognised.
+fn current_availability_index(current: Option<&str>) -> usize {
+    current
+        .and_then(|c| MIN_AVAILABILITY.iter().position(|(_, value)| *value == c))
+        .unwrap_or_else(released_availability_index)
 }
 
 #[cfg(test)]
@@ -2482,6 +2639,29 @@ mod tests {
     fn released_availability_index_matches_table() {
         assert_eq!(
             MIN_AVAILABILITY[released_availability_index()].1,
+            "released"
+        );
+    }
+
+    #[test]
+    fn current_quality_index_matches_id_else_none() {
+        let profiles = [profile(3, "SD"), profile(7, "HD-1080p")];
+        assert_eq!(current_quality_index(&profiles, 7), Some(1));
+        assert_eq!(current_quality_index(&profiles, 99), None);
+    }
+
+    #[test]
+    fn current_availability_index_maps_value_and_falls_back() {
+        assert_eq!(
+            MIN_AVAILABILITY[current_availability_index(Some("inCinemas"))].1,
+            "inCinemas"
+        );
+        assert_eq!(
+            MIN_AVAILABILITY[current_availability_index(None)].1,
+            "released"
+        );
+        assert_eq!(
+            MIN_AVAILABILITY[current_availability_index(Some("bogus"))].1,
             "released"
         );
     }

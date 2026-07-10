@@ -215,6 +215,33 @@ impl Client {
         Ok(())
     }
 
+    /// Edit a series' add-time options via the same bulk editor endpoint. Only
+    /// the changed fields are sent (a `None` leaves that option untouched);
+    /// `move_files` rides only when `root_folder_path` is set, telling Sonarr
+    /// whether to relocate existing files on disk to the new root.
+    pub async fn edit_series_options(
+        &self,
+        series_id: i64,
+        root_folder_path: Option<&str>,
+        move_files: bool,
+        quality_profile_id: Option<i64>,
+        series_type: Option<&str>,
+        season_folder: Option<bool>,
+    ) -> Result<(), Error> {
+        let body = series_editor_body(
+            series_id,
+            root_folder_path,
+            move_files,
+            quality_profile_id,
+            series_type,
+            season_folder,
+        );
+        self.transport
+            .send(Method::PUT, "/api/v3/series/editor", &[], Some(&body), None)
+            .await?;
+        Ok(())
+    }
+
     /// Toggle a season's monitored flag. Season monitoring lives inside the
     /// series object and there is no per-season editor, so fetch the series as
     /// raw JSON, flip the matching season, and PUT it back.
@@ -293,5 +320,73 @@ impl Client {
             )
             .await?;
         Ok(page.records)
+    }
+}
+
+/// Build the `series/editor` bulk-update body: always the id, plus only the
+/// fields that were supplied. `moveFiles` rides only alongside `rootFolderPath`,
+/// so an edit that doesn't change the root never asks Sonarr to relocate files.
+fn series_editor_body(
+    series_id: i64,
+    root_folder_path: Option<&str>,
+    move_files: bool,
+    quality_profile_id: Option<i64>,
+    series_type: Option<&str>,
+    season_folder: Option<bool>,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({ "seriesIds": [series_id] });
+    let object = body
+        .as_object_mut()
+        .expect("json! object literal is always an object");
+    if let Some(path) = root_folder_path {
+        object.insert("rootFolderPath".into(), serde_json::json!(path));
+        object.insert("moveFiles".into(), serde_json::json!(move_files));
+    }
+    if let Some(id) = quality_profile_id {
+        object.insert("qualityProfileId".into(), serde_json::json!(id));
+    }
+    if let Some(kind) = series_type {
+        object.insert("seriesType".into(), serde_json::json!(kind));
+    }
+    if let Some(season_folder) = season_folder {
+        object.insert("seasonFolder".into(), serde_json::json!(season_folder));
+    }
+    body
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn editor_body_sends_only_supplied_fields() {
+        // Quality only: no root, so neither rootFolderPath nor moveFiles ride.
+        assert_eq!(
+            series_editor_body(5, None, true, Some(7), None, None),
+            serde_json::json!({ "seriesIds": [5], "qualityProfileId": 7 })
+        );
+        // Root change carries moveFiles alongside it.
+        assert_eq!(
+            series_editor_body(5, Some("/tv4k"), true, None, None, None),
+            serde_json::json!({
+                "seriesIds": [5],
+                "rootFolderPath": "/tv4k",
+                "moveFiles": true,
+            })
+        );
+        // Series-type and season-folder ride independently of the root.
+        assert_eq!(
+            series_editor_body(5, None, false, None, Some("anime"), Some(false)),
+            serde_json::json!({
+                "seriesIds": [5],
+                "seriesType": "anime",
+                "seasonFolder": false,
+            })
+        );
+        // Nothing supplied: just the id (the caller guards against this).
+        assert_eq!(
+            series_editor_body(9, None, false, None, None, None),
+            serde_json::json!({ "seriesIds": [9] })
+        );
     }
 }

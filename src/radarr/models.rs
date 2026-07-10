@@ -40,6 +40,13 @@ pub struct Movie {
     pub ratings: Option<Ratings>,
     /// Embedded by GET /movie whenever the movie has a file.
     pub movie_file: Option<MovieFile>,
+    /// Add-time options, editable via the `o` wizard. Present on library
+    /// GET /movie; absent (defaulted) on lookup results, where the edit
+    /// wizard never opens.
+    pub quality_profile_id: i64,
+    /// "announced" | "inCinemas" | "released".
+    pub minimum_availability: Option<String>,
+    pub root_folder_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -91,6 +98,9 @@ mod tests {
             "hasFile": true,
             "movieFileId": 7,
             "sizeOnDisk": 33500000000,
+            "qualityProfileId": 3,
+            "minimumAvailability": "released",
+            "rootFolderPath": "/movies",
             "ratings": {
                 "imdb": { "votes": 1900000, "value": 8.7, "type": "user" },
                 "tmdb": { "votes": 33000, "value": 8.4, "type": "user" }
@@ -119,6 +129,9 @@ mod tests {
         assert_eq!(movie.id, 42);
         assert_eq!(movie.status.as_deref(), Some("released"));
         assert_eq!(movie.runtime, 169);
+        assert_eq!(movie.quality_profile_id, 3);
+        assert_eq!(movie.minimum_availability.as_deref(), Some("released"));
+        assert_eq!(movie.root_folder_path.as_deref(), Some("/movies"));
         let ratings = movie.ratings.as_ref().unwrap();
         assert!((ratings.tmdb.as_ref().unwrap().value - 8.4).abs() < f64::EPSILON);
         assert!((ratings.imdb.as_ref().unwrap().value - 8.7).abs() < f64::EPSILON);
