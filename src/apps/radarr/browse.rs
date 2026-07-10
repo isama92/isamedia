@@ -13,6 +13,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 
+use crate::apps::delete_prompt::{self, DeletePrompt};
 use crate::apps::downloads;
 use crate::event::AppSender;
 use crate::radarr::display::{self, MOVIE_SORTS, MovieSort, MovieStatus};
@@ -132,6 +133,9 @@ pub struct Browse {
     /// "Auto search / Interactive search / Cancel" popup cursor.
     search_menu: Option<usize>,
     confirm: Option<Confirm>,
+    /// The delete-movie prompt (files / import-list-exclusion toggles); modal
+    /// while set, opened with `z` on the detail.
+    delete_prompt: Option<DeletePrompt>,
     /// Cursor into the selected release's rejection list; `None` when closed.
     rejections_popup: Option<usize>,
 
@@ -207,6 +211,7 @@ impl Browse {
             sort_menu: None,
             search_menu: None,
             confirm: None,
+            delete_prompt: None,
             rejections_popup: None,
             add_search: TextInput::default(),
             add_search_focused: false,
@@ -480,6 +485,22 @@ impl Browse {
                 self.fetch_movies();
                 self.fetch_queue();
                 self.notice = Some("movie file deleted".into());
+            }
+            CommandKind::DeleteMovie(deleted_id) => {
+                // The movie is gone. Only leave its detail if the user is
+                // still looking at it: a delete landing after they navigated
+                // to another movie (the generation counter doesn't bump on
+                // navigation) must not yank them away. The refetch drops it
+                // from the list regardless.
+                if matches!(&self.level,
+                    Level::MovieDetail { movie } | Level::Search { movie }
+                        if movie.id == deleted_id)
+                {
+                    self.level = Level::MovieList;
+                }
+                self.fetch_movies();
+                self.fetch_queue();
+                self.notice = Some("movie deleted".into());
             }
             CommandKind::DeleteQueue => {
                 self.downloads.clear_marks();
@@ -1102,6 +1123,28 @@ impl Browse {
             }
             return None;
         }
+
+        // The delete-movie prompt is modal. Take it so the handler owns it
+        // (which ends the borrow before we touch `self`); it goes back only
+        // when the key was merely consumed — commit and cancel both close it.
+        if let Some(mut prompt) = self.delete_prompt.take() {
+            match prompt.handle_key(key) {
+                delete_prompt::DeleteAction::Commit {
+                    id,
+                    delete_files,
+                    add_exclusion,
+                } => {
+                    let client = self.client.clone();
+                    self.spawn_command(CommandKind::DeleteMovie(id), async move {
+                        client.delete_movie(id, delete_files, add_exclusion).await
+                    });
+                }
+                delete_prompt::DeleteAction::Cancelled => {}
+                delete_prompt::DeleteAction::Consumed => self.delete_prompt = Some(prompt),
+            }
+            return None;
+        }
+
         if let Some(selected) = self.sort_menu {
             match key.code {
                 KeyCode::Up | KeyCode::Char('k') => {
@@ -1283,6 +1326,17 @@ impl Browse {
                 Level::Downloads => self.downloads.begin_delete(&self.queue),
                 _ => {}
             },
+            KeyCode::Char('z') => {
+                if let Level::MovieDetail { movie } = &self.level {
+                    self.delete_prompt = Some(DeletePrompt::new(
+                        movie.id,
+                        movie
+                            .title
+                            .clone()
+                            .unwrap_or_else(|| "this movie".to_string()),
+                    ));
+                }
+            }
             KeyCode::Char('r') => self.refresh(),
             KeyCode::Char('?') => self.show_full_help = !self.show_full_help,
             KeyCode::Char('q') => return Some(BrowseAction::Quit),
@@ -1370,6 +1424,9 @@ impl Browse {
             let cursor = self.add_flow.as_ref().map(|flow| flow.cursor).unwrap_or(0);
             let (title, labels) = self.add_step_menu();
             prompt::draw_menu(frame, area, title, &labels, cursor);
+        }
+        if let Some(prompt) = &self.delete_prompt {
+            prompt.draw(frame, area);
         }
         self.downloads.draw_prompt(frame, area);
     }
@@ -1903,6 +1960,14 @@ impl Browse {
         if self.confirm.is_some() {
             return vec![("y/enter", "confirm"), ("n/esc", "cancel")];
         }
+        if self.delete_prompt.is_some() {
+            return vec![
+                ("j/k", "move"),
+                ("space", "toggle"),
+                ("enter", "delete"),
+                ("esc", "cancel"),
+            ];
+        }
         if self.downloads.is_prompting() {
             return vec![
                 ("j/k", "move"),
@@ -1943,6 +2008,7 @@ impl Browse {
                 if movie.movie_file.is_some() {
                     entries.push(("x", "delete file"));
                 }
+                entries.push(("z", "delete"));
                 entries.push(("v", "overview"));
             }
             Level::Search { .. } => {
@@ -2008,6 +2074,7 @@ impl Browse {
             ],
             &[
                 ("x", "delete file / rejections"),
+                ("z", "delete movie"),
                 ("! ✓", "rejected / grabbed before"),
                 ("↓", "downloading"),
                 ("q", "quit"),
