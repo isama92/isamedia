@@ -20,8 +20,7 @@ runs).
   the current item and position, `s` stops playback
 - **Multi-app shell**: switch apps with `ctrl+←/→` or `ctrl+1..3`
   (Sonarr/Radarr are placeholders for now)
-- Log in once; the token is stored. Existing `jfsh` credentials are imported
-  automatically on first run.
+- Log in once; the token is stored and reused on later runs.
 
 ## Requirements
 
@@ -65,9 +64,8 @@ isamedia [OPTIONS]
 ## Configuration
 
 `~/.config/isamedia/config.toml` on Linux (`%APPDATA%\isamedia\` on Windows),
-created on first run. If it does not exist yet and a jfsh config is found at
-`~/.config/jfsh/jfsh.yaml`, its credentials are imported so you do not have to
-log in again.
+created on first run. The login screen collects host and credentials the
+first time; after that the stored token is used.
 
 ```toml
 last_app = "jellyfin"

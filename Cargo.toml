@@ -11,7 +11,6 @@ gethostname = "1.1.0"
 ratatui = "0.30.2"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
-serde_yaml = "0.9.34"
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "net"] }
 toml = "1.1.2"
