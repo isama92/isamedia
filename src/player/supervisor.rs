@@ -426,11 +426,10 @@ pub(super) async fn run(
                 // Command replies: surface failures (e.g. a rejected loadfile).
                 if msg.event.is_none() {
                     if let Some(error) = msg.error.as_deref().filter(|&e| e != "success") {
-                        tracing::warn!(
-                            error = %ipc::redact_secrets(error),
-                            line = %ipc::redact_secrets(&line),
-                            "mpv command failed"
-                        );
+                        // error is an mpv status string ("invalid parameter"),
+                        // never a token, and a substring of the already-redacted
+                        // line, so it is safe to log raw.
+                        tracing::warn!(error, line = %ipc::redact_secrets(&line), "mpv command failed");
                     }
                     continue;
                 }
