@@ -122,6 +122,8 @@ pub(super) async fn run(
             emit(PlayerEvent::Failed(format!(
                 "failed to launch mpv (is it installed and in PATH?): {err}"
             )));
+            // No socket exists yet, but the fallback 0700 directory does.
+            ipc::cleanup_socket(&socket);
             return;
         }
     };

@@ -249,7 +249,7 @@ impl JellyfinApp {
                         .as_ref()
                         .map(|(h, u, p)| (h.as_str(), u.as_str(), p.as_str())),
                 );
-                let plain_http = client.host.to_ascii_lowercase().starts_with("http://");
+                let plain_http = crate::jellyfin::url::is_plain_http(&client.host);
                 let mut browse = Browse::new(client, self.sender.clone());
                 if plain_http {
                     // The login form warns about this too, but auto-login
