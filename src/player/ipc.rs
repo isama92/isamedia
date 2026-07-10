@@ -61,7 +61,6 @@ pub struct MpvMessage {
     pub error: Option<String>,
     pub event: Option<String>,
     pub name: Option<String>,
-    pub reason: Option<String>,
     pub data: Option<Value>,
     pub playlist_entry_id: Option<i64>,
 }
@@ -110,7 +109,13 @@ pub fn play_file_cmd(url: &str, title: &str, start_secs: f64, old_mpv: bool) -> 
     if old_mpv {
         vec![json!("loadfile"), json!(url), json!("replace"), opts]
     } else {
-        vec![json!("loadfile"), json!(url), json!("replace"), json!(0), opts]
+        vec![
+            json!("loadfile"),
+            json!(url),
+            json!("replace"),
+            json!(0),
+            opts,
+        ]
     }
 }
 
@@ -119,7 +124,13 @@ pub fn append_file_cmd(url: &str, title: &str, old_mpv: bool) -> Vec<Value> {
     if old_mpv {
         vec![json!("loadfile"), json!(url), json!("append"), opts]
     } else {
-        vec![json!("loadfile"), json!(url), json!("append"), json!(0), opts]
+        vec![
+            json!("loadfile"),
+            json!(url),
+            json!("append"),
+            json!(0),
+            opts,
+        ]
     }
 }
 
