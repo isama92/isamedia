@@ -45,6 +45,14 @@ const SPINNER_FRAMES: [&str; 8] = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "�
 /// tab, the movie list itself shows download state, so polling runs on
 /// every level.
 const QUEUE_POLL_TICKS: u32 = 40;
+/// How many times the poll interval may double on repeated failures (~10s →
+/// ~80s) before it stops growing.
+const QUEUE_BACKOFF_MAX_SHIFT: u32 = 3;
+/// The fully-backed-off poll interval. Derived from the base and the shift cap
+/// so the two can't drift: it is exactly the interval at the last backoff step
+/// (`QUEUE_POLL_TICKS << QUEUE_BACKOFF_MAX_SHIFT`), which `queue_poll_interval`
+/// clamps to. Change the shift and the cap follows automatically.
+const QUEUE_POLL_MAX_TICKS: u32 = QUEUE_POLL_TICKS << QUEUE_BACKOFF_MAX_SHIFT;
 
 /// Right-hand column budget of a movie row: the status text and a gap
 /// (fits "unreleased 2026-09-12").
@@ -110,6 +118,17 @@ struct PendingEdit {
 /// What the browse screen wants its parent (the Radarr app) to do.
 pub enum BrowseAction {
     Quit,
+}
+
+/// The periodic queue-poll interval (in ticks) for a given backoff exponent:
+/// the base cadence doubled per failed poll, capped so a downed server is
+/// retried with growing intervals instead of a fixed loop. `checked_shl` keeps
+/// an out-of-range exponent from overflowing the shift.
+fn queue_poll_interval(backoff: u32) -> u32 {
+    QUEUE_POLL_TICKS
+        .checked_shl(backoff)
+        .unwrap_or(QUEUE_POLL_MAX_TICKS)
+        .min(QUEUE_POLL_MAX_TICKS)
 }
 
 /// A movie's "Title (Year)" label for the auto-search status line.
@@ -222,6 +241,15 @@ pub struct Browse {
     fetch_gen: u64,
     /// Generation of the latest queue poll, independent of list fetches.
     queue_gen: u64,
+    /// Backoff exponent for the periodic queue poll: 0 when healthy, bumped
+    /// (capped) on each failed poll so a downed server is retried with growing
+    /// intervals, reset on the next success.
+    queue_backoff: u32,
+    /// `tick_count` at the last periodic poll, so the (possibly backed-off)
+    /// interval is measured from when it actually last ran.
+    last_poll_tick: u32,
+    /// Whether this is the visible tab; the periodic poll pauses while hidden.
+    active: bool,
     has_fetched: bool,
     tick_count: u32,
     spinner_frame: usize,
@@ -278,6 +306,9 @@ impl Browse {
             gen_counter,
             fetch_gen: 0,
             queue_gen: 0,
+            queue_backoff: 0,
+            last_poll_tick: 0,
+            active: true,
             has_fetched: false,
             tick_count: 0,
             spinner_frame: 0,
@@ -294,11 +325,33 @@ impl Browse {
             self.spinner_frame = (self.spinner_frame + 1) % SPINNER_FRAMES.len();
         }
         self.tick_count = self.tick_count.wrapping_add(1);
-        // Every level shows download state, so the poll never pauses.
-        if self.tick_count.is_multiple_of(QUEUE_POLL_TICKS) {
+        // Every level shows download state, but only poll while this tab is
+        // visible: a hidden tab would otherwise poll the server forever.
+        // Auto-search monitors fetch the queue themselves when they need it,
+        // so pausing here can't stall them.
+        if self.active && self.queue_poll_due() {
+            self.last_poll_tick = self.tick_count;
             self.fetch_queue();
         }
         self.tick_monitors();
+    }
+
+    /// Whether the (possibly backed-off) periodic poll interval has elapsed.
+    fn queue_poll_due(&self) -> bool {
+        self.tick_count.wrapping_sub(self.last_poll_tick) >= queue_poll_interval(self.queue_backoff)
+    }
+
+    /// Called by the app when this tab shows or hides. While hidden the
+    /// periodic queue poll pauses; on return it resets the backoff and
+    /// refreshes the markers at once so they aren't left stale.
+    pub fn set_active(&mut self, active: bool) {
+        let returning = active && !self.active;
+        self.active = active;
+        if returning {
+            self.queue_backoff = 0;
+            self.last_poll_tick = self.tick_count;
+            self.fetch_queue();
+        }
     }
 
     /// Mark a list fetch as started and allocate its generation; any result
@@ -445,9 +498,15 @@ impl Browse {
             Ok(queue) => {
                 self.queue = queue;
                 self.downloads.prune(&self.queue);
+                self.queue_backoff = 0;
             }
             Err(crate::radarr::Error::Unauthorized) => return true,
-            Err(err) => tracing::debug!(%err, "queue poll failed"),
+            Err(err) => {
+                // Grow the poll interval so a downed server is retried with
+                // exponential backoff, not a fixed ~10s loop.
+                self.queue_backoff = (self.queue_backoff + 1).min(QUEUE_BACKOFF_MAX_SHIFT);
+                tracing::debug!(%err, "queue poll failed");
+            }
         }
         false
     }
@@ -656,37 +715,54 @@ impl Browse {
         add_gen: u64,
         result: Result<Box<Movie>, crate::radarr::Error>,
     ) -> bool {
-        if add_gen != self.add_gen {
-            return false; // superseded: the user left the add screen meanwhile
+        let is_current = add_gen == self.add_gen;
+        // A *failed* add the user has already left has nothing to surface, so
+        // drop it. A *successful* one still has work to do (below), so it falls
+        // through even when the user moved on.
+        if result.is_err() && !is_current {
+            return false;
         }
-        self.add_submitting = false;
-        if matches!(result, Err(crate::radarr::Error::Unauthorized)) {
-            return true;
-        }
-        self.loading = false;
         let pending_search = std::mem::take(&mut self.pending_search);
         match result {
             Ok(movie) => {
-                // Kick off the tracked background search before the movie is
-                // moved into the detail level.
+                // The add already succeeded server-side, so the tracked
+                // auto-search the user opted into and the library refetch run
+                // whether or not they are still on the add screen: the monitor
+                // is view-independent (see auto_search), and the refetch makes
+                // the new movie present when they next look. Only the
+                // navigation and the add-screen chrome are gated on staying.
                 if pending_search {
                     self.start_auto_search(movie.id, movie_label(&movie));
                 }
-                self.overview_expanded = false;
-                self.overview_scroll = 0;
-                self.level = Level::MovieDetail { movie: *movie };
-                self.add_results.clear();
-                self.add_results_raw.clear();
-                self.add_search.clear();
-                self.add_search_focused = false;
+                if is_current {
+                    self.add_submitting = false;
+                    self.overview_expanded = false;
+                    self.overview_scroll = 0;
+                    self.level = Level::MovieDetail { movie: *movie };
+                    self.add_results.clear();
+                    self.add_results_raw.clear();
+                    self.add_search.clear();
+                    self.add_search_focused = false;
+                }
                 self.fetch_movies();
                 self.fetch_queue();
-                // Set AFTER the refetch, which clears the notice row.
-                self.notice = Some("movie added".into());
+                if is_current {
+                    // Set AFTER the refetch, which clears the notice row.
+                    self.notice = Some("movie added".into());
+                }
+            }
+            // is_current is guaranteed here (stale errors returned above).
+            Err(crate::radarr::Error::Unauthorized) => {
+                self.add_submitting = false;
+                return true;
             }
             // The add failed (e.g. already in the library); stay on the
             // results so the user can pick something else.
-            Err(err) => self.error = Some(err.to_string()),
+            Err(err) => {
+                self.add_submitting = false;
+                self.loading = false;
+                self.error = Some(err.to_string());
+            }
         }
         false
     }
@@ -954,6 +1030,16 @@ impl Browse {
                 true
             }
             Level::Search { movie } => {
+                // The release search runs under a 120s timeout (see
+                // arr::RELEASE_SEARCH_TIMEOUT); bump the fetch generation so a
+                // result — or error — landing after we leave can't stamp
+                // `releases`/`error` onto the detail we return to. Only this
+                // level carries such a long-lived fetch: bumping on the other
+                // pops would instead drop a benign, often wanted, list refetch
+                // (e.g. the one a just-completed add fires).
+                self.fetch_gen = self.gen_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                self.loading = false;
+                self.error = None;
                 self.releases.clear();
                 self.history.clear();
                 self.overview_expanded = false;
@@ -2670,5 +2756,21 @@ mod tests {
             MIN_AVAILABILITY[current_availability_index(Some("bogus"))].1,
             "released"
         );
+    }
+
+    #[test]
+    fn queue_poll_interval_backs_off_and_caps() {
+        assert_eq!(queue_poll_interval(0), QUEUE_POLL_TICKS);
+        assert_eq!(queue_poll_interval(1), QUEUE_POLL_TICKS * 2);
+        assert_eq!(
+            queue_poll_interval(QUEUE_BACKOFF_MAX_SHIFT),
+            QUEUE_POLL_MAX_TICKS
+        );
+        // Beyond the cap (and an absurd shift) stays at the max, never overflows.
+        assert_eq!(
+            queue_poll_interval(QUEUE_BACKOFF_MAX_SHIFT + 4),
+            QUEUE_POLL_MAX_TICKS
+        );
+        assert_eq!(queue_poll_interval(64), QUEUE_POLL_MAX_TICKS);
     }
 }
