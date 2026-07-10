@@ -232,5 +232,14 @@ editing.
   the GitHub release, which triggers `release.yml` to build and attach the
   Linux/Windows/macOS binaries. `Cargo.toml` stays the source of truth for the
   version, so `isamedia --version` is always correct.
-- `publish = false` in `Cargo.toml` keeps this bin-only crate off crates.io;
-  release-plz only cuts git tags and GitHub releases.
+- This bin-only crate is never published to crates.io. That is enforced by
+  `publish = false` in `.github/release-plz.toml`, **not** in `Cargo.toml`: a
+  `publish = false` in the manifest marks the package non-publishable, which
+  makes release-plz's release step skip creating the git tag and GitHub release
+  altogether. Keep `Cargo.toml` publishable so release-plz can tag; do not
+  re-add `publish = false` there.
+- Because the crate is not on crates.io, release-plz can't read the last
+  released version from the registry, so `git_only = true` in
+  `.github/release-plz.toml` tells it to read the version from the `vX.Y.Z` git
+  tags instead. Without it, release-plz never opens a release PR ("nothing to
+  release").
