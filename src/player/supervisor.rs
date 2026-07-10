@@ -78,7 +78,7 @@ impl Ipc {
     async fn send(&mut self, command: &[Value]) -> std::io::Result<()> {
         self.request_id += 1;
         let encoded = ipc::encode_request(command, self.request_id);
-        tracing::debug!(command = %encoded.trim_end(), "mpv send");
+        tracing::debug!(command = %ipc::redact_secrets(encoded.trim_end()), "mpv send");
         self.writer.write_all(encoded.as_bytes()).await
     }
 }
@@ -160,11 +160,11 @@ pub(super) async fn run(
         let title = display::media_title(item);
         let command = if position == 0 {
             let start = ticks_to_seconds(display::resume_position_ticks(item));
-            ipc::play_file_cmd(&url, &title, start, old_mpv)
+            ipc::play_file_cmd(&url, &title, start, old_mpv, &client.token)
         } else if item_index > index {
-            ipc::append_file_cmd(&url, &title, old_mpv)
+            ipc::append_file_cmd(&url, &title, old_mpv, &client.token)
         } else {
-            ipc::prepend_file_cmd(&url, &title)
+            ipc::prepend_file_cmd(&url, &title, &client.token)
         };
         if let Err(err) = ipc.send(&command).await {
             tracing::error!(%err, "failed to load file into mpv");
@@ -277,7 +277,13 @@ pub(super) async fn run(
                         }
 
                         for subtitle in display::external_subtitles(&current) {
-                            let url = format!("{}{}", client.host, subtitle.path);
+                            // sub-add takes no per-file options, so the token
+                            // must ride in the URL; redact_secrets keeps it
+                            // out of the debug log.
+                            let url = format!(
+                                "{}{}?api_key={}",
+                                client.host, subtitle.path, client.token
+                            );
                             if let Err(err) = ipc
                                 .send(&ipc::sub_add_cmd(&url, &subtitle.title, &subtitle.language))
                                 .await
