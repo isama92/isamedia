@@ -11,7 +11,7 @@ pub mod models;
 use reqwest::{Method, StatusCode};
 use serde::de::DeserializeOwned;
 
-use models::{Page, QualityProfile, QueueItem, RootFolder};
+use models::{Command, Page, QualityProfile, QueueItem, RootFolder};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -174,6 +174,18 @@ impl Transport {
             }
         }
         Ok(records)
+    }
+
+    /// Poll one command's status by id. Used to track a background
+    /// auto-search to completion; the endpoint is identical on both backends.
+    pub async fn get_command(&self, command_id: i64) -> Result<Command, Error> {
+        self.request(
+            Method::GET,
+            &format!("/api/v3/command/{command_id}"),
+            &[],
+            None,
+        )
+        .await
     }
 
     /// Grab a release from the latest interactive search; the server looks
