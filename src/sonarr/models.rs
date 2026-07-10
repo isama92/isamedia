@@ -6,13 +6,17 @@
 use serde::Deserialize;
 
 pub use crate::arr::models::{
-    HistoryRecord, Language, MediaInfo, QualityWrapper, QueueItem, Release,
+    HistoryRecord, Language, MediaInfo, QualityProfile, QualityWrapper, QueueItem, Release,
+    RootFolder,
 };
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Series {
     pub id: i64,
+    /// TVDb id: the identity the add endpoint keys on. Populated on lookup
+    /// results (whose `id` is 0 until added) and on library series alike.
+    pub tvdb_id: Option<i64>,
     pub title: Option<String>,
     pub sort_title: Option<String>,
     pub overview: Option<String>,
@@ -184,5 +188,26 @@ mod tests {
         assert!(!episode.has_file);
         assert!(episode.episode_file.is_none());
         assert!(episode.air_date_utc.is_none());
+    }
+
+    #[test]
+    fn deserializes_lookup_result_without_id() {
+        // A series/lookup hit for something not yet in the library: id 0,
+        // but the tvdbId the add endpoint needs is present.
+        let raw = r#"{
+            "title": "Frieren",
+            "year": 2023,
+            "tvdbId": 424536,
+            "overview": "The elf mage Frieren.",
+            "seasons": [
+                { "seasonNumber": 0 },
+                { "seasonNumber": 1 }
+            ],
+            "ratings": { "value": 8.8 }
+        }"#;
+        let series: Series = serde_json::from_str(raw).unwrap();
+        assert_eq!(series.id, 0);
+        assert_eq!(series.tvdb_id, Some(424536));
+        assert_eq!(series.seasons.len(), 2);
     }
 }

@@ -283,6 +283,27 @@ impl MediaApp for SonarrApp {
                     self.on_session_expired();
                 }
             }
+            Msg::LookupLoaded { fetch_gen, result } => {
+                if let Screen::Browse(browse) = &mut self.screen
+                    && browse.on_lookup_loaded(fetch_gen, result)
+                {
+                    self.on_session_expired();
+                }
+            }
+            Msg::AddOptionsLoaded { prereq_gen, result } => {
+                if let Screen::Browse(browse) = &mut self.screen
+                    && browse.on_add_options_loaded(prereq_gen, result)
+                {
+                    self.on_session_expired();
+                }
+            }
+            Msg::SeriesAdded { fetch_gen, result } => {
+                if let Screen::Browse(browse) = &mut self.screen
+                    && browse.on_series_added(fetch_gen, result)
+                {
+                    self.on_session_expired();
+                }
+            }
             Msg::KeyringError(message) => {
                 tracing::warn!(message, "keyring problem");
                 if let Screen::Browse(browse) = &mut self.screen {
