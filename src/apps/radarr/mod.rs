@@ -276,9 +276,12 @@ impl MediaApp for RadarrApp {
                     self.on_session_expired();
                 }
             }
-            Msg::LookupLoaded { fetch_gen, result } => {
+            Msg::LookupLoaded {
+                add_lookup_gen,
+                result,
+            } => {
                 if let Screen::Browse(browse) = &mut self.screen
-                    && browse.on_lookup_loaded(fetch_gen, result)
+                    && browse.on_lookup_loaded(add_lookup_gen, result)
                 {
                     self.on_session_expired();
                 }
@@ -290,9 +293,9 @@ impl MediaApp for RadarrApp {
                     self.on_session_expired();
                 }
             }
-            Msg::MovieAdded { fetch_gen, result } => {
+            Msg::MovieAdded { add_gen, result } => {
                 if let Screen::Browse(browse) = &mut self.screen
-                    && browse.on_movie_added(fetch_gen, result)
+                    && browse.on_movie_added(add_gen, result)
                 {
                     self.on_session_expired();
                 }
