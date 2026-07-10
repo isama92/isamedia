@@ -1,8 +1,8 @@
 # isamedia
 
-A terminal client for your media stack. Browse your Jellyfin library and play
-it in [mpv](https://mpv.io), without leaving the terminal. Sonarr and Radarr
-support is planned; they already have (disabled) tabs in the UI.
+A terminal client for your media stack: browse and play your Jellyfin library
+in [mpv](https://mpv.io), and manage your Radarr movies and Sonarr series,
+without leaving the terminal.
 
 isamedia is a Rust rewrite and extension of
 [jfsh](https://github.com/hacel/jfsh), keeping feature parity while adding a
@@ -11,24 +11,46 @@ runs).
 
 ## Features
 
-- **Jellyfin**: Resume / Next Up / Recently Added / Search tabs, series
-  drill-down, client-side filtering, watched toggling
-- **Playback in mpv** with your own mpv config: direct play, resume from last
-  position, whole-series playlists for episodes, automatic progress reporting
-  back to Jellyfin, media segment skipping (intro/outro), external subtitles
-- **Non-blocking**: keep browsing while something plays; a status bar shows
-  the current item and position, `s` stops playback
-- **Multi-app shell**: switch apps with `ctrl+←/→` or `ctrl+1..4`
-  (Radarr/Sonarr are placeholders for now; a Settings tab picks the theme)
+### Jellyfin
+
+- Resume / Next Up / Recently Added / Libraries / Search tabs, series and
+  season drill-down, client-side filtering, a sort menu and an info panel.
+- Watched toggling that reports straight back to the server.
+- Audio and subtitle language preferences, with per-show overrides.
+
+### Radarr and Sonarr
+
+- Add movies and series, delete them (with or without files), toggle
+  monitoring, and edit options (quality profile, root folder, and so on).
+- A downloads queue with bulk removal, interactive release search, and
+  tracked auto-search that keeps you posted while it runs.
+
+### Playback (mpv)
+
+- Uses your own mpv config: direct play, resume from the last position,
+  whole-series playlists for episodes, automatic progress reporting back to
+  Jellyfin, media segment skipping (intro/outro), and external subtitles.
+- Non-blocking: keep browsing while something plays. A status bar shows the
+  current item and position, and `s` stops playback.
+
+### Shell and Settings
+
+- Switch apps with `ctrl+←/→` or `ctrl+1..4`. Each app owns its own keymap;
+  press `?` in any tab for the always-accurate contextual help.
+- The Settings tab covers the theme and accent, backend credentials
+  (Jellyfin, Radarr and Sonarr), and the Jellyfin language preferences.
 - Log in once; the token is stored in the OS keyring (Secret Service on
   Linux, Credential Manager on Windows) and reused on later runs.
 
 ## Requirements
 
 - mpv in `PATH`
-- A Jellyfin server (10.9+)
-- On Linux: a Secret Service keyring (GNOME Keyring or KWallet — present on
-  any normal desktop) for storing the login token
+- A Jellyfin server (10.9+; media segment skipping needs 10.10+, which added
+  the `/MediaSegments` API)
+- Optionally, a Radarr (v3+) and/or Sonarr (v4) server for the *arr tabs;
+  each speaks the v3 API
+- On Linux: a Secret Service keyring (GNOME Keyring or KWallet, present on
+  any normal desktop) for storing credentials
 
 ## Build
 
@@ -61,25 +83,71 @@ isamedia [OPTIONS]
 
 ### Keys
 
+Every app owns its own keymap, so the surest reference is the contextual help
+overlay: press `?` in any tab. It is generated from the same data as the
+status bar, so it can never drift from what the keys actually do. The tables
+below cover the common cases.
+
+**Common**
+
 | Key | Action |
 | --- | --- |
-| `ctrl+←/→`, `ctrl+1..4` | switch app |
-| `←/h` `→/l` | previous / next tab |
-| `↑/k` `↓/j`, `pgup/b/u`, `pgdn/f/d`, `g`, `G` | move around lists |
-| `enter` / `space` | play item / open series |
-| `esc` / `backspace` | back / clear |
-| `/` | search (Search tab) or filter the current list |
-| `w` | toggle watched |
+| `ctrl+c` | quit |
+| `ctrl+←/→` | previous / next app |
+| `ctrl+1..4` | jump to app (Jellyfin, Radarr, Sonarr, Settings) |
+| `↑` `↓` | move selection |
+| `←/→` or `pgup/pgdn` | previous / next page (in lists) |
+| `g` / `home`, `G` / `end` | start / end of list |
+| `enter` | open or confirm |
+| `esc` / `backspace` | back |
+| `/` | search or filter the current list |
 | `r` | refresh |
-| `s` | stop playback |
-| `?` | full help |
-| `q`, `ctrl+c` | quit |
+| `?` | contextual help overlay |
+| `ctrl+u` | clear the focused input |
+| `q` | quit (when not typing into an input) |
+
+**Jellyfin**
+
+| Key | Action |
+| --- | --- |
+| `tab` / `shift+tab` | switch content tab (Resume / Next Up / Recently Added / Libraries / Search) |
+| `enter` / `space` | play, or open a series / season |
+| `w` | toggle watched |
+| `i` | info panel |
+| `s` | stop playback if something is playing, otherwise open the sort menu |
+| `y` / `n` | confirm / cancel the replace-playback prompt |
+
+**Radarr and Sonarr**
+
+| Key | Action |
+| --- | --- |
+| `a` | add a movie / series |
+| `enter` | open; on a movie or episode, open the search menu (auto or interactive) |
+| `m` | toggle monitored |
+| `o` | edit options |
+| `s` | sort menu |
+| `i` | expand overview / episode info |
+| `d` | open the downloads queue |
+| `x` | delete file, remove from the queue, or show release rejections |
+| `z` | delete the movie / series |
+| `space` | mark an item in the downloads queue |
+
+**Settings**
+
+| Key | Action |
+| --- | --- |
+| `↑` `↓` | move between rows |
+| `enter` | open a row; in a form, save or advance |
+| `←/→` | cycle a select field in a credential form |
+| `tab` | move between form fields |
+| `esc` | cancel a form |
+| type | filter the language picker |
 
 ## Configuration
 
-`~/.config/isamedia/config.toml` on Linux (`%APPDATA%\isamedia\` on Windows),
-created on first run. The login screen collects host and credentials the
-first time; after that the stored token is used.
+`~/.config/isamedia/config.toml` on Linux (`%APPDATA%\isamedia\config\` on
+Windows), created on first run. The login screen collects host and credentials
+the first time; after that the stored token is used.
 
 ```toml
 last_app = "jellyfin"
@@ -93,13 +161,27 @@ device = "hostname"
 device_id = "..."          # generated
 user_id = "..."            # managed automatically
 skip_segments = []         # e.g. ["Intro", "Outro", "Recap", "Preview", "Commercial"]
+# Optional language preferences (usually set from the Settings tab).
+# Each is "default", "off", or an ISO 639-2/B code such as "ita".
+audio_language = "default"
+subtitle_language = "off"
+
+[radarr]                   # optional; omit if you don't use Radarr
+host = "https://radarr.example.com"
+
+[sonarr]                   # optional; omit if you don't use Sonarr
+host = "https://sonarr.example.com"
 ```
 
-The config file holds no secrets. The session token — and the password, if
-you enter one at login — are stored in the OS keyring under the `isamedia`
-service (`jellyfin-token` / `jellyfin-password`). The password is optional
-and only used to re-authenticate automatically when the token expires; leave
-the field empty at login to not store one.
+Per-show audio and subtitle overrides are kept in a `language_overrides.json`
+file next to `config.toml`, managed automatically.
+
+The config file holds no secrets. Credentials live in the OS keyring under the
+`isamedia` service: the Jellyfin session token and optional password
+(`jellyfin-token` / `jellyfin-password`), plus the Radarr and Sonarr API keys
+(`radarr-api-key` / `sonarr-api-key`). The Jellyfin password is optional and
+only used to re-authenticate automatically when the token expires; leave the
+field empty at login to not store one.
 
 ### Themes
 
@@ -134,8 +216,8 @@ with `git commit --no-verify`.
 
 Architecture notes: one central event loop (tokio mpsc channel); all state
 mutation is synchronous in the shell loop, every await lives in a spawned
-task. Apps implement the `MediaApp` trait (`src/app.rs`); adding Sonarr later
-means writing `src/apps/sonarr/` and registering it in
+task. Apps implement the `MediaApp` trait (`src/app.rs`); adding a new app
+means writing its module under `src/apps/` and registering it in
 `src/apps/mod.rs::build_apps`. mpv is driven over its JSON IPC socket by a
 supervisor task (`src/player/supervisor.rs`).
 
