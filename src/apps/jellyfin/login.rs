@@ -52,7 +52,9 @@ impl LoginForm {
         if self.host.value().is_empty() {
             return None;
         }
-        normalize_host(self.host.value()).err().map(|e| e.to_string())
+        normalize_host(self.host.value())
+            .err()
+            .map(|e| e.to_string())
     }
 
     fn valid(&self) -> bool {
@@ -155,8 +157,7 @@ impl LoginForm {
         } else if let Some(err) = &self.error {
             Line::styled(format!(" {err}"), theme::error()).render(rows[8], buf);
         } else {
-            Line::styled(" enter: next/submit  tab: next field", theme::dim())
-                .render(rows[8], buf);
+            Line::styled(" enter: next/submit  tab: next field", theme::dim()).render(rows[8], buf);
         }
     }
 }

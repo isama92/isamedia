@@ -19,10 +19,16 @@ pub enum PlayerCommand {
 #[derive(Debug)]
 pub enum PlayerEvent {
     /// A (new) file started playing in mpv.
-    Started { title: String },
+    Started {
+        title: String,
+    },
     /// Whole-second position updates.
-    Position { secs: f64 },
-    Duration { secs: f64 },
+    Position {
+        secs: f64,
+    },
+    Duration {
+        secs: f64,
+    },
     /// Something went wrong; shown as the browse error line.
     Failed(String),
     /// The player is gone. Always the final event, exactly once.
@@ -75,7 +81,9 @@ pub fn spawn(
                 }
                 Ok(_) => (vec![item], 0),
                 Err(err) => {
-                    emit(PlayerEvent::Failed(format!("failed to fetch episodes: {err}")));
+                    emit(PlayerEvent::Failed(format!(
+                        "failed to fetch episodes: {err}"
+                    )));
                     emit(PlayerEvent::Exited);
                     return;
                 }

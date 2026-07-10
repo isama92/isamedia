@@ -177,7 +177,10 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(item_title(&item), "Dune (2021) [45%]");
-        assert_eq!(item_description(&item), "Movie  | Rating: 8.0 | Runtime: 1h33m");
+        assert_eq!(
+            item_description(&item),
+            "Movie  | Rating: 8.0 | Runtime: 1h33m"
+        );
     }
 
     #[test]
@@ -229,7 +232,6 @@ mod tests {
                     index: Some(2),
                     language: Some("eng".into()),
                     display_title: Some("English SRT".into()),
-                    ..Default::default()
                 },
                 MediaStream {
                     kind: Some("Subtitle".into()),

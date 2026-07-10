@@ -36,6 +36,7 @@ fn format_clock(secs: f64) -> String {
     }
 }
 
+#[allow(clippy::large_enum_variant)] // single instance, size is irrelevant
 enum Screen {
     /// Not activated yet.
     Boot,
@@ -378,7 +379,10 @@ impl MediaApp for JellyfinApp {
         Some(ratatui::text::Line::from(vec![
             ratatui::text::Span::styled(" ⏵ ", theme::selected()),
             ratatui::text::Span::styled(player.now.title.clone(), theme::accent()),
-            ratatui::text::Span::styled(format!("  {timing}"), ratatui::style::Style::new().fg(theme::FG)),
+            ratatui::text::Span::styled(
+                format!("  {timing}"),
+                ratatui::style::Style::new().fg(theme::FG),
+            ),
             ratatui::text::Span::styled("  s: stop", theme::dim()),
         ]))
     }

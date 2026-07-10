@@ -149,7 +149,10 @@ impl Client {
     pub async fn get_resume(&self) -> Result<Vec<MediaItem>, Error> {
         self.get_items(
             "/UserItems/Resume",
-            &[("userId", self.user_id.as_str()), ("fields", "MediaStreams")],
+            &[
+                ("userId", self.user_id.as_str()),
+                ("fields", "MediaStreams"),
+            ],
         )
         .await
     }
@@ -230,22 +233,34 @@ impl Client {
     }
 
     pub async fn report_playback_progress(&self, item_id: &str, ticks: i64) -> Result<(), Error> {
-        self.report("/Sessions/Playing/Progress", item_id, ticks).await
+        self.report("/Sessions/Playing/Progress", item_id, ticks)
+            .await
     }
 
     pub async fn report_playback_stopped(&self, item_id: &str, ticks: i64) -> Result<(), Error> {
-        self.report("/Sessions/Playing/Stopped", item_id, ticks).await
+        self.report("/Sessions/Playing/Stopped", item_id, ticks)
+            .await
     }
 
     pub async fn mark_watched(&self, item_id: &str) -> Result<(), Error> {
-        self.send(Method::POST, &format!("/UserPlayedItems/{item_id}"), &[], None)
-            .await?;
+        self.send(
+            Method::POST,
+            &format!("/UserPlayedItems/{item_id}"),
+            &[],
+            None,
+        )
+        .await?;
         Ok(())
     }
 
     pub async fn mark_unwatched(&self, item_id: &str) -> Result<(), Error> {
-        self.send(Method::DELETE, &format!("/UserPlayedItems/{item_id}"), &[], None)
-            .await?;
+        self.send(
+            Method::DELETE,
+            &format!("/UserPlayedItems/{item_id}"),
+            &[],
+            None,
+        )
+        .await?;
         Ok(())
     }
 

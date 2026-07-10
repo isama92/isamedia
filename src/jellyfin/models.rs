@@ -127,8 +127,7 @@ mod tests {
 
     #[test]
     fn unknown_kind_falls_back() {
-        let item: MediaItem =
-            serde_json::from_str(r#"{"Id": "x", "Type": "MusicAlbum"}"#).unwrap();
+        let item: MediaItem = serde_json::from_str(r#"{"Id": "x", "Type": "MusicAlbum"}"#).unwrap();
         assert_eq!(item.kind, ItemKind::Other);
     }
 

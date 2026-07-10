@@ -5,7 +5,6 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 
-use crate::app::ShellRequest;
 use crate::event::AppSender;
 use crate::jellyfin::{Client, MediaItem, display, models::ItemKind};
 use crate::ui::input::TextInput;
@@ -47,6 +46,7 @@ impl Tab {
 }
 
 /// What the browse screen wants its parent (the Jellyfin app) to do.
+#[allow(clippy::large_enum_variant)] // one short-lived value, size is irrelevant
 pub enum BrowseAction {
     Quit,
     /// Play this item; if it is an episode, play it within its series.
@@ -194,7 +194,9 @@ impl Browse {
                 .iter()
                 .filter(|item| {
                     display::item_title(item).to_lowercase().contains(&needle)
-                        || display::item_description(item).to_lowercase().contains(&needle)
+                        || display::item_description(item)
+                            .to_lowercase()
+                            .contains(&needle)
                 })
                 .cloned()
                 .collect();
@@ -509,7 +511,14 @@ impl Browse {
                 entries.push(("esc", "clear"));
             }
         }
-        entries.push(("?", if self.show_full_help { "close help" } else { "help" }));
+        entries.push((
+            "?",
+            if self.show_full_help {
+                "close help"
+            } else {
+                "help"
+            },
+        ));
         entries.push(("q", "quit"));
         entries
     }
@@ -546,11 +555,7 @@ impl Browse {
                 ("/", "search/filter"),
                 ("esc", "clear/back"),
             ],
-            &[
-                ("w", "toggle watched"),
-                ("q", "quit"),
-                ("?", "close help"),
-            ],
+            &[("w", "toggle watched"), ("q", "quit"), ("?", "close help")],
         ];
         let areas = Layout::horizontal([
             Constraint::Length(26),

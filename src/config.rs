@@ -136,10 +136,14 @@ mod tests {
 
     #[test]
     fn roundtrip() {
-        let mut config = Config::default();
-        config.last_app = Some("jellyfin".into());
-        config.jellyfin.host = "https://demo.jellyfin.org".into();
-        config.jellyfin.skip_segments = vec!["Intro".into(), "Outro".into()];
+        let config = Config {
+            last_app: Some("jellyfin".into()),
+            jellyfin: JellyfinConfig {
+                host: "https://demo.jellyfin.org".into(),
+                skip_segments: vec!["Intro".into(), "Outro".into()],
+                ..JellyfinConfig::default()
+            },
+        };
         let raw = toml::to_string_pretty(&config).unwrap();
         let parsed: Config = toml::from_str(&raw).unwrap();
         assert_eq!(parsed.last_app.as_deref(), Some("jellyfin"));
