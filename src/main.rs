@@ -4,9 +4,11 @@ mod cli;
 mod config;
 mod event;
 mod jellyfin;
+mod net;
 mod player;
 mod secrets;
 mod shell;
+mod sonarr;
 mod ui;
 
 use std::sync::{Arc, Mutex};

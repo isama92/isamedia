@@ -1,32 +1,9 @@
 use super::Error;
 
-/// Validate and normalize a server host string: requires an http(s) scheme
-/// and a hostname, strips trailing slashes, keeps base paths
-/// (e.g. https://example.com/jellyfin).
+/// Validate and normalize a server host string; see `crate::net`. Wrapped
+/// here so callers inside the Jellyfin client keep getting `jellyfin::Error`.
 pub fn normalize_host(host: &str) -> Result<String, Error> {
-    let host = host.trim();
-    let scheme_end = host.find("://");
-    let rest = match scheme_end {
-        None => {
-            return Err(Error::InvalidHost(
-                "host must include http:// or https://".into(),
-            ));
-        }
-        Some(idx) => {
-            let scheme = host[..idx].to_ascii_lowercase();
-            if scheme != "http" && scheme != "https" {
-                return Err(Error::InvalidHost(
-                    "host must use http:// or https://".into(),
-                ));
-            }
-            &host[idx + 3..]
-        }
-    };
-    let hostname = rest.split('/').next().unwrap_or("");
-    if hostname.is_empty() {
-        return Err(Error::InvalidHost("host must include a hostname".into()));
-    }
-    Ok(host.trim_end_matches('/').to_string())
+    crate::net::normalize_host(host).map_err(|err| Error::InvalidHost(err.to_string()))
 }
 
 pub fn stream_url(host: &str, item_id: &str) -> Result<String, Error> {
@@ -34,34 +11,11 @@ pub fn stream_url(host: &str, item_id: &str) -> Result<String, Error> {
     Ok(format!("{host}/videos/{item_id}/stream?static=true"))
 }
 
-/// True when the host uses unencrypted http://, so callers can warn that
-/// credentials and traffic cross the network in cleartext.
-pub fn is_plain_http(host: &str) -> bool {
-    host.trim().to_ascii_lowercase().starts_with("http://")
-}
+pub use crate::net::is_plain_http;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // Ported from jfsh internal/jellyfin/url_test.go
-    #[test]
-    fn normalize_host_cases() {
-        assert_eq!(
-            normalize_host("https://example.com").unwrap(),
-            "https://example.com"
-        );
-        assert_eq!(
-            normalize_host("http://example.com/").unwrap(),
-            "http://example.com"
-        );
-        assert_eq!(
-            normalize_host("https://example.com/jellyfin/").unwrap(),
-            "https://example.com/jellyfin"
-        );
-        assert!(normalize_host("example.com").is_err());
-        assert!(normalize_host("ftp://example.com").is_err());
-    }
 
     #[test]
     fn streaming_url() {
@@ -73,5 +27,13 @@ mod tests {
             .unwrap(),
             "https://example.com/jellyfin/videos/127ac3264ae6ff99c33b9bfce1f0b160/stream?static=true"
         );
+    }
+
+    #[test]
+    fn wraps_net_validation_into_jellyfin_error() {
+        assert!(matches!(
+            normalize_host("example.com"),
+            Err(Error::InvalidHost(_))
+        ));
     }
 }
