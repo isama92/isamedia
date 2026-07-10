@@ -18,8 +18,8 @@ runs).
   back to Jellyfin, media segment skipping (intro/outro), external subtitles
 - **Non-blocking**: keep browsing while something plays; a status bar shows
   the current item and position, `s` stops playback
-- **Multi-app shell**: switch apps with `ctrl+←/→` or `ctrl+1..3`
-  (Sonarr/Radarr are placeholders for now)
+- **Multi-app shell**: switch apps with `ctrl+←/→` or `ctrl+1..4`
+  (Radarr/Sonarr are placeholders for now; a Settings tab picks the theme)
 - Log in once; the token is stored in the OS keyring (Secret Service on
   Linux, Credential Manager on Windows) and reused on later runs.
 
@@ -63,8 +63,7 @@ isamedia [OPTIONS]
 
 | Key | Action |
 | --- | --- |
-| `ctrl+←/→`, `ctrl+1..3` | switch app |
-| `ctrl+t` | choose colour theme |
+| `ctrl+←/→`, `ctrl+1..4` | switch app |
 | `←/h` `→/l` | previous / next tab |
 | `↑/k` `↓/j`, `pgup/b/u`, `pgdn/f/d`, `g`, `G` | move around lists |
 | `enter` / `space` | play item / open series |
@@ -85,6 +84,7 @@ first time; after that the stored token is used.
 ```toml
 last_app = "jellyfin"
 theme = "latte"            # "latte" or "solarized-light"
+accent = "rosewater"       # latte accents: rosewater, mauve, green, sky, lavender
 
 [jellyfin]
 host = "https://jellyfin.example.com"   # http(s), base paths supported
@@ -103,11 +103,13 @@ the field empty at login to not store one.
 
 ### Themes
 
-Two light themes ship: Catppuccin Latte (default) and Solarized Light. Press
-`ctrl+t` to open the picker, choose with the arrow keys and `enter`, and the
-choice is saved to `theme` in the config. Both are light themes that only set
-foreground colours and leave your terminal's own background alone, so they look
-best on a light terminal.
+Two light themes ship: Catppuccin Latte (default) and Solarized Light. Open the
+Settings tab (`ctrl+4`), press `enter` on a row to open its choice list, pick
+with the arrow keys and `enter`. Catppuccin Latte also offers five accent
+colours (rosewater, mauve, green, sky, lavender); Solarized Light has none.
+Selections are saved to `theme` and `accent` in the config. Both are light
+themes that only set foreground colours and leave your terminal's own background
+alone, so they look best on a light terminal.
 
 ## Development
 
@@ -141,3 +143,4 @@ supervisor task (`src/player/supervisor.rs`).
 
 Behaviour, keybindings and the Jellyfin/mpv integration are ported from
 [jfsh](https://github.com/hacel/jfsh) by hacel (public domain / Unlicense).
+
