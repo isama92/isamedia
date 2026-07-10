@@ -37,6 +37,17 @@ cargo build --release
 ./target/release/isamedia
 ```
 
+To install it as a command on your PATH (into `~/.cargo/bin`):
+
+```sh
+cargo install --locked --path .
+isamedia
+```
+
+`--locked` reuses the exact dependency versions from `Cargo.lock`. The binary
+is a snapshot, so re-run the command to pick up later source changes; remove
+it with `cargo uninstall isamedia`.
+
 Linux and Windows are supported (macOS should work too, but is untested).
 
 ## Usage
