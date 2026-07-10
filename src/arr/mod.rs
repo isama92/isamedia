@@ -189,6 +189,34 @@ impl Transport {
         .await?;
         Ok(())
     }
+
+    /// Remove queue items by id via the bulk endpoint (which also covers the
+    /// single-item case, so there is one code path). `remove_from_client`
+    /// deletes the partial data from the download client; `blocklist` marks
+    /// the release so it is not grabbed again.
+    pub async fn delete_queue_items(
+        &self,
+        ids: &[i64],
+        remove_from_client: bool,
+        blocklist: bool,
+    ) -> Result<(), Error> {
+        let body = serde_json::json!({ "ids": ids });
+        self.send(
+            Method::DELETE,
+            "/api/v3/queue/bulk",
+            &[
+                (
+                    "removeFromClient",
+                    if remove_from_client { "true" } else { "false" },
+                ),
+                ("blocklist", if blocklist { "true" } else { "false" }),
+            ],
+            Some(&body),
+            None,
+        )
+        .await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

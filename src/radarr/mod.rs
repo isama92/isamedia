@@ -41,6 +41,18 @@ impl Client {
         self.transport.get_queue(&[]).await
     }
 
+    /// Remove queue items by id. See `arr::Transport::delete_queue_items`.
+    pub async fn delete_queue_items(
+        &self,
+        ids: &[i64],
+        remove_from_client: bool,
+        blocklist: bool,
+    ) -> Result<(), Error> {
+        self.transport
+            .delete_queue_items(ids, remove_from_client, blocklist)
+            .await
+    }
+
     /// Look up movies to add, by free text or by `tmdb:<id>` / `imdb:<id>`;
     /// the server parses the prefix itself, so id searches need no special
     /// handling. Returned as raw JSON: POST /movie requires fields the typed
