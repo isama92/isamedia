@@ -187,9 +187,13 @@ impl Browse {
         self.fetch();
     }
 
-    /// Refetch after playback so progress/watched state is fresh.
+    /// Refetch after playback so progress/watched state is fresh. A playback
+    /// failure (e.g. mpv missing) survives the refetch's error reset;
+    /// otherwise it would flash for a single tick and vanish.
     pub fn on_playback_finished(&mut self) {
+        let playback_error = self.error.take();
         self.fetch();
+        self.error = playback_error;
     }
 
     fn apply_filter(&mut self) {
