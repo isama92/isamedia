@@ -189,14 +189,13 @@ impl Config {
     }
 }
 
+/// Distinguishes concurrent temp files written by this process.
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 /// Write a settings file owner-only, creating its directory if needed. No
 /// secrets go through here, but the files still name your server, account
 /// and watched shows; create them 0600 from the start rather than chmodding
 /// after the fact, so they are never world-readable even briefly.
-/// Distinguishes concurrent temp files written by this process (see
-/// `write_owner_only`).
-static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
 fn write_owner_only(path: &Path, raw: &str) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)
