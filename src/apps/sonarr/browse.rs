@@ -45,12 +45,14 @@ const SPINNER_FRAMES: [&str; 8] = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "�
 
 /// Queue polls fire every this many 250ms ticks (~10s) while inside a show.
 const QUEUE_POLL_TICKS: u32 = 40;
-/// Cap on the backed-off poll interval (~80s): a downed server is retried with
-/// exponential backoff rather than hammered every ~10s.
-const QUEUE_POLL_MAX_TICKS: u32 = QUEUE_POLL_TICKS * 8;
-/// Cap on [`Browse::queue_backoff`] so `QUEUE_POLL_TICKS << backoff` stays at
-/// or below `QUEUE_POLL_MAX_TICKS` and never overflows.
+/// How many times the poll interval may double on repeated failures (~10s →
+/// ~80s) before it stops growing.
 const QUEUE_BACKOFF_MAX_SHIFT: u32 = 3;
+/// The fully-backed-off poll interval. Derived from the base and the shift cap
+/// so the two can't drift: it is exactly the interval at the last backoff step
+/// (`QUEUE_POLL_TICKS << QUEUE_BACKOFF_MAX_SHIFT`), which `queue_poll_interval`
+/// clamps to. Change the shift and the cap follows automatically.
+const QUEUE_POLL_MAX_TICKS: u32 = QUEUE_POLL_TICKS << QUEUE_BACKOFF_MAX_SHIFT;
 
 /// Right-hand column budget of an episode row: air date, status, a gap.
 const EPISODE_META_WIDTH: u16 = 34;
@@ -1180,17 +1182,6 @@ impl Browse {
     fn pop_level(&mut self) -> bool {
         // Esc/back while the pickers are still loading cancels a deferred `o`.
         self.pending_edit = None;
-        if matches!(self.level, Level::SeriesList) {
-            return false;
-        }
-        // Leaving a level supersedes whatever it has in flight. A release
-        // search runs under a 120s timeout (see arr::RELEASE_SEARCH_TIMEOUT),
-        // so without bumping the generation its result — or its error — could
-        // land minutes later and stamp `releases`/`error` onto the level we
-        // popped back to. The Add arm bumps its own add_* generations too.
-        self.fetch_gen = self.gen_counter.fetch_add(1, Ordering::Relaxed) + 1;
-        self.loading = false;
-        self.error = None;
         match std::mem::replace(&mut self.level, Level::SeriesList) {
             Level::SeriesList => false,
             Level::Downloads => {
@@ -1207,6 +1198,16 @@ impl Browse {
                 true
             }
             Level::Search { series, season, .. } => {
+                // The release search runs under a 120s timeout (see
+                // arr::RELEASE_SEARCH_TIMEOUT); bump the fetch generation so a
+                // result — or error — landing after we leave can't stamp
+                // `releases`/`error` onto the episode list we return to. Only
+                // this level carries such a long-lived fetch: bumping on the
+                // other pops would instead drop a benign, often wanted, list
+                // refetch (e.g. the one a just-completed add fires).
+                self.fetch_gen = self.gen_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                self.loading = false;
+                self.error = None;
                 self.releases.clear();
                 self.history.clear();
                 self.level = Level::Episodes { series, season };
