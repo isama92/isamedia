@@ -3,10 +3,15 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::ui::theme::Theme;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub last_app: Option<String>,
+    // Declared before the `jellyfin` table: TOML puts bare keys before tables,
+    // so a field placed after it would serialise into the wrong section.
+    pub theme: Theme,
     pub jellyfin: JellyfinConfig,
 }
 
@@ -95,6 +100,7 @@ mod tests {
     fn roundtrip() {
         let config = Config {
             last_app: Some("jellyfin".into()),
+            theme: Theme::SolarizedLight,
             jellyfin: JellyfinConfig {
                 host: "https://demo.jellyfin.org".into(),
                 skip_segments: vec!["Intro".into(), "Outro".into()],
@@ -104,6 +110,7 @@ mod tests {
         let raw = toml::to_string_pretty(&config).unwrap();
         let parsed: Config = toml::from_str(&raw).unwrap();
         assert_eq!(parsed.last_app.as_deref(), Some("jellyfin"));
+        assert_eq!(parsed.theme, Theme::SolarizedLight);
         assert_eq!(parsed.jellyfin.host, config.jellyfin.host);
         assert_eq!(parsed.jellyfin.skip_segments, config.jellyfin.skip_segments);
     }
@@ -114,6 +121,27 @@ mod tests {
         assert_eq!(parsed.jellyfin.host, "http://x");
         assert!(parsed.jellyfin.user_id.is_empty());
         assert!(parsed.last_app.is_none());
+        // A config with no theme key defaults, so old files load unchanged.
+        assert_eq!(parsed.theme, Theme::Latte);
+    }
+
+    #[test]
+    fn theme_serialises_kebab_case() {
+        let config = Config {
+            theme: Theme::SolarizedLight,
+            ..Config::default()
+        };
+        let raw = toml::to_string_pretty(&config).unwrap();
+        assert!(raw.contains("theme = \"solarized-light\""));
+        let parsed: Config = toml::from_str("theme = \"latte\"\n").unwrap();
+        assert_eq!(parsed.theme, Theme::Latte);
+    }
+
+    #[test]
+    fn unknown_theme_is_rejected() {
+        // The enum is strict: a hand-edited unknown value fails to parse like
+        // any other malformed TOML, rather than silently resetting.
+        assert!(toml::from_str::<Config>("theme = \"nord\"\n").is_err());
     }
 
     #[test]
