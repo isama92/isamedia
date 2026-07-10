@@ -117,13 +117,12 @@ impl Transport {
         query: &[(&str, &str)],
         timeout: Option<std::time::Duration>,
     ) -> Result<T, Error> {
-        let response = self.send(method, path, query, None, timeout).await?;
-        Ok(response.json().await?)
+        self.send_json(method, path, query, None, timeout).await
     }
 
-    /// Like [`request`](Self::request) but forwards a body and reads the
-    /// response back; the add endpoints POST a payload and return the created
-    /// item, which the UI navigates straight to.
+    /// Like [`request`](Self::request) but forwards a body; the add endpoints
+    /// POST a payload and return the created item, which the UI navigates
+    /// straight to.
     pub(crate) async fn send_json<T: DeserializeOwned>(
         &self,
         method: Method,

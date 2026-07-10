@@ -63,8 +63,10 @@ impl Client {
 
     /// Look up series to add, by free text or by `tvdb:<id>`; the server
     /// parses the prefix itself, so id searches need no special handling.
-    /// Hits are shaped like library series but have id 0.
-    pub async fn lookup_series(&self, term: &str) -> Result<Vec<Series>, Error> {
+    /// Returned as raw JSON: POST /series requires fields the typed `Series`
+    /// doesn't carry (titleSlug, images, the full seasons array), so the add
+    /// forwards the whole lookup object back rather than a hand-built subset.
+    pub async fn lookup_series(&self, term: &str) -> Result<Vec<serde_json::Value>, Error> {
         self.transport
             .request(
                 Method::GET,
@@ -75,8 +77,9 @@ impl Client {
             .await
     }
 
-    /// Add a series from a built payload and return the created series (with
-    /// its new id), so the UI can open its detail straight away.
+    /// Add a series from a lookup object augmented with the user's choices,
+    /// and return the created series (with its new id) so the UI can open its
+    /// detail straight away.
     pub async fn add_series(&self, body: &serde_json::Value) -> Result<Series, Error> {
         self.transport
             .send_json(Method::POST, "/api/v3/series", &[], Some(body), None)
