@@ -1,6 +1,7 @@
 pub mod coming_soon;
 pub mod jellyfin;
 pub mod settings;
+pub mod sonarr;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -23,10 +24,14 @@ pub fn build_apps(
         Box::new(jellyfin::JellyfinApp::new(
             config.clone(),
             config_path.clone(),
-            AppSender::new("jellyfin", tx),
+            AppSender::new("jellyfin", tx.clone()),
         )),
         Box::new(coming_soon::ComingSoonApp::new("radarr", "Radarr")),
-        Box::new(coming_soon::ComingSoonApp::new("sonarr", "Sonarr")),
+        Box::new(sonarr::SonarrApp::new(
+            config.clone(),
+            config_path.clone(),
+            AppSender::new("sonarr", tx),
+        )),
         // Purely local: owns the config to read/write settings, needs no sender.
         Box::new(settings::SettingsApp::new(config, config_path)),
     ]
