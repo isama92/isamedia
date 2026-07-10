@@ -3,6 +3,7 @@ mod apps;
 mod cli;
 mod config;
 mod event;
+mod jellyfin;
 mod shell;
 mod ui;
 
