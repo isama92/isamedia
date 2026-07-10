@@ -61,7 +61,9 @@ enum Confirm {
     Grab { index: usize },
 }
 
-/// One step of the add wizard, in order. Radarr walks all five.
+/// One step of the add wizard, in order. Radarr walks all five; each opens
+/// pre-selected on a sensible default (first root folder, a 1080p quality
+/// profile, "Released" availability) that the user can still change.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AddStep {
     RootFolder,
@@ -866,13 +868,16 @@ impl Browse {
                 Some("add options unavailable: need a root folder and a quality profile".into());
             return;
         }
+        // Each step opens pre-selected on a sensible default; the cursor for
+        // the quality and availability steps is set as they open (see
+        // `advance_add_flow`), the root folder simply starts on the first.
         self.add_flow = Some(AddFlow {
             result: self.add_cursor,
             step: AddStep::RootFolder,
             cursor: 0,
             root_folder: None,
             quality_profile_id: None,
-            min_availability: 0,
+            min_availability: released_availability_index(),
             monitored: true,
             search: true,
         });
@@ -956,9 +961,16 @@ impl Browse {
         }
         match step.next() {
             Some(next) => {
+                // Open each step on its smart default; unlisted steps start
+                // at their first option.
+                let next_cursor = match next {
+                    AddStep::QualityProfile => preferred_quality_index(&self.quality_profiles),
+                    AddStep::MinAvailability => released_availability_index(),
+                    _ => 0,
+                };
                 if let Some(flow) = self.add_flow.as_mut() {
                     flow.step = next;
-                    flow.cursor = 0;
+                    flow.cursor = next_cursor;
                 }
             }
             None => self.commit_add(),
@@ -2116,3 +2128,70 @@ const MIN_AVAILABILITY: [(&str, &str); 3] = [
     ("In Cinemas", "inCinemas"),
     ("Released", "released"),
 ];
+
+/// The add wizard pre-selects the first quality profile whose name contains
+/// "1080" (case-insensitive) so the common HD choice needs no scrolling,
+/// falling back to the first profile when none match.
+fn preferred_quality_index(profiles: &[QualityProfile]) -> usize {
+    profiles
+        .iter()
+        .position(|p| p.name.to_lowercase().contains("1080"))
+        .unwrap_or(0)
+}
+
+/// Index of the "Released" minimum-availability option so the step opens on
+/// it; falls back to the first option if the table is ever reordered.
+fn released_availability_index() -> usize {
+    MIN_AVAILABILITY
+        .iter()
+        .position(|(_, value)| *value == "released")
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn profile(id: i64, name: &str) -> QualityProfile {
+        QualityProfile {
+            id,
+            name: name.to_string(),
+        }
+    }
+
+    #[test]
+    fn preferred_quality_index_picks_first_1080() {
+        let profiles = [
+            profile(1, "Any"),
+            profile(2, "SD"),
+            profile(3, "HD-1080p"),
+            profile(4, "Ultra-HD"),
+        ];
+        assert_eq!(preferred_quality_index(&profiles), 2);
+    }
+
+    #[test]
+    fn preferred_quality_index_is_case_insensitive() {
+        let profiles = [profile(1, "Any"), profile(2, "HD - 1080P")];
+        assert_eq!(preferred_quality_index(&profiles), 1);
+    }
+
+    #[test]
+    fn preferred_quality_index_falls_back_to_first() {
+        let profiles = [profile(1, "Any"), profile(2, "SD"), profile(3, "HD-720p")];
+        assert_eq!(preferred_quality_index(&profiles), 0);
+    }
+
+    #[test]
+    fn preferred_quality_index_empty_is_zero() {
+        assert_eq!(preferred_quality_index(&[]), 0);
+    }
+
+    #[test]
+    fn released_availability_index_matches_table() {
+        assert_eq!(
+            MIN_AVAILABILITY[released_availability_index()].1,
+            "released"
+        );
+    }
+}
