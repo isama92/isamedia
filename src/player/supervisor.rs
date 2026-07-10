@@ -69,6 +69,66 @@ fn inside_skippable_segment(segments: &[(f64, f64)], pos: f64) -> Option<f64> {
         .map(|(_, end)| *end)
 }
 
+/// A playback state report for the reporter task. Reports are sent
+/// fire-and-forget from the mpv event loop so a slow or unreachable server
+/// (30s request timeout) can never stall position updates, segment skips,
+/// or quit handling.
+enum Report {
+    Start { item_id: String, ticks: i64 },
+    Progress { item_id: String, ticks: i64 },
+    Stopped { item_id: String, ticks: i64 },
+}
+
+/// Reporter task: runs reports sequentially, preserving order. A backlog of
+/// progress reports for the same item collapses to the newest one, so an
+/// outage (enqueue every 3s, 30s timeout per attempt) cannot grow the queue.
+fn spawn_reporter(client: Client) -> (mpsc::UnboundedSender<Report>, tokio::task::JoinHandle<()>) {
+    let (tx, mut rx) = mpsc::unbounded_channel::<Report>();
+    let task = tokio::spawn(async move {
+        while let Some(mut report) = rx.recv().await {
+            while let Ok(next) = rx.try_recv() {
+                match (&report, &next) {
+                    (Report::Progress { item_id: a, .. }, Report::Progress { item_id: b, .. })
+                        if a == b =>
+                    {
+                        report = next;
+                    }
+                    _ => {
+                        send_report(&client, report).await;
+                        report = next;
+                    }
+                }
+            }
+            send_report(&client, report).await;
+        }
+    });
+    (tx, task)
+}
+
+async fn send_report(client: &Client, report: Report) {
+    let (kind, item, result) = match &report {
+        Report::Start { item_id, ticks } => (
+            "start",
+            item_id,
+            client.report_playback_start(item_id, *ticks).await,
+        ),
+        Report::Progress { item_id, ticks } => (
+            "progress",
+            item_id,
+            client.report_playback_progress(item_id, *ticks).await,
+        ),
+        Report::Stopped { item_id, ticks } => (
+            "stopped",
+            item_id,
+            client.report_playback_stopped(item_id, *ticks).await,
+        ),
+    };
+    match result {
+        Ok(()) => tracing::info!(kind, item = %item, "reported playback state"),
+        Err(err) => tracing::error!(%err, kind, item = %item, "failed to report playback state"),
+    }
+}
+
 struct Ipc {
     writer: WriteHalf<IpcStream>,
     request_id: u64,
@@ -189,6 +249,12 @@ pub(super) async fn run(
     let mut quit_deadline: Option<Instant> = None;
     let mut cmd_open = true;
 
+    let (report_tx, reporter) = spawn_reporter(client.clone());
+    // Media segment fetches land here; tagged with the item id so a result
+    // arriving after an auto-advance is dropped instead of applied.
+    let (seg_tx, mut seg_rx) =
+        mpsc::unbounded_channel::<(String, Vec<crate::jellyfin::MediaSegment>)>();
+
     loop {
         tokio::select! {
             line = lines.next_line() => {
@@ -227,15 +293,15 @@ pub(super) async fn run(
                             }
 
                             if last_report.elapsed() > PROGRESS_REPORT_INTERVAL {
-                                if let Err(err) = client
-                                    .report_playback_progress(&current.id, seconds_to_ticks(pos))
-                                    .await
-                                {
-                                    tracing::error!(%err, "failed to report progress");
-                                } else {
-                                    tracing::info!(item = %current.id, pos, "reported progress");
-                                    last_report = Instant::now();
-                                }
+                                // Fire-and-forget; the debounce advances no
+                                // matter how the report fares, so a down
+                                // server is attempted once per interval, not
+                                // on every time-pos event.
+                                let _ = report_tx.send(Report::Progress {
+                                    item_id: current.id.clone(),
+                                    ticks: seconds_to_ticks(pos),
+                                });
+                                last_report = Instant::now();
                             }
 
                             let second = pos.floor() as i64;
@@ -266,24 +332,37 @@ pub(super) async fn run(
                         current = items[item_index].clone();
                         tracing::info!(item = %current.id, "start-file");
 
-                        if let Err(err) = client
-                            .report_playback_start(&current.id, seconds_to_ticks(pos))
-                            .await
-                        {
-                            tracing::error!(%err, "failed to report playback start");
-                        }
+                        // `pos` still holds the previous file's position here.
+                        // Only the initially selected file was loaded with a
+                        // start= option (its resume position); every other
+                        // playlist entry begins at 0.
+                        pos = if item_index == index {
+                            ticks_to_seconds(display::resume_position_ticks(&current))
+                        } else {
+                            0.0
+                        };
+
+                        let _ = report_tx.send(Report::Start {
+                            item_id: current.id.clone(),
+                            ticks: seconds_to_ticks(pos),
+                        });
 
                         skippable.clear();
-                        match client.get_media_segments(&current.id, &skip_types).await {
-                            Ok(segments) => {
-                                skippable = segments
-                                    .iter()
-                                    .map(|s| {
-                                        (ticks_to_seconds(s.start_ticks), ticks_to_seconds(s.end_ticks))
-                                    })
-                                    .collect();
-                            }
-                            Err(err) => tracing::error!(%err, "failed to get media segments"),
+                        if !skip_types.is_empty() {
+                            let client = client.clone();
+                            let item_id = current.id.clone();
+                            let skip_types = skip_types.clone();
+                            let seg_tx = seg_tx.clone();
+                            tokio::spawn(async move {
+                                match client.get_media_segments(&item_id, &skip_types).await {
+                                    Ok(segments) => {
+                                        let _ = seg_tx.send((item_id, segments));
+                                    }
+                                    Err(err) => {
+                                        tracing::error!(%err, "failed to get media segments");
+                                    }
+                                }
+                            });
                         }
 
                         for subtitle in display::external_subtitles(&current) {
@@ -317,17 +396,24 @@ pub(super) async fn run(
                     }
 
                     Some("end-file") | Some("shutdown") => {
-                        if let Err(err) = client
-                            .report_playback_stopped(&current.id, seconds_to_ticks(pos))
-                            .await
-                        {
-                            tracing::error!(%err, "failed to report playback stopped");
-                        } else {
-                            tracing::info!(item = %current.id, pos, "reported playback stopped");
-                        }
+                        let _ = report_tx.send(Report::Stopped {
+                            item_id: current.id.clone(),
+                            ticks: seconds_to_ticks(pos),
+                        });
                     }
 
                     _ => {}
+                }
+            }
+
+            segments = seg_rx.recv() => {
+                if let Some((item_id, segments)) = segments
+                    && item_id == current.id
+                {
+                    skippable = segments
+                        .iter()
+                        .map(|s| (ticks_to_seconds(s.start_ticks), ticks_to_seconds(s.end_ticks)))
+                        .collect();
                 }
             }
 
@@ -357,6 +443,17 @@ pub(super) async fn run(
     let _ = child.kill().await;
     let _ = child.wait().await;
     ipc::cleanup_socket(&socket);
+
+    // Let queued reports (typically the final stopped) land before the
+    // caller emits Exited and the UI refetches watch state; bounded so a
+    // dead server cannot hold shutdown hostage.
+    drop(report_tx);
+    if tokio::time::timeout(Duration::from_secs(5), reporter)
+        .await
+        .is_err()
+    {
+        tracing::warn!("gave up waiting for final playback reports");
+    }
 }
 
 #[cfg(test)]

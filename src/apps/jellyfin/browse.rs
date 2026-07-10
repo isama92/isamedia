@@ -1,3 +1,6 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -77,14 +80,20 @@ pub struct Browse {
     /// One-line advisory (e.g. plain-http nudge after auto-login), shown in
     /// the error row when there is no error; cleared on the next fetch.
     pub notice: Option<String>,
+    /// Allocator for fetch generations. Owned by the app and shared across
+    /// Browse instances, so a fetch still in flight from a pre-relogin
+    /// instance can never collide with this instance's generations.
+    gen_counter: Arc<AtomicU64>,
+    /// Generation of this instance's latest fetch; older results are stale.
     fetch_gen: u64,
+    has_fetched: bool,
     spinner_frame: usize,
     /// Terminal height from the last draw, for jfsh-style page jumps.
     last_height: u16,
 }
 
 impl Browse {
-    pub fn new(client: Client, sender: AppSender) -> Self {
+    pub fn new(client: Client, sender: AppSender, gen_counter: Arc<AtomicU64>) -> Self {
         let mut browse = Self {
             client,
             sender,
@@ -102,7 +111,9 @@ impl Browse {
             loading: false,
             error: None,
             notice: None,
+            gen_counter,
             fetch_gen: 0,
+            has_fetched: false,
             spinner_frame: 0,
             last_height: 24,
         };
@@ -130,10 +141,11 @@ impl Browse {
         self.loading = true;
         self.error = None;
         // The connect-time notice has been seen once the user navigates.
-        if self.fetch_gen > 0 {
+        if self.has_fetched {
             self.notice = None;
         }
-        self.fetch_gen += 1;
+        self.has_fetched = true;
+        self.fetch_gen = self.gen_counter.fetch_add(1, Ordering::Relaxed) + 1;
         let fetch_gen = self.fetch_gen;
         let client = self.client.clone();
         let sender = self.sender.clone();
@@ -158,13 +170,18 @@ impl Browse {
         });
     }
 
+    /// Returns true when the server rejected the session token (the caller
+    /// must drop to the login screen). Staleness is checked FIRST: a 401
+    /// from a superseded fetch belongs to a token that may since have been
+    /// replaced by a re-login, and must not kick the fresh session.
+    #[must_use]
     pub fn on_items_loaded(
         &mut self,
         fetch_gen: u64,
         result: Result<Vec<MediaItem>, crate::jellyfin::Error>,
-    ) {
+    ) -> bool {
         if fetch_gen != self.fetch_gen {
-            return; // stale response from a superseded fetch
+            return false; // stale response from a superseded fetch
         }
         self.loading = false;
         match result {
@@ -175,16 +192,33 @@ impl Browse {
                 self.filter_focused = false;
                 self.apply_filter();
             }
+            Err(crate::jellyfin::Error::Unauthorized) => return true,
             Err(err) => self.error = Some(err.to_string()),
         }
+        false
     }
 
-    pub fn on_watched_toggled(&mut self, result: Result<(), crate::jellyfin::Error>) {
+    /// Same contract as `on_items_loaded`: true means the session expired.
+    #[must_use]
+    pub fn on_watched_toggled(
+        &mut self,
+        fetch_gen: u64,
+        result: Result<(), crate::jellyfin::Error>,
+    ) -> bool {
+        if fetch_gen != self.fetch_gen {
+            return false; // superseded: the user moved to another view meanwhile
+        }
+        if matches!(result, Err(crate::jellyfin::Error::Unauthorized)) {
+            return true;
+        }
         self.loading = false;
+        self.fetch();
+        // After fetch(), which resets the error line; a toggle failure must
+        // outlive the refetch, not flash for a tick.
         if let Err(err) = result {
             self.error = Some(err.to_string());
         }
-        self.fetch();
+        false
     }
 
     /// Refetch after playback so progress/watched state is fresh. A playback
@@ -228,6 +262,7 @@ impl Browse {
         let watched = display::watched(item);
         let item_id = item.id.clone();
         self.loading = true;
+        let fetch_gen = self.fetch_gen;
         let client = self.client.clone();
         let sender = self.sender.clone();
         tokio::spawn(async move {
@@ -236,7 +271,7 @@ impl Browse {
             } else {
                 client.mark_watched(&item_id).await
             };
-            sender.send(Msg::WatchedToggled(result));
+            sender.send(Msg::WatchedToggled { fetch_gen, result });
         });
     }
 
@@ -274,6 +309,13 @@ impl Browse {
                 }
             }
             self.filter.focused = self.filter_focused;
+            return None;
+        }
+
+        // The shell only claims ctrl+c/arrows/digits; don't let other
+        // ctrl/alt-modified chars fall through to single-letter shortcuts
+        // (ctrl+d is not "page down", ctrl+q is not "quit").
+        if crate::app::modified_char(&key) {
             return None;
         }
 

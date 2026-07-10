@@ -36,7 +36,7 @@ impl MediaApp for ComingSoonApp {
 
     fn on_key(&mut self, key: KeyEvent) -> Option<ShellRequest> {
         match key.code {
-            KeyCode::Char('q') => Some(ShellRequest::Quit),
+            KeyCode::Char('q') if key.modifiers.is_empty() => Some(ShellRequest::Quit),
             _ => None,
         }
     }
