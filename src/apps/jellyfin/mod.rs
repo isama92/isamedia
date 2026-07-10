@@ -15,14 +15,26 @@ use ratatui::widgets::Widget;
 use crate::app::{AppId, MediaApp, ShellRequest};
 use crate::config::Config;
 use crate::event::AppSender;
-use crate::jellyfin::{Client, Credentials};
-use crate::ui::theme;
+use crate::jellyfin::{Client, Credentials, MediaItem};
+use crate::player::{self, PlayerEvent, PlayerHandle};
+use crate::ui::{prompt, theme};
 
 use browse::{Browse, BrowseAction};
 use login::{LoginAction, LoginForm};
 use msg::Msg;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// "1:23:45" / "23:45" style clock for the now-playing bar.
+fn format_clock(secs: f64) -> String {
+    let total = secs.max(0.0) as u64;
+    let (hours, minutes, seconds) = (total / 3600, (total % 3600) / 60, total % 60);
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
+    }
+}
 
 enum Screen {
     /// Not activated yet.
@@ -41,6 +53,11 @@ pub struct JellyfinApp {
     /// Bumped whenever an auth attempt starts or is cancelled, so stale
     /// results are ignored.
     auth_gen: u64,
+    player: Option<PlayerHandle>,
+    /// Bumped per playback; events from a replaced player are dropped.
+    player_gen: u64,
+    /// Item waiting behind the "replace current playback?" prompt.
+    pending_play: Option<MediaItem>,
 }
 
 impl JellyfinApp {
@@ -51,6 +68,57 @@ impl JellyfinApp {
             sender,
             screen: Screen::Boot,
             auth_gen: 0,
+            player: None,
+            player_gen: 0,
+            pending_play: None,
+        }
+    }
+
+    fn start_playback(&mut self, item: MediaItem) {
+        let Screen::Browse(browse) = &self.screen else {
+            return;
+        };
+        let client = browse.client.clone();
+        let skip_types = self.config.lock().unwrap().jellyfin.skip_segments.clone();
+        self.player_gen += 1;
+        let player_gen = self.player_gen;
+        let sender = self.sender.clone();
+        let handle = player::spawn(client, item, skip_types, move |event| {
+            sender.send(Msg::Player { player_gen, event });
+        });
+        self.player = Some(handle);
+    }
+
+    fn on_player_event(&mut self, event: PlayerEvent) {
+        match event {
+            PlayerEvent::Started { title } => {
+                if let Some(player) = &mut self.player {
+                    player.now.title = title;
+                    player.now.position_secs = 0.0;
+                    player.now.duration_secs = None;
+                }
+            }
+            PlayerEvent::Position { secs } => {
+                if let Some(player) = &mut self.player {
+                    player.now.position_secs = secs;
+                }
+            }
+            PlayerEvent::Duration { secs } => {
+                if let Some(player) = &mut self.player {
+                    player.now.duration_secs = Some(secs);
+                }
+            }
+            PlayerEvent::Failed(message) => {
+                if let Screen::Browse(browse) = &mut self.screen {
+                    browse.error = Some(message);
+                }
+            }
+            PlayerEvent::Exited => {
+                self.player = None;
+                if let Screen::Browse(browse) = &mut self.screen {
+                    browse.on_playback_finished();
+                }
+            }
         }
     }
 
@@ -172,6 +240,35 @@ impl MediaApp for JellyfinApp {
     }
 
     fn on_key(&mut self, key: KeyEvent) -> Option<ShellRequest> {
+        // The replace-playback prompt is modal.
+        if self.pending_play.is_some() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    let item = self.pending_play.take().unwrap();
+                    if let Some(old) = self.player.take() {
+                        old.stop();
+                    }
+                    self.start_playback(item);
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
+                    self.pending_play = None;
+                }
+                _ => {}
+            }
+            return None;
+        }
+
+        // Global stop key, active whenever no text input has focus.
+        if key.code == KeyCode::Char('s')
+            && self.player.is_some()
+            && matches!(&self.screen, Screen::Browse(browse) if !browse.input_focused())
+        {
+            if let Some(player) = &self.player {
+                player.stop();
+            }
+            return None;
+        }
+
         match &mut self.screen {
             Screen::Boot => None,
             Screen::Connecting => match key.code {
@@ -207,11 +304,11 @@ impl MediaApp for JellyfinApp {
             Screen::Browse(browse) => match browse.on_key(key) {
                 Some(BrowseAction::Quit) => Some(ShellRequest::Quit),
                 Some(BrowseAction::Play(item)) => {
-                    // Playback lands in M4.
-                    browse.error = Some(format!(
-                        "playback not implemented yet ({})",
-                        crate::jellyfin::display::item_title(&item)
-                    ));
+                    if self.player.is_some() {
+                        self.pending_play = Some(item);
+                    } else {
+                        self.start_playback(item);
+                    }
                     None
                 }
                 None => None,
@@ -254,7 +351,36 @@ impl MediaApp for JellyfinApp {
                     browse.on_watched_toggled(result);
                 }
             }
+            Msg::Player { player_gen, event } => {
+                if player_gen != self.player_gen {
+                    return; // event from a player that was replaced
+                }
+                self.on_player_event(event);
+            }
         }
+    }
+
+    fn on_quit(&mut self) -> bool {
+        if let Some(player) = &self.player {
+            player.stop();
+            return true;
+        }
+        false
+    }
+
+    fn status_line(&self) -> Option<ratatui::text::Line<'static>> {
+        let player = self.player.as_ref()?;
+        let position = format_clock(player.now.position_secs);
+        let timing = match player.now.duration_secs {
+            Some(duration) => format!("{position} / {}", format_clock(duration)),
+            None => position,
+        };
+        Some(ratatui::text::Line::from(vec![
+            ratatui::text::Span::styled(" ⏵ ", theme::selected()),
+            ratatui::text::Span::styled(player.now.title.clone(), theme::accent()),
+            ratatui::text::Span::styled(format!("  {timing}"), ratatui::style::Style::new().fg(theme::FG)),
+            ratatui::text::Span::styled("  s: stop", theme::dim()),
+        ]))
     }
 
     fn draw(&mut self, frame: &mut Frame, area: Rect) {
@@ -267,6 +393,9 @@ impl MediaApp for JellyfinApp {
             }
             Screen::Login(form) => form.draw(frame, area),
             Screen::Browse(browse) => browse.draw(frame, area),
+        }
+        if self.pending_play.is_some() {
+            prompt::draw_confirm(frame, area, "Replace current playback?");
         }
     }
 }

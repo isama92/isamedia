@@ -16,4 +16,10 @@ pub enum Msg {
         result: Result<Vec<MediaItem>, Error>,
     },
     WatchedToggled(Result<(), Error>),
+    /// Playback lifecycle from the mpv supervisor; `player_gen` distinguishes
+    /// the current player from a replaced one that is still shutting down.
+    Player {
+        player_gen: u64,
+        event: crate::player::PlayerEvent,
+    },
 }
