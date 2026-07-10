@@ -4,6 +4,7 @@ mod cli;
 mod config;
 mod event;
 mod jellyfin;
+mod player;
 mod shell;
 mod ui;
 

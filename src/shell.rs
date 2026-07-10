@@ -73,8 +73,14 @@ impl Shell {
                 }
             }
             if self.should_quit {
+                let mut needs_grace = false;
                 for app in &mut self.apps {
-                    app.on_quit();
+                    needs_grace |= app.on_quit();
+                }
+                if needs_grace {
+                    // Give shutdown tasks (mpv quit, final playback report) a
+                    // moment before the runtime is torn down.
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 }
                 break;
             }
