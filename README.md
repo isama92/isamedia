@@ -64,6 +64,7 @@ isamedia [OPTIONS]
 | Key | Action |
 | --- | --- |
 | `ctrl+←/→`, `ctrl+1..3` | switch app |
+| `ctrl+t` | choose colour theme |
 | `←/h` `→/l` | previous / next tab |
 | `↑/k` `↓/j`, `pgup/b/u`, `pgdn/f/d`, `g`, `G` | move around lists |
 | `enter` / `space` | play item / open series |
@@ -83,6 +84,7 @@ first time; after that the stored token is used.
 
 ```toml
 last_app = "jellyfin"
+theme = "latte"            # "latte" or "solarized-light"
 
 [jellyfin]
 host = "https://jellyfin.example.com"   # http(s), base paths supported
@@ -98,6 +100,14 @@ you enter one at login — are stored in the OS keyring under the `isamedia`
 service (`jellyfin-token` / `jellyfin-password`). The password is optional
 and only used to re-authenticate automatically when the token expires; leave
 the field empty at login to not store one.
+
+### Themes
+
+Two light themes ship: Catppuccin Latte (default) and Solarized Light. Press
+`ctrl+t` to open the picker, choose with the arrow keys and `enter`, and the
+choice is saved to `theme` in the config. Both are light themes that only set
+foreground colours and leave your terminal's own background alone, so they look
+best on a light terminal.
 
 ## Development
 

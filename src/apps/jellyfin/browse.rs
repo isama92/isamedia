@@ -434,14 +434,18 @@ impl Browse {
         if let Some(series) = &self.current_series {
             spans.push(Span::styled(
                 format!(" {} ", display::item_title(series)),
-                Style::new().fg(theme::CHROME_FG).bg(theme::ACCENT),
+                Style::new()
+                    .fg(theme::on_accent())
+                    .bg(theme::accent_color()),
             ));
         } else {
             for tab in Tab::ALL {
                 let style = if tab == self.tab {
-                    Style::new().fg(theme::CHROME_FG).bg(theme::ACCENT)
+                    Style::new()
+                        .fg(theme::on_accent())
+                        .bg(theme::accent_color())
                 } else {
-                    Style::new().fg(theme::CHROME_FG).bg(theme::TAB_BG)
+                    Style::new().fg(theme::on_tab()).bg(theme::tab_bg())
                 };
                 spans.push(Span::styled(format!(" {} ", tab.name()), style));
                 spans.push(Span::raw(" "));
@@ -450,7 +454,7 @@ impl Browse {
         if self.loading {
             spans.push(Span::styled(
                 format!(" {}", SPINNER_FRAMES[self.spinner_frame]),
-                Style::new().fg(theme::ACCENT_BRIGHT),
+                Style::new().fg(theme::accent_bright()),
             ));
         }
         Line::from(spans).render(area, frame.buffer_mut());
@@ -463,7 +467,7 @@ impl Browse {
             Constraint::Fill(1),
         ])
         .areas(row);
-        Line::styled(format!("  {prompt}"), Style::new().fg(theme::FG))
+        Line::styled(format!("  {prompt}"), Style::new().fg(theme::fg()))
             .render(prompt_area, frame.buffer_mut());
         input.render(input_area, frame.buffer_mut());
     }
@@ -491,24 +495,24 @@ impl Browse {
             let (title_line, desc_line) = if i == self.cursor {
                 (
                     Line::from(vec![
-                        Span::styled(" │ ", Style::new().fg(theme::ACCENT_BRIGHT)),
+                        Span::styled(" │ ", Style::new().fg(theme::accent_bright())),
                         Span::styled(
                             title,
                             Style::new()
-                                .fg(theme::ACCENT_BRIGHT)
+                                .fg(theme::accent_bright())
                                 .add_modifier(Modifier::BOLD),
                         ),
                     ]),
                     Line::from(vec![
-                        Span::styled(" │ ", Style::new().fg(theme::ACCENT_BRIGHT)),
-                        Span::styled(desc, Style::new().fg(theme::ACCENT)),
+                        Span::styled(" │ ", Style::new().fg(theme::accent_bright())),
+                        Span::styled(desc, Style::new().fg(theme::accent_color())),
                     ]),
                 )
             } else {
                 let title_style = if display::watched(item) {
                     theme::dim()
                 } else {
-                    Style::new().fg(theme::FG)
+                    Style::new().fg(theme::fg())
                 };
                 (
                     Line::from(Span::styled(format!("   {title}"), title_style)),
@@ -531,7 +535,7 @@ impl Browse {
                 .round() as usize;
             for i in 0..avail_height {
                 let (symbol, style) = if i == thumb {
-                    ("█", Style::new().fg(theme::ACCENT))
+                    ("█", Style::new().fg(theme::accent_color()))
                 } else {
                     ("│", theme::dim())
                 };
@@ -587,7 +591,7 @@ impl Browse {
                 if i > 0 {
                     spans.push(Span::styled(" • ", theme::dim()));
                 }
-                spans.push(Span::styled(key, Style::new().fg(theme::DIM)));
+                spans.push(Span::styled(key, Style::new().fg(theme::dim_color())));
                 spans.push(Span::styled(format!(" {desc}"), theme::dim()));
             }
             Line::from(spans).render(area, buf);
@@ -611,7 +615,12 @@ impl Browse {
                 ("/", "search/filter"),
                 ("esc", "clear/back"),
             ],
-            &[("w", "toggle watched"), ("q", "quit"), ("?", "close help")],
+            &[
+                ("w", "toggle watched"),
+                ("ctrl+t", "choose theme"),
+                ("q", "quit"),
+                ("?", "close help"),
+            ],
         ];
         let areas = Layout::horizontal([
             Constraint::Length(26),
@@ -629,7 +638,7 @@ impl Browse {
                         1,
                     );
                     Line::from(vec![
-                        Span::styled(format!("  {key:<10}"), Style::new().fg(theme::DIM)),
+                        Span::styled(format!("  {key:<10}"), Style::new().fg(theme::dim_color())),
                         Span::styled(desc.to_string(), theme::dim()),
                     ])
                     .render(line_area, buf);

@@ -465,7 +465,7 @@ impl MediaApp for JellyfinApp {
             ratatui::text::Span::styled(player.now.title.clone(), theme::accent()),
             ratatui::text::Span::styled(
                 format!("  {timing}"),
-                ratatui::style::Style::new().fg(theme::FG),
+                ratatui::style::Style::new().fg(theme::fg()),
             ),
             ratatui::text::Span::styled("  s: stop", theme::dim()),
         ]))
