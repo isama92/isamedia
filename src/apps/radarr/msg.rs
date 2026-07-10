@@ -94,4 +94,8 @@ pub enum CommandKind {
     /// A monitored toggle: the refetched indicator is the only feedback, so
     /// this carries no payload and sets no notice.
     SetMonitored,
+    /// An add-time options edit (root folder / quality profile / minimum
+    /// availability) via the bulk editor. A refetch repaints the change and a
+    /// one-line notice confirms it.
+    SetOptions,
 }
