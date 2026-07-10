@@ -5,6 +5,7 @@ mod config;
 mod event;
 mod jellyfin;
 mod player;
+mod secrets;
 mod shell;
 mod ui;
 

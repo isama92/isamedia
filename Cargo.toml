@@ -26,3 +26,12 @@ reqwest = { version = "0.13.4", default-features = false, features = ["json", "r
 
 [target.'cfg(windows)'.dependencies]
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "native-tls", "http2", "query"] }
+keyring = { version = "3", features = ["windows-native"] }
+
+# Secrets (token/password) live in the OS keyring, not the config file.
+# vendored: build libdbus from source so no -dev package is needed.
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", features = ["sync-secret-service", "vendored"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
