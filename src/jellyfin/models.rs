@@ -9,6 +9,8 @@ pub enum ItemKind {
     Series,
     Episode,
     Video,
+    BoxSet,
+    CollectionFolder,
     #[serde(other)]
     #[default]
     Other,
@@ -30,6 +32,10 @@ pub struct MediaItem {
     pub production_year: Option<i32>,
     pub community_rating: Option<f32>,
     pub run_time_ticks: Option<i64>,
+    /// Set on library views ("movies", "tvshows", "boxsets", ...); the item
+    /// `Type` alone cannot tell library kinds apart, since every view is a
+    /// `CollectionFolder`.
+    pub collection_type: Option<String>,
     pub path: Option<String>,
     pub user_data: Option<UserData>,
     pub media_streams: Vec<MediaStream>,
@@ -59,6 +65,11 @@ pub struct MediaStream {
 #[serde(rename_all = "PascalCase", default)]
 pub struct ItemsResponse {
     pub items: Vec<MediaItem>,
+    /// Total matches server-side, beyond the requested page. `i64` rather
+    /// than `usize` because some endpoints disable the count (NextUp sends
+    /// `enableTotalRecordCount=false`) and a defensive type can never fail
+    /// deserialization; defaults to 0 when absent.
+    pub total_record_count: i64,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
@@ -129,6 +140,36 @@ mod tests {
     fn unknown_kind_falls_back() {
         let item: MediaItem = serde_json::from_str(r#"{"Id": "x", "Type": "MusicAlbum"}"#).unwrap();
         assert_eq!(item.kind, ItemKind::Other);
+    }
+
+    #[test]
+    fn deserializes_box_set() {
+        let item: MediaItem =
+            serde_json::from_str(r#"{"Id": "b1", "Name": "Trilogy", "Type": "BoxSet"}"#).unwrap();
+        assert_eq!(item.kind, ItemKind::BoxSet);
+    }
+
+    #[test]
+    fn deserializes_library_view() {
+        let raw = r#"{
+            "Id": "lib1",
+            "Name": "Movies",
+            "Type": "CollectionFolder",
+            "CollectionType": "movies"
+        }"#;
+        let item: MediaItem = serde_json::from_str(raw).unwrap();
+        assert_eq!(item.kind, ItemKind::CollectionFolder);
+        assert_eq!(item.collection_type.as_deref(), Some("movies"));
+    }
+
+    #[test]
+    fn items_response_total_record_count() {
+        let with: ItemsResponse =
+            serde_json::from_str(r#"{"Items": [], "TotalRecordCount": 250}"#).unwrap();
+        assert_eq!(with.total_record_count, 250);
+        // Absent (e.g. enableTotalRecordCount=false) falls back to 0.
+        let without: ItemsResponse = serde_json::from_str(r#"{"Items": []}"#).unwrap();
+        assert_eq!(without.total_record_count, 0);
     }
 
     #[test]

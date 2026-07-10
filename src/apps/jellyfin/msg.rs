@@ -1,4 +1,4 @@
-use crate::jellyfin::{Client, Error, MediaItem};
+use crate::jellyfin::{Client, Error, ItemsResponse, MediaItem};
 
 /// Messages sent back to the Jellyfin app by its spawned tasks. Carried
 /// through the shell as `Box<dyn Any>` and downcast in `on_event`.
@@ -14,6 +14,14 @@ pub enum Msg {
     ItemsLoaded {
         fetch_gen: u64,
         result: Result<Vec<MediaItem>, Error>,
+    },
+    /// One page of a Libraries-tab listing. `start_index == 0` replaces the
+    /// list, anything else appends; `fetch_gen` drops pages superseded by a
+    /// sort, filter, or navigation change.
+    LibraryItemsLoaded {
+        fetch_gen: u64,
+        start_index: usize,
+        result: Result<ItemsResponse, Error>,
     },
     /// Result of a watched/unwatched toggle; `fetch_gen` is the view
     /// generation the toggle was issued from, so a result landing after the

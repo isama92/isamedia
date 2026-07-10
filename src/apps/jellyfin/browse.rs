@@ -9,30 +9,44 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 
 use crate::event::AppSender;
-use crate::jellyfin::{Client, MediaItem, display, models::ItemKind};
+use crate::jellyfin::{Client, LibraryItemsQuery, MediaItem, display, models::ItemKind};
 use crate::ui::input::TextInput;
-use crate::ui::theme;
+use crate::ui::{prompt, theme};
 
 use super::msg::Msg;
 
 const SPINNER_FRAMES: [&str; 8] = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
+
+/// Items per request in the Libraries tab's lazily-loaded lists.
+const PAGE_SIZE: usize = 100;
+/// Fetch the next page once the cursor is within this many rows of the end
+/// of the loaded window.
+const FETCH_AHEAD: usize = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Resume,
     NextUp,
     RecentlyAdded,
+    Libraries,
     Search,
 }
 
 impl Tab {
-    const ALL: [Tab; 4] = [Tab::Resume, Tab::NextUp, Tab::RecentlyAdded, Tab::Search];
+    const ALL: [Tab; 5] = [
+        Tab::Resume,
+        Tab::NextUp,
+        Tab::RecentlyAdded,
+        Tab::Libraries,
+        Tab::Search,
+    ];
 
     fn name(self) -> &'static str {
         match self {
             Tab::Resume => "Resume",
             Tab::NextUp => "Next Up",
             Tab::RecentlyAdded => "Recently Added",
+            Tab::Libraries => "Libraries",
             Tab::Search => "Search",
         }
     }
@@ -46,6 +60,161 @@ impl Tab {
         let idx = Tab::ALL.iter().position(|&t| t == self).unwrap();
         Tab::ALL[(idx + Tab::ALL.len() - 1) % Tab::ALL.len()]
     }
+}
+
+/// How a library behaves when opened; derived from the view's
+/// `CollectionType`, since every view shares `Type: "CollectionFolder"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LibraryKind {
+    Movies,
+    Shows,
+    Other,
+}
+
+fn library_kind(item: &MediaItem) -> LibraryKind {
+    match item.collection_type.as_deref() {
+        Some("movies") => LibraryKind::Movies,
+        Some("tvshows") => LibraryKind::Shows,
+        _ => LibraryKind::Other,
+    }
+}
+
+/// Where the user is inside the Libraries tab. A flat enum rather than a
+/// stack: depth is bounded at two, and collections only exist inside Other
+/// libraries, so popping `Collection` always lands on `Library { Other }`.
+#[allow(clippy::large_enum_variant)] // one instance per Browse, size is irrelevant
+#[derive(Debug, Clone)]
+enum LibraryLevel {
+    Root,
+    Library {
+        library: MediaItem,
+        kind: LibraryKind,
+    },
+    Collection {
+        library: MediaItem,
+        collection: MediaItem,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SortField {
+    Name,
+    DateAdded,
+    ReleaseDate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SortDir {
+    Ascending,
+    Descending,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Sort {
+    field: SortField,
+    dir: SortDir,
+}
+
+impl Sort {
+    const DEFAULT: Sort = Sort {
+        field: SortField::DateAdded,
+        dir: SortDir::Descending,
+    };
+
+    fn api_params(self) -> (&'static str, &'static str) {
+        let sort_by = match self.field {
+            SortField::Name => "SortName",
+            SortField::DateAdded => "DateCreated",
+            SortField::ReleaseDate => "PremiereDate",
+        };
+        let sort_order = match self.dir {
+            SortDir::Ascending => "Ascending",
+            SortDir::Descending => "Descending",
+        };
+        (sort_by, sort_order)
+    }
+
+    fn label(self) -> &'static str {
+        match (self.field, self.dir) {
+            (SortField::DateAdded, SortDir::Descending) => "Date added, newest first",
+            (SortField::DateAdded, SortDir::Ascending) => "Date added, oldest first",
+            (SortField::Name, SortDir::Ascending) => "Name, A to Z",
+            (SortField::Name, SortDir::Descending) => "Name, Z to A",
+            (SortField::ReleaseDate, SortDir::Descending) => "Release date, newest first",
+            (SortField::ReleaseDate, SortDir::Ascending) => "Release date, oldest first",
+        }
+    }
+}
+
+/// Sort menu entries, default first.
+const SORT_OPTIONS: [Sort; 6] = [
+    Sort {
+        field: SortField::DateAdded,
+        dir: SortDir::Descending,
+    },
+    Sort {
+        field: SortField::DateAdded,
+        dir: SortDir::Ascending,
+    },
+    Sort {
+        field: SortField::Name,
+        dir: SortDir::Ascending,
+    },
+    Sort {
+        field: SortField::Name,
+        dir: SortDir::Descending,
+    },
+    Sort {
+        field: SortField::ReleaseDate,
+        dir: SortDir::Descending,
+    },
+    Sort {
+        field: SortField::ReleaseDate,
+        dir: SortDir::Ascending,
+    },
+];
+
+/// Whether the cursor is close enough to the end of the loaded window to
+/// warrant fetching the next page. `loading` blocks a second in-flight page.
+fn should_fetch_more(cursor: usize, loaded: usize, total: usize, loading: bool) -> bool {
+    !loading && loaded < total && cursor + FETCH_AHEAD >= loaded
+}
+
+/// The request for one page of the current library level; `None` at the
+/// root, which is served by `get_libraries` instead. Free function (not a
+/// method) so it can be unit-tested without a `Client`.
+fn build_library_query(
+    level: &LibraryLevel,
+    sort: Sort,
+    filter: Option<&str>,
+    start_index: usize,
+) -> Option<LibraryItemsQuery> {
+    let (parent_id, include_item_types, recursive) = match level {
+        LibraryLevel::Root => return None,
+        LibraryLevel::Library { library, kind } => (
+            library.id.clone(),
+            match kind {
+                LibraryKind::Movies => Some("Movie"),
+                LibraryKind::Shows => Some("Series"),
+                LibraryKind::Other => None,
+            },
+            // Movie/show libraries recurse into folders; an Other library
+            // lists its direct children (the collections themselves).
+            !matches!(kind, LibraryKind::Other),
+        ),
+        LibraryLevel::Collection { collection, .. } => (collection.id.clone(), None, false),
+    };
+    let (sort_by, sort_order) = sort.api_params();
+    Some(LibraryItemsQuery {
+        parent_id,
+        include_item_types,
+        recursive,
+        start_index,
+        limit: PAGE_SIZE,
+        sort_by,
+        sort_order,
+        search_term: filter.filter(|term| !term.is_empty()).map(str::to_string),
+    })
 }
 
 /// What the browse screen wants its parent (the Jellyfin app) to do.
@@ -73,6 +242,15 @@ pub struct Browse {
     filter_focused: bool,
 
     current_series: Option<MediaItem>,
+
+    /// Drill-down position inside the Libraries tab; `Root` elsewhere.
+    lib_level: LibraryLevel,
+    /// Server-side total for the current Libraries list, driving pagination.
+    lib_total: usize,
+    /// Sort of the collection-videos level; reset on entering a collection.
+    collection_sort: Sort,
+    /// Sort popup cursor into `SORT_OPTIONS`; `None` when closed.
+    sort_menu: Option<usize>,
 
     show_full_help: bool,
     loading: bool,
@@ -107,6 +285,10 @@ impl Browse {
             filter_active: false,
             filter_focused: false,
             current_series: None,
+            lib_level: LibraryLevel::Root,
+            lib_total: 0,
+            collection_sort: Sort::DEFAULT,
+            sort_menu: None,
             show_full_help: false,
             loading: false,
             error: None,
@@ -137,7 +319,41 @@ impl Browse {
         self.search_focused || self.filter_focused
     }
 
-    pub fn fetch(&mut self) {
+    /// Whether the user is inside any drill-down level; tab switching is
+    /// blocked while drilled in.
+    fn drilled_in(&self) -> bool {
+        self.current_series.is_some()
+            || (self.tab == Tab::Libraries && !matches!(self.lib_level, LibraryLevel::Root))
+    }
+
+    /// Whether `/` filters server-side (`searchTerm` on the paginated
+    /// request) instead of narrowing the already-loaded items. True inside
+    /// any Libraries drill level except the episodes view, which is a plain
+    /// unpaginated list like everywhere else.
+    fn uses_server_filter(&self) -> bool {
+        self.tab == Tab::Libraries
+            && self.current_series.is_none()
+            && !matches!(self.lib_level, LibraryLevel::Root)
+    }
+
+    /// Only videos inside a collection are user-sortable; every other
+    /// Libraries list uses the default sort.
+    fn current_sort(&self) -> Sort {
+        match self.lib_level {
+            LibraryLevel::Collection { .. } => self.collection_sort,
+            _ => Sort::DEFAULT,
+        }
+    }
+
+    fn sort_key_available(&self) -> bool {
+        self.tab == Tab::Libraries
+            && self.current_series.is_none()
+            && matches!(self.lib_level, LibraryLevel::Collection { .. })
+    }
+
+    /// Mark a fetch as started and allocate its generation; any result
+    /// carrying an older generation is stale and dropped on arrival.
+    fn begin_fetch(&mut self) -> u64 {
         self.loading = true;
         self.error = None;
         // The connect-time notice has been seen once the user navigates.
@@ -146,7 +362,18 @@ impl Browse {
         }
         self.has_fetched = true;
         self.fetch_gen = self.gen_counter.fetch_add(1, Ordering::Relaxed) + 1;
-        let fetch_gen = self.fetch_gen;
+        self.fetch_gen
+    }
+
+    pub fn fetch(&mut self) {
+        // Libraries lists are paginated and go through their own path; the
+        // episodes drill inside a shows library is the exception and loads
+        // like any other series.
+        if self.tab == Tab::Libraries && self.current_series.is_none() {
+            self.fetch_library_page(0);
+            return;
+        }
+        let fetch_gen = self.begin_fetch();
         let client = self.client.clone();
         let sender = self.sender.clone();
         let series = self.current_series.clone();
@@ -158,6 +385,8 @@ impl Browse {
                 (None, Tab::Resume) => client.get_resume().await,
                 (None, Tab::NextUp) => client.get_next_up().await,
                 (None, Tab::RecentlyAdded) => client.get_recently_added().await,
+                // Handled by fetch_library_page above; kept for exhaustiveness.
+                (None, Tab::Libraries) => Ok(Vec::new()),
                 (None, Tab::Search) => {
                     if query.is_empty() {
                         Ok(Vec::new())
@@ -168,6 +397,75 @@ impl Browse {
             };
             sender.send(Msg::ItemsLoaded { fetch_gen, result });
         });
+    }
+
+    /// Request one page of the current library level. `start_index == 0`
+    /// replaces the list (navigation, sort/filter change, refresh); a later
+    /// index appends as the user scrolls.
+    fn fetch_library_page(&mut self, start_index: usize) {
+        let fetch_gen = self.begin_fetch();
+        let client = self.client.clone();
+        let sender = self.sender.clone();
+        let filter = self.filter_active.then(|| self.filter.value().to_string());
+        match build_library_query(
+            &self.lib_level,
+            self.current_sort(),
+            filter.as_deref(),
+            start_index,
+        ) {
+            // Root: /Views is a handful of entries, one unpaginated request.
+            None => {
+                tokio::spawn(async move {
+                    let result = client.get_libraries().await;
+                    sender.send(Msg::LibraryItemsLoaded {
+                        fetch_gen,
+                        start_index: 0,
+                        result,
+                    });
+                });
+            }
+            Some(query) => {
+                tokio::spawn(async move {
+                    let result = client.get_library_items(&query).await;
+                    sender.send(Msg::LibraryItemsLoaded {
+                        fetch_gen,
+                        start_index,
+                        result,
+                    });
+                });
+            }
+        }
+    }
+
+    fn maybe_fetch_next_page(&mut self) {
+        if self.tab != Tab::Libraries
+            || self.current_series.is_some()
+            // The root list is never paginated, whatever total the server
+            // reports for it.
+            || matches!(self.lib_level, LibraryLevel::Root)
+        {
+            return;
+        }
+        if should_fetch_more(
+            self.cursor,
+            self.all_items.len(),
+            self.lib_total,
+            self.loading,
+        ) {
+            self.fetch_library_page(self.all_items.len());
+        }
+    }
+
+    /// Reset per-level list state after moving between library levels, then
+    /// load the first page of the level just entered. The previous level's
+    /// items stay visible until it arrives, like every other fetch.
+    fn enter_new_level(&mut self) {
+        self.cursor = 0;
+        self.lib_total = 0;
+        self.filter.clear();
+        self.filter_active = false;
+        self.filter_focused = false;
+        self.fetch_library_page(0);
     }
 
     /// Returns true when the server rejected the session token (the caller
@@ -191,6 +489,41 @@ impl Browse {
                 self.filter_active = false;
                 self.filter_focused = false;
                 self.apply_filter();
+            }
+            Err(crate::jellyfin::Error::Unauthorized) => return true,
+            Err(err) => self.error = Some(err.to_string()),
+        }
+        false
+    }
+
+    /// Same contract as `on_items_loaded`, for Libraries-tab pages. Unlike
+    /// `on_items_loaded` this must NOT clear the filter: the request was
+    /// issued with it (server-side filtering), so the result matches it.
+    #[must_use]
+    pub fn on_library_items_loaded(
+        &mut self,
+        fetch_gen: u64,
+        start_index: usize,
+        result: Result<crate::jellyfin::ItemsResponse, crate::jellyfin::Error>,
+    ) -> bool {
+        if fetch_gen != self.fetch_gen {
+            return false; // stale page from a superseded fetch
+        }
+        self.loading = false;
+        match result {
+            Ok(page) => {
+                self.lib_total = page.total_record_count.max(0) as usize;
+                if start_index == 0 {
+                    self.all_items = page.items;
+                } else {
+                    self.all_items.extend(page.items);
+                }
+                // The fetched list is already filtered and sorted; it IS the
+                // visible list.
+                self.items = self.all_items.clone();
+                if self.cursor >= self.items.len() {
+                    self.cursor = self.items.len().saturating_sub(1);
+                }
             }
             Err(crate::jellyfin::Error::Unauthorized) => return true,
             Err(err) => self.error = Some(err.to_string()),
@@ -231,6 +564,15 @@ impl Browse {
     }
 
     fn apply_filter(&mut self) {
+        // Server-side filtering: the loaded items already match the filter,
+        // so a residual call just mirrors them.
+        if self.uses_server_filter() {
+            self.items = self.all_items.clone();
+            if self.cursor >= self.items.len() {
+                self.cursor = 0;
+            }
+            return;
+        }
         if !self.filter_active || self.filter.value().is_empty() {
             self.items = self.all_items.clone();
         } else {
@@ -256,7 +598,12 @@ impl Browse {
         let Some(item) = self.current_item() else {
             return;
         };
-        if item.kind == ItemKind::Series {
+        // Only individually playable items toggle; series, libraries and
+        // collections are containers.
+        if !matches!(
+            item.kind,
+            ItemKind::Movie | ItemKind::Episode | ItemKind::Video
+        ) {
             return;
         }
         let watched = display::watched(item);
@@ -292,19 +639,55 @@ impl Browse {
         }
 
         if self.filter_focused {
-            match key.code {
-                KeyCode::Esc => {
-                    self.filter_focused = false;
-                    self.filter.clear();
-                    self.filter_active = false;
-                    self.apply_filter();
+            if self.uses_server_filter() {
+                // Server-side filter: typing only edits the text; leaving the
+                // input applies it as a fresh page-0 fetch, mirroring the
+                // Search tab's apply-on-unfocus. Applying on EVERY unfocus
+                // path (not just Enter) keeps a later page append from mixing
+                // an edited-but-unapplied term with the visible list.
+                match key.code {
+                    KeyCode::Esc => {
+                        self.filter_focused = false;
+                        self.filter.clear();
+                        self.filter_active = false;
+                        self.cursor = 0;
+                        self.fetch_library_page(0);
+                    }
+                    KeyCode::Enter
+                    | KeyCode::Tab
+                    | KeyCode::BackTab
+                    | KeyCode::Up
+                    | KeyCode::Down => {
+                        self.filter_focused = false;
+                        if self.filter.value().is_empty() {
+                            self.filter_active = false;
+                        }
+                        self.cursor = 0;
+                        self.fetch_library_page(0);
+                    }
+                    _ => {
+                        self.filter.on_key(key);
+                    }
                 }
-                KeyCode::Enter | KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => {
-                    self.filter_focused = false;
-                }
-                _ => {
-                    if self.filter.on_key(key) {
+            } else {
+                match key.code {
+                    KeyCode::Esc => {
+                        self.filter_focused = false;
+                        self.filter.clear();
+                        self.filter_active = false;
                         self.apply_filter();
+                    }
+                    KeyCode::Enter
+                    | KeyCode::Tab
+                    | KeyCode::BackTab
+                    | KeyCode::Up
+                    | KeyCode::Down => {
+                        self.filter_focused = false;
+                    }
+                    _ => {
+                        if self.filter.on_key(key) {
+                            self.apply_filter();
+                        }
                     }
                 }
             }
@@ -316,6 +699,30 @@ impl Browse {
         // ctrl/alt-modified chars fall through to single-letter shortcuts
         // (ctrl+d is not "page down", ctrl+q is not "quit").
         if crate::app::modified_char(&key) {
+            return None;
+        }
+
+        // The sort popup is modal: while open it owns every key.
+        if let Some(selected) = self.sort_menu {
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.sort_menu = Some(selected.saturating_sub(1));
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.sort_menu = Some((selected + 1).min(SORT_OPTIONS.len() - 1));
+                }
+                KeyCode::Enter => {
+                    self.sort_menu = None;
+                    let sort = SORT_OPTIONS.get(selected).copied().unwrap_or(Sort::DEFAULT);
+                    if sort != self.collection_sort {
+                        self.collection_sort = sort;
+                        self.cursor = 0;
+                        self.fetch_library_page(0);
+                    }
+                }
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('s') => self.sort_menu = None,
+                _ => {}
+            }
             return None;
         }
 
@@ -336,14 +743,18 @@ impl Browse {
             KeyCode::Home | KeyCode::Char('g') => self.cursor = 0,
             KeyCode::End | KeyCode::Char('G') => self.cursor = self.items.len().saturating_sub(1),
 
-            KeyCode::Right | KeyCode::Char('l') if self.current_series.is_none() => {
+            KeyCode::Right | KeyCode::Char('l') if !self.drilled_in() => {
                 self.tab = self.tab.next();
                 self.cursor = 0;
+                self.lib_level = LibraryLevel::Root;
+                self.lib_total = 0;
                 self.fetch();
             }
-            KeyCode::Left | KeyCode::Char('h') if self.current_series.is_none() => {
+            KeyCode::Left | KeyCode::Char('h') if !self.drilled_in() => {
                 self.tab = self.tab.prev();
                 self.cursor = 0;
+                self.lib_level = LibraryLevel::Root;
+                self.lib_total = 0;
                 self.fetch();
             }
 
@@ -351,6 +762,12 @@ impl Browse {
                 if self.tab == Tab::Search && self.current_series.is_none() {
                     self.search_focused = true;
                     self.search.focused = true;
+                } else if self.tab == Tab::Libraries
+                    && self.current_series.is_none()
+                    && matches!(self.lib_level, LibraryLevel::Root)
+                {
+                    // No filter at the libraries root: /Views takes no
+                    // searchTerm and the list is a handful of entries.
                 } else {
                     self.filter_active = true;
                     self.filter_focused = true;
@@ -365,7 +782,29 @@ impl Browse {
                 } else if self.filter_active && key.code == KeyCode::Esc {
                     self.filter.clear();
                     self.filter_active = false;
-                    self.apply_filter();
+                    if self.uses_server_filter() {
+                        self.cursor = 0;
+                        self.fetch_library_page(0);
+                    } else {
+                        self.apply_filter();
+                    }
+                } else if self.tab == Tab::Libraries
+                    && self.current_series.is_none()
+                    && !self.filter_active
+                {
+                    // Pop one library level; collections only exist inside
+                    // Other libraries, so that is always where they return to.
+                    match std::mem::replace(&mut self.lib_level, LibraryLevel::Root) {
+                        LibraryLevel::Collection { library, .. } => {
+                            self.lib_level = LibraryLevel::Library {
+                                library,
+                                kind: LibraryKind::Other,
+                            };
+                            self.enter_new_level();
+                        }
+                        LibraryLevel::Library { .. } => self.enter_new_level(),
+                        LibraryLevel::Root => {}
+                    }
                 } else if self.tab == Tab::Search
                     && key.code == KeyCode::Esc
                     && !self.search.value().is_empty()
@@ -377,22 +816,65 @@ impl Browse {
 
             KeyCode::Enter | KeyCode::Char(' ') => {
                 if let Some(item) = self.current_item().cloned() {
+                    if self.tab == Tab::Libraries && self.current_series.is_none() {
+                        match (&self.lib_level, item.kind) {
+                            (LibraryLevel::Root, _) => {
+                                let kind = library_kind(&item);
+                                self.lib_level = LibraryLevel::Library {
+                                    library: item,
+                                    kind,
+                                };
+                                self.enter_new_level();
+                                return None;
+                            }
+                            (
+                                LibraryLevel::Library {
+                                    library,
+                                    kind: LibraryKind::Other,
+                                },
+                                ItemKind::BoxSet,
+                            ) => {
+                                self.lib_level = LibraryLevel::Collection {
+                                    library: library.clone(),
+                                    collection: item,
+                                };
+                                // Sort belongs to this level; entering
+                                // always starts from the default.
+                                self.collection_sort = Sort::DEFAULT;
+                                self.enter_new_level();
+                                return None;
+                            }
+                            _ => {}
+                        }
+                    }
                     if item.kind == ItemKind::Series {
                         self.current_series = Some(item);
                         self.cursor = 0;
                         self.fetch();
-                    } else {
+                    } else if !matches!(item.kind, ItemKind::BoxSet | ItemKind::CollectionFolder) {
+                        // Containers never play; anything else does. A video
+                        // inside a collection plays alone (only episodes are
+                        // expanded to a playlist, by the player).
                         return Some(BrowseAction::Play(item));
                     }
                 }
             }
 
+            KeyCode::Char('s') if self.sort_key_available() => {
+                self.sort_menu = Some(
+                    SORT_OPTIONS
+                        .iter()
+                        .position(|&sort| sort == self.collection_sort)
+                        .unwrap_or(0),
+                );
+            }
             KeyCode::Char('w') => self.toggle_watched(),
             KeyCode::Char('r') => self.fetch(),
             KeyCode::Char('?') => self.show_full_help = !self.show_full_help,
             KeyCode::Char('q') => return Some(BrowseAction::Quit),
             _ => {}
         }
+        self.maybe_fetch_next_page();
         None
     }
 
@@ -427,6 +909,27 @@ impl Browse {
         }
         self.draw_list(frame, rows[4]);
         self.draw_help(frame, rows[5]);
+        if let Some(selected) = self.sort_menu {
+            let labels: Vec<&str> = SORT_OPTIONS.iter().map(|sort| sort.label()).collect();
+            prompt::draw_menu(frame, area, "Sort by", &labels, selected);
+        }
+    }
+
+    /// "Library" or "Library / Collection" pill while drilled into the
+    /// Libraries tab; `None` at the root (the tab strip shows instead).
+    fn library_breadcrumb(&self) -> Option<String> {
+        if self.tab != Tab::Libraries {
+            return None;
+        }
+        let name = |item: &MediaItem| item.name.clone().unwrap_or_default();
+        match &self.lib_level {
+            LibraryLevel::Root => None,
+            LibraryLevel::Library { library, .. } => Some(name(library)),
+            LibraryLevel::Collection {
+                library,
+                collection,
+            } => Some(format!("{} / {}", name(library), name(collection))),
+        }
     }
 
     fn draw_tabs(&self, frame: &mut Frame, area: Rect) {
@@ -434,6 +937,13 @@ impl Browse {
         if let Some(series) = &self.current_series {
             spans.push(Span::styled(
                 format!(" {} ", display::item_title(series)),
+                Style::new()
+                    .fg(theme::on_accent())
+                    .bg(theme::accent_color()),
+            ));
+        } else if let Some(breadcrumb) = self.library_breadcrumb() {
+            spans.push(Span::styled(
+                format!(" {breadcrumb} "),
                 Style::new()
                     .fg(theme::on_accent())
                     .bg(theme::accent_color()),
@@ -550,14 +1060,19 @@ impl Browse {
         if self.search_focused || self.filter_focused {
             return vec![("esc", "cancel"), ("enter", "apply")];
         }
+        if self.sort_menu.is_some() {
+            return vec![("esc", "close"), ("enter", "select")];
+        }
         let mut entries = Vec::new();
-        if self.current_series.is_some() {
+        if self.drilled_in() {
             entries.push(("esc", "back"));
         }
-        if self
-            .current_item()
-            .is_some_and(|item| item.kind != ItemKind::Series)
-        {
+        if self.current_item().is_some_and(|item| {
+            matches!(
+                item.kind,
+                ItemKind::Movie | ItemKind::Episode | ItemKind::Video
+            )
+        }) {
             entries.push(("w", "toggle watched"));
         }
         if self.tab == Tab::Search && self.current_series.is_none() {
@@ -565,11 +1080,19 @@ impl Browse {
             if !self.search.value().is_empty() {
                 entries.push(("esc", "clear"));
             }
+        } else if self.tab == Tab::Libraries
+            && self.current_series.is_none()
+            && matches!(self.lib_level, LibraryLevel::Root)
+        {
+            // No filter at the libraries root.
         } else {
             entries.push(("/", "filter"));
             if self.filter_active {
                 entries.push(("esc", "clear"));
             }
+        }
+        if self.sort_key_available() {
+            entries.push(("s", "sort"));
         }
         entries.push((
             "?",
@@ -598,6 +1121,12 @@ impl Browse {
             return;
         }
 
+        let mut third: Vec<(&str, &str)> = vec![("w", "toggle watched")];
+        if self.sort_key_available() {
+            third.push(("s", "sort (in collection)"));
+        }
+        third.push(("q", "quit"));
+        third.push(("?", "close help"));
         let columns: [&[(&str, &str)]; 3] = [
             &[
                 ("↑/k", "up"),
@@ -615,7 +1144,7 @@ impl Browse {
                 ("/", "search/filter"),
                 ("esc", "clear/back"),
             ],
-            &[("w", "toggle watched"), ("q", "quit"), ("?", "close help")],
+            &third,
         ];
         let areas = Layout::horizontal([
             Constraint::Length(26),
@@ -672,9 +1201,128 @@ mod tests {
 
     #[test]
     fn tab_cycle_wraps() {
+        assert_eq!(Tab::RecentlyAdded.next(), Tab::Libraries);
+        assert_eq!(Tab::Libraries.next(), Tab::Search);
         assert_eq!(Tab::Search.next(), Tab::Resume);
         assert_eq!(Tab::Resume.prev(), Tab::Search);
         assert_eq!(Tab::Resume.next(), Tab::NextUp);
+    }
+
+    fn library(id: &str, collection_type: Option<&str>) -> MediaItem {
+        MediaItem {
+            id: id.into(),
+            name: Some(id.to_string()),
+            kind: ItemKind::CollectionFolder,
+            collection_type: collection_type.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn library_kind_classifies_by_collection_type() {
+        assert_eq!(
+            library_kind(&library("a", Some("movies"))),
+            LibraryKind::Movies
+        );
+        assert_eq!(
+            library_kind(&library("b", Some("tvshows"))),
+            LibraryKind::Shows
+        );
+        assert_eq!(
+            library_kind(&library("c", Some("boxsets"))),
+            LibraryKind::Other
+        );
+        assert_eq!(
+            library_kind(&library("d", Some("music"))),
+            LibraryKind::Other
+        );
+        assert_eq!(library_kind(&library("e", None)), LibraryKind::Other);
+    }
+
+    #[test]
+    fn sort_api_params_cover_all_options() {
+        let expected = [
+            ("DateCreated", "Descending"),
+            ("DateCreated", "Ascending"),
+            ("SortName", "Ascending"),
+            ("SortName", "Descending"),
+            ("PremiereDate", "Descending"),
+            ("PremiereDate", "Ascending"),
+        ];
+        for (sort, expected) in SORT_OPTIONS.iter().zip(expected) {
+            assert_eq!(sort.api_params(), expected);
+        }
+        assert_eq!(Sort::DEFAULT.api_params(), ("DateCreated", "Descending"));
+        assert_eq!(
+            SORT_OPTIONS[0],
+            Sort::DEFAULT,
+            "default sorts first in the menu"
+        );
+    }
+
+    #[test]
+    fn should_fetch_more_predicate() {
+        // Never while a fetch is already in flight.
+        assert!(!should_fetch_more(99, 100, 500, true));
+        // Never once everything is loaded.
+        assert!(!should_fetch_more(99, 100, 100, false));
+        // Not while the cursor is far from the end of the window.
+        assert!(!should_fetch_more(10, 100, 500, false));
+        // At the threshold, with more available.
+        assert!(should_fetch_more(80, 100, 500, false));
+        // An empty list has nothing to page.
+        assert!(!should_fetch_more(0, 0, 0, false));
+    }
+
+    #[test]
+    fn library_query_per_level() {
+        let movies = LibraryLevel::Library {
+            library: library("lib-movies", Some("movies")),
+            kind: LibraryKind::Movies,
+        };
+        let query = build_library_query(&movies, Sort::DEFAULT, None, 0).unwrap();
+        assert_eq!(query.parent_id, "lib-movies");
+        assert_eq!(query.include_item_types, Some("Movie"));
+        assert!(query.recursive);
+        assert_eq!(query.limit, PAGE_SIZE);
+        assert_eq!(query.search_term, None);
+
+        let shows = LibraryLevel::Library {
+            library: library("lib-shows", Some("tvshows")),
+            kind: LibraryKind::Shows,
+        };
+        let query = build_library_query(&shows, Sort::DEFAULT, Some("expanse"), 100).unwrap();
+        assert_eq!(query.include_item_types, Some("Series"));
+        assert!(query.recursive);
+        assert_eq!(query.start_index, 100);
+        assert_eq!(query.search_term.as_deref(), Some("expanse"));
+
+        let other = LibraryLevel::Library {
+            library: library("lib-other", Some("boxsets")),
+            kind: LibraryKind::Other,
+        };
+        let query = build_library_query(&other, Sort::DEFAULT, Some(""), 0).unwrap();
+        assert_eq!(query.include_item_types, None);
+        assert!(!query.recursive, "collections list direct children");
+        assert_eq!(query.search_term, None, "empty filter sends no searchTerm");
+
+        let collection = LibraryLevel::Collection {
+            library: library("lib-other", Some("boxsets")),
+            collection: MediaItem {
+                id: "box1".into(),
+                kind: ItemKind::BoxSet,
+                ..Default::default()
+            },
+        };
+        let sort = Sort {
+            field: SortField::Name,
+            dir: SortDir::Ascending,
+        };
+        let query = build_library_query(&collection, sort, None, 0).unwrap();
+        assert_eq!(query.parent_id, "box1");
+        assert_eq!((query.sort_by, query.sort_order), ("SortName", "Ascending"));
+
+        assert!(build_library_query(&LibraryLevel::Root, Sort::DEFAULT, None, 0).is_none());
     }
 
     #[test]

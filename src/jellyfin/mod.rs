@@ -29,6 +29,26 @@ pub enum Error {
     Http(#[from] reqwest::Error),
 }
 
+/// Parameters for one page of an `/Items` listing under a parent (a library
+/// view or a collection). Owned strings so a query built on the render
+/// thread moves cleanly into the spawned request task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LibraryItemsQuery {
+    pub parent_id: String,
+    /// e.g. `Some("Movie")` / `Some("Series")`; `None` lists all children.
+    pub include_item_types: Option<&'static str>,
+    /// Recurse into folders (movie/show libraries); collections list their
+    /// direct children.
+    pub recursive: bool,
+    pub start_index: usize,
+    pub limit: usize,
+    /// "SortName" | "DateCreated" | "PremiereDate".
+    pub sort_by: &'static str,
+    /// "Ascending" | "Descending".
+    pub sort_order: &'static str,
+    pub search_term: Option<String>,
+}
+
 /// Everything needed to (re)connect: the jellyfin config section plus the
 /// secrets fetched from the OS keyring.
 #[derive(Clone)]
@@ -235,6 +255,39 @@ impl Client {
         .await
     }
 
+    /// The user's library views (Movies, Shows, Collections, ...).
+    pub async fn get_libraries(&self) -> Result<ItemsResponse, Error> {
+        self.request(Method::GET, &format!("/Users/{}/Views", self.user_id), &[])
+            .await
+    }
+
+    /// One page of items under a library or collection. Returns the full
+    /// response (not just the items) because the caller needs
+    /// `total_record_count` to drive pagination.
+    pub async fn get_library_items(
+        &self,
+        query: &LibraryItemsQuery,
+    ) -> Result<ItemsResponse, Error> {
+        let start_index = query.start_index.to_string();
+        let limit = query.limit.to_string();
+        let mut params: Vec<(&str, &str)> = vec![
+            ("parentId", query.parent_id.as_str()),
+            ("recursive", if query.recursive { "true" } else { "false" }),
+            ("startIndex", start_index.as_str()),
+            ("limit", limit.as_str()),
+            ("sortBy", query.sort_by),
+            ("sortOrder", query.sort_order),
+            ("fields", "MediaStreams"),
+        ];
+        if let Some(types) = query.include_item_types {
+            params.push(("includeItemTypes", types));
+        }
+        if let Some(term) = &query.search_term {
+            params.push(("searchTerm", term.as_str()));
+        }
+        self.request(Method::GET, "/Items", &params).await
+    }
+
     /// Episodes of a series; accepts a series or an episode of it.
     pub async fn get_episodes(&self, item: &MediaItem) -> Result<Vec<MediaItem>, Error> {
         let series_id = if item.kind == models::ItemKind::Series {
@@ -383,6 +436,23 @@ mod tests {
             let episodes = client.get_episodes(series).await.expect("episodes");
             assert!(!episodes.is_empty());
         }
+
+        let libraries = client.get_libraries().await.expect("libraries");
+        assert!(!libraries.items.is_empty(), "demo server should have views");
+        let page = client
+            .get_library_items(&LibraryItemsQuery {
+                parent_id: libraries.items[0].id.clone(),
+                include_item_types: None,
+                recursive: true,
+                start_index: 0,
+                limit: 5,
+                sort_by: "DateCreated",
+                sort_order: "Descending",
+                search_term: None,
+            })
+            .await
+            .expect("library items");
+        assert!(page.total_record_count >= page.items.len() as i64);
 
         let bad = Client::connect(Credentials {
             host: "https://demo.jellyfin.org/stable".into(),
