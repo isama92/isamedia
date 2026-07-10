@@ -9,7 +9,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 
 use crate::event::AppSender;
-use crate::jellyfin::{Client, LibraryItemsQuery, MediaItem, display, models::ItemKind};
+use crate::jellyfin::{
+    Client, LibraryItemsQuery, MediaItem, display, library_scope, models::ItemKind,
+};
 use crate::ui::input::TextInput;
 use crate::ui::{prompt, theme};
 
@@ -191,17 +193,12 @@ fn build_library_query(
 ) -> Option<LibraryItemsQuery> {
     let (parent_id, include_item_types, recursive) = match level {
         LibraryLevel::Root => return None,
-        LibraryLevel::Library { library, kind } => (
-            library.id.clone(),
-            match kind {
-                LibraryKind::Movies => Some("Movie"),
-                LibraryKind::Shows => Some("Series"),
-                LibraryKind::Other => None,
-            },
-            // Movie/show libraries recurse into folders; an Other library
-            // lists its direct children (the collections themselves).
-            !matches!(kind, LibraryKind::Other),
-        ),
+        LibraryLevel::Library { library, .. } => {
+            // Same scope the client uses for the root's item counts, so the
+            // number shown and the list opened can never disagree.
+            let (include_item_types, recursive) = library_scope(library.collection_type.as_deref());
+            (library.id.clone(), include_item_types, recursive)
+        }
         LibraryLevel::Collection { collection, .. } => (collection.id.clone(), None, false),
     };
     let (sort_by, sort_order) = sort.api_params();
