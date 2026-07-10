@@ -155,11 +155,9 @@ impl LoginForm {
         if let Some(err) = self.host_error() {
             Line::styled(format!(" {err}"), theme::dim()).render(rows[3], buf);
         } else if self.plain_http() {
-            Line::styled(
-                " http:// sends credentials unencrypted; prefer https://",
-                theme::dim(),
-            )
-            .render(rows[3], buf);
+            // Short enough to fit the half-width form box on 80 columns.
+            Line::styled(" http:// is unencrypted; prefer https://", theme::dim())
+                .render(rows[3], buf);
         }
 
         let (label_area, input_area) = field_area(rows[4]);

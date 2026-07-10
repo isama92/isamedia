@@ -249,7 +249,15 @@ impl JellyfinApp {
                         .as_ref()
                         .map(|(h, u, p)| (h.as_str(), u.as_str(), p.as_str())),
                 );
-                self.screen = Screen::Browse(Browse::new(client, self.sender.clone()));
+                let plain_http = client.host.to_ascii_lowercase().starts_with("http://");
+                let mut browse = Browse::new(client, self.sender.clone());
+                if plain_http {
+                    // The login form warns about this too, but auto-login
+                    // (stored host + token) never shows the form.
+                    browse.notice =
+                        Some("connected over plain http://; traffic is unencrypted".into());
+                }
+                self.screen = Screen::Browse(browse);
             }
             Err(err) => {
                 tracing::warn!(%err, "authentication failed");
