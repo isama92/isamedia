@@ -434,14 +434,14 @@ impl Browse {
         if let Some(series) = &self.current_series {
             spans.push(Span::styled(
                 format!(" {} ", display::item_title(series)),
-                Style::new().fg(theme::FG).bg(theme::ACCENT),
+                Style::new().fg(theme::CHROME_FG).bg(theme::ACCENT),
             ));
         } else {
             for tab in Tab::ALL {
                 let style = if tab == self.tab {
-                    Style::new().fg(theme::FG).bg(theme::ACCENT)
+                    Style::new().fg(theme::CHROME_FG).bg(theme::ACCENT)
                 } else {
-                    Style::new().fg(theme::FG).bg(theme::TAB_BG)
+                    Style::new().fg(theme::CHROME_FG).bg(theme::TAB_BG)
                 };
                 spans.push(Span::styled(format!(" {} ", tab.name()), style));
                 spans.push(Span::raw(" "));
