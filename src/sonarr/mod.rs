@@ -149,6 +149,39 @@ impl Client {
         Ok(())
     }
 
+    /// Remove a series from the library, including every season and episode.
+    /// `delete_files` also deletes its files from disk; `add_import_exclusion`
+    /// adds an import-list exclusion so a list can't re-add it. Both ride as
+    /// query params, like the delete-queue endpoint (see
+    /// `arr::Transport::delete_queue_items`).
+    pub async fn delete_series(
+        &self,
+        series_id: i64,
+        delete_files: bool,
+        add_import_exclusion: bool,
+    ) -> Result<(), Error> {
+        self.transport
+            .send(
+                Method::DELETE,
+                &format!("/api/v3/series/{series_id}"),
+                &[
+                    ("deleteFiles", if delete_files { "true" } else { "false" }),
+                    (
+                        "addImportListExclusion",
+                        if add_import_exclusion {
+                            "true"
+                        } else {
+                            "false"
+                        },
+                    ),
+                ],
+                None,
+                None,
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Past grab/import/delete events of one episode, for the
     /// "grabbed before" marker in interactive search results. Paginated,
     /// unlike Radarr's /history/movie.
