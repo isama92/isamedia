@@ -1,0 +1,75 @@
+name: Conventions
+
+on:
+  pull_request:
+    # ready_for_review matters: a draft PR with a bad title, marked ready with
+    # no further commits, would otherwise never fire an event with draft==false
+    # and its title would go unvalidated.
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: conventions-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pr-title:
+    name: Check PR title
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    if: github.event.pull_request.draft == false
+    steps:
+      # The PR title is what a squash-merge lands on main, and release-plz reads
+      # those Conventional Commit messages to compute the next version. Enforce
+      # the format so version bumps are reliable.
+      - name: Validate Conventional Commit title
+        uses: amannn/action-semantic-pull-request@e32d7e603df1aa1ba07e981f2a23455dee596825 # v5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          types: |
+            feat
+            fix
+            chore
+            docs
+            refactor
+            perf
+            test
+            build
+            ci
+
+      # Apply a cosmetic type label from the title prefix (for filtering PRs in
+      # the UI). Best-effort: versioning does not depend on labels, so a missing
+      # label in the repo must not fail the check.
+      - name: Apply type label
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const match = (pr.title || '').match(/^(\w+)(\([^)]*\))?!?:/);
+            const type = match ? match[1] : '';
+            const label = { feat: 'feature', fix: 'bug', docs: 'documentation' }[type] || 'chore';
+            const managed = ['feature', 'bug', 'documentation', 'chore'];
+            const current = pr.labels.map((l) => l.name);
+
+            for (const name of managed) {
+              if (name !== label && current.includes(name)) {
+                await github.rest.issues
+                  .removeLabel({ ...context.repo, issue_number: pr.number, name })
+                  .catch(() => {});
+              }
+            }
+            if (!current.includes(label)) {
+              try {
+                await github.rest.issues.addLabels({
+                  ...context.repo,
+                  issue_number: pr.number,
+                  labels: [label],
+                });
+              } catch (error) {
+                core.warning(`Could not apply "${label}" label: ${error.message}`);
+              }
+            }

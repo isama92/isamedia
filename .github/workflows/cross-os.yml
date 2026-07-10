@@ -1,0 +1,58 @@
+name: Cross-OS check
+
+# The PR gate (ci.yml) only compiles on Linux, so the cfg-gated Windows/macOS
+# code (keyring + TLS backends) is never checked there. Compile it post-merge
+# on main so platform breakage is caught within minutes of merge, without
+# paying the Windows (2x) / macOS (10x) Actions-minute multiplier on every PR
+# push. A separate push-only workflow keeps this off the PR checks entirely.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cross-os-${{ github.ref }}
+  # Runs only on push to main; don't cancel a post-merge run when merges land
+  # back to back, or the earlier merge loses its cross-OS signal.
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  check:
+    name: Compile check (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+          - os: macos-14
+            target: aarch64-apple-darwin
+          # Intel mac: cross-compiled from the arm64 runner in release.yml and
+          # checked nowhere else, so compile-check it here before release.
+          - os: macos-14
+            target: x86_64-apple-darwin
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Check
+        run: cargo check --locked --target ${{ matrix.target }}

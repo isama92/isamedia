@@ -185,6 +185,14 @@ is I/O-bound on network calls, not compute-bound).
 - After a branch merges, clean up: `git worktree remove feature/<branch-name>`
   and delete the branch so stale worktrees and merged branches don't
   accumulate.
+- Never `git push --force` (or `--force-with-lease`) on a branch that has been
+  pushed. Add new commits instead of rewriting history; PRs are squashed on
+  merge, so the individual commits do not need tidying. Force-pushing breaks
+  the merge-base for reviewers and can drop others' work.
+- PR titles must be Conventional Commits (`feat:`, `fix:`, `feat!:`, `chore:`,
+  ...). Because PRs are squash-merged, the title becomes the commit on `main`
+  that release-plz reads to decide the next version. See "Continuous
+  integration and releases".
 - Clear, descriptive commit messages.
 - No commented-out code, no debug `println!`/`dbg!` left behind.
 - Don't leave a newly introduced `.unwrap()` in code that ships.
@@ -203,3 +211,26 @@ is I/O-bound on network calls, not compute-bound).
 - [ ] Any spawned external process cleans up (`kill_on_drop` plus socket
       removal) on every exit path
 - [ ] A new app implements the full `MediaApp` contract
+
+## Continuous integration and releases
+
+GitHub Actions live in `.github/`. Third-party actions are pinned by commit
+SHA (with a version comment); Dependabot bumps them, so keep the pinning when
+editing.
+
+- `ci.yml` is the PR gate: `fmt`/`clippy`/`build`/`test` on Linux for every
+  non-draft PR. It is the required check that blocks merge. The cfg-gated
+  Windows/macOS code (keyring + TLS backends) is compile-checked by
+  `cross-os.yml` only post-merge on `main`, to avoid the Windows (2x) / macOS
+  (10x) Actions-minute multiplier on every PR push. If you touch a `#[cfg(windows)]` /
+  `#[cfg(target_os = ...)]` path, build it locally for that target before
+  merging, since PR CI will not.
+- Versioning is automated by release-plz (Conventional Commits), not by hand.
+  Do not bump `version` in `Cargo.toml` in a feature PR: on push to `main`,
+  release-plz opens a "chore: release X.Y.Z" PR that bumps `Cargo.toml`,
+  `Cargo.lock` and `CHANGELOG.md`. Merging that PR tags `vX.Y.Z` and publishes
+  the GitHub release, which triggers `release.yml` to build and attach the
+  Linux/Windows/macOS binaries. `Cargo.toml` stays the source of truth for the
+  version, so `isamedia --version` is always correct.
+- `publish = false` in `Cargo.toml` keeps this bin-only crate off crates.io;
+  release-plz only cuts git tags and GitHub releases.

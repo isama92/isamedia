@@ -1,0 +1,13 @@
+[workspace]
+# Cut a git tag and a GitHub release for every version bump; the release event
+# is what triggers the cross-platform binary build in release.yml.
+git_release_enable = true
+git_tag_enable = true
+# Match the v-prefixed tag scheme used by release.yml asset names and CLAUDE.md.
+git_tag_name = "v{{ version }}"
+git_release_name = "v{{ version }}"
+# Maintain CHANGELOG.md from Conventional Commit messages.
+changelog_update = true
+# This is a binary application, not a crate: do not publish to crates.io.
+# (Cargo.toml also sets publish = false.)
+publish = false

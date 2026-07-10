@@ -2,6 +2,10 @@
 name = "isamedia"
 version = "0.1.0"
 edition = "2024"
+# Application binary, not a library: never published to crates.io. This also
+# tells release-plz to cut git tags and GitHub releases only, skipping the
+# registry.
+publish = false
 
 [dependencies]
 anyhow = "1.0.103"
