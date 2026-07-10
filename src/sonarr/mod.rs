@@ -204,6 +204,76 @@ impl Client {
         Ok(())
     }
 
+    /// Toggle a series' monitored flag via the bulk editor endpoint, which
+    /// takes only the ids and the changed field (the `Series` model is
+    /// deserialize-only, so we can't PUT the whole resource back).
+    pub async fn set_series_monitored(&self, series_id: i64, monitored: bool) -> Result<(), Error> {
+        let body = serde_json::json!({ "seriesIds": [series_id], "monitored": monitored });
+        self.transport
+            .send(Method::PUT, "/api/v3/series/editor", &[], Some(&body), None)
+            .await?;
+        Ok(())
+    }
+
+    /// Toggle a season's monitored flag. Season monitoring lives inside the
+    /// series object and there is no per-season editor, so fetch the series as
+    /// raw JSON, flip the matching season, and PUT it back.
+    pub async fn set_season_monitored(
+        &self,
+        series_id: i64,
+        season_number: i32,
+        monitored: bool,
+    ) -> Result<(), Error> {
+        let mut series: serde_json::Value = self
+            .transport
+            .request(
+                Method::GET,
+                &format!("/api/v3/series/{series_id}"),
+                &[],
+                None,
+            )
+            .await?;
+        if let Some(seasons) = series.get_mut("seasons").and_then(|s| s.as_array_mut()) {
+            for season in seasons {
+                if season.get("seasonNumber").and_then(|n| n.as_i64())
+                    == Some(i64::from(season_number))
+                    && let Some(obj) = season.as_object_mut()
+                {
+                    obj.insert("monitored".into(), serde_json::Value::Bool(monitored));
+                }
+            }
+        }
+        self.transport
+            .send(
+                Method::PUT,
+                &format!("/api/v3/series/{series_id}"),
+                &[],
+                Some(&series),
+                None,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Toggle one episode's monitored flag via the dedicated bulk endpoint.
+    pub async fn set_episode_monitored(
+        &self,
+        episode_id: i64,
+        monitored: bool,
+    ) -> Result<(), Error> {
+        let body = serde_json::json!({ "episodeIds": [episode_id], "monitored": monitored });
+        self.transport
+            .send(
+                Method::PUT,
+                "/api/v3/episode/monitor",
+                &[],
+                Some(&body),
+                None,
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Past grab/import/delete events of one episode, for the
     /// "grabbed before" marker in interactive search results. Paginated,
     /// unlike Radarr's /history/movie.

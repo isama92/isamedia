@@ -96,4 +96,8 @@ pub enum CommandKind {
     /// generation counter).
     DeleteSeries(i64),
     DeleteQueue,
+    /// A monitored toggle (series, season, or episode): the refetched indicator
+    /// is the only feedback, so this carries no payload and sets no notice. The
+    /// refetch is driven by the current level.
+    SetMonitored,
 }

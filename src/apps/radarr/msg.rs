@@ -91,4 +91,7 @@ pub enum CommandKind {
     /// generation counter).
     DeleteMovie(i64),
     DeleteQueue,
+    /// A monitored toggle: the refetched indicator is the only feedback, so
+    /// this carries no payload and sets no notice.
+    SetMonitored,
 }

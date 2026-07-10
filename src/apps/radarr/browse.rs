@@ -540,6 +540,11 @@ impl Browse {
                 self.fetch_queue();
                 self.notice = Some("removed from queue".into());
             }
+            CommandKind::SetMonitored => {
+                // Refetch so the list and the embedded detail copy repaint from
+                // the server; the flipped indicator is feedback enough.
+                self.fetch_movies();
+            }
         }
         false
     }
@@ -1578,12 +1583,31 @@ impl Browse {
                     ));
                 }
             }
+            KeyCode::Char('m') => self.toggle_monitored(),
             KeyCode::Char('r') => self.refresh(),
             KeyCode::Char('?') => self.show_full_help = !self.show_full_help,
             KeyCode::Char('q') => return Some(BrowseAction::Quit),
             _ => {}
         }
         None
+    }
+
+    /// Flip the monitored flag on the selected movie (list) or the movie the
+    /// detail is showing. Copy the id/new-state out before spawning so the
+    /// borrow of `self.level` ends before `spawn_command` takes `&mut self`.
+    fn toggle_monitored(&mut self) {
+        let (id, want) = match &self.level {
+            Level::MovieList => match self.selected_movie() {
+                Some(movie) => (movie.id, !movie.monitored),
+                None => return,
+            },
+            Level::MovieDetail { movie } => (movie.id, !movie.monitored),
+            _ => return,
+        };
+        let client = self.client.clone();
+        self.spawn_command(CommandKind::SetMonitored, async move {
+            client.set_movie_monitored(id, want).await
+        });
     }
 
     pub fn draw(&mut self, frame: &mut Frame, area: Rect) {
@@ -1846,13 +1870,30 @@ impl Browse {
             let selected = i == self.movie_cursor;
 
             let title = truncate(movie.title.as_deref().unwrap_or("(untitled)"), title_width);
-            let meta = truncate(&display::movie_meta(movie), text_width);
+            // Reserve room for the unmonitored marker so a long meta line
+            // can't clip it, mirroring the Sonarr episode row.
+            let mon_word = if movie.monitored {
+                ""
+            } else {
+                display::monitored_label(false)
+            };
+            let meta_reserve = if mon_word.is_empty() {
+                0
+            } else {
+                mon_word.chars().count() + 3 // " • " separator
+            };
+            let meta = truncate(
+                &display::movie_meta(movie),
+                text_width.saturating_sub(meta_reserve),
+            );
 
+            // Unmonitored movies dim like unreleased ones, and carry an
+            // explicit marker on the meta line so the state is unmistakable.
             let title_style = if selected {
                 Style::new()
                     .fg(theme::accent_bright())
                     .add_modifier(Modifier::BOLD)
-            } else if unreleased {
+            } else if unreleased || !movie.monitored {
                 theme::dim()
             } else {
                 Style::new().fg(theme::fg())
@@ -1880,7 +1921,15 @@ impl Browse {
                 } else {
                     theme::dim()
                 };
-                Line::from(vec![gutter(selected), Span::styled(meta, meta_style)]).render(
+                let mut meta_spans = vec![gutter(selected)];
+                if !meta.is_empty() {
+                    meta_spans.push(Span::styled(meta, meta_style));
+                }
+                if !mon_word.is_empty() {
+                    let prefix = if meta_spans.len() > 1 { " • " } else { "" };
+                    meta_spans.push(Span::styled(format!("{prefix}{mon_word}"), theme::dim()));
+                }
+                Line::from(meta_spans).render(
                     Rect::new(area.x, y + 1, area.width.saturating_sub(1), 1),
                     buf,
                 );
@@ -1931,13 +1980,17 @@ impl Browse {
             )),
             &mut y,
         );
-        let meta = display::movie_meta(movie);
-        if !meta.is_empty() {
-            line(
-                Line::from(Span::styled(format!("  {meta}"), theme::dim())),
-                &mut y,
-            );
-        }
+        // Always surface the monitored state in the header (there is room),
+        // appended to the meta line like the Sonarr season label.
+        let monitored = display::monitored_label(movie.monitored);
+        let meta = match display::movie_meta(movie) {
+            m if m.is_empty() => monitored.to_string(),
+            m => format!("{m} • {monitored}"),
+        };
+        line(
+            Line::from(Span::styled(format!("  {meta}"), theme::dim())),
+            &mut y,
+        );
         y += 1;
 
         let bottom = area.y + area.height;
@@ -2260,6 +2313,7 @@ impl Browse {
                     entries.push(("esc", "clear"));
                 }
                 entries.push(("s", "sort"));
+                entries.push(("m", "monitor"));
             }
             Level::Downloads => {
                 entries.push(("esc", "back"));
@@ -2273,6 +2327,7 @@ impl Browse {
                     entries.push(("x", "delete file"));
                 }
                 entries.push(("z", "delete"));
+                entries.push(("m", "monitor"));
                 // Only offered when the overview is actually capped.
                 if self.overview_truncatable {
                     entries.push((
