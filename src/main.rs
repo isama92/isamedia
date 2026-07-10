@@ -1,5 +1,6 @@
 mod app;
 mod apps;
+mod arr;
 mod cli;
 mod config;
 mod event;
