@@ -615,12 +615,7 @@ impl Browse {
                 ("/", "search/filter"),
                 ("esc", "clear/back"),
             ],
-            &[
-                ("w", "toggle watched"),
-                ("ctrl+t", "choose theme"),
-                ("q", "quit"),
-                ("?", "close help"),
-            ],
+            &[("w", "toggle watched"), ("q", "quit"), ("?", "close help")],
         ];
         let areas = Layout::horizontal([
             Constraint::Length(26),

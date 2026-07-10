@@ -32,6 +32,7 @@ async fn main() -> Result<()> {
     let config = Config::load_or_init(&config_path)?;
     // Set the palette before the first draw so the initial frame is themed.
     crate::ui::theme::init(config.theme);
+    crate::ui::theme::init_accent(config.accent);
     let config = Arc::new(Mutex::new(config));
 
     let (tx, rx) = mpsc::unbounded_channel();
