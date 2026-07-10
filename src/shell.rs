@@ -2,7 +2,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use ratatui::crossterm::event::{Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
@@ -63,11 +65,7 @@ impl Shell {
                     }
                 }
                 Event::App(app_event) => {
-                    if let Some(app) = self
-                        .apps
-                        .iter_mut()
-                        .find(|app| app.id() == app_event.app)
-                    {
+                    if let Some(app) = self.apps.iter_mut().find(|app| app.id() == app_event.app) {
                         app.on_event(app_event.payload);
                     }
                 }

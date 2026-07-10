@@ -15,7 +15,9 @@ pub fn normalize_host(host: &str) -> Result<String, Error> {
         Some(idx) => {
             let scheme = host[..idx].to_ascii_lowercase();
             if scheme != "http" && scheme != "https" {
-                return Err(Error::InvalidHost("host must use http:// or https://".into()));
+                return Err(Error::InvalidHost(
+                    "host must use http:// or https://".into(),
+                ));
             }
             &host[idx + 3..]
         }
@@ -58,7 +60,11 @@ mod tests {
     #[test]
     fn streaming_url() {
         assert_eq!(
-            stream_url("https://example.com/jellyfin/", "127ac3264ae6ff99c33b9bfce1f0b160").unwrap(),
+            stream_url(
+                "https://example.com/jellyfin/",
+                "127ac3264ae6ff99c33b9bfce1f0b160"
+            )
+            .unwrap(),
             "https://example.com/jellyfin/videos/127ac3264ae6ff99c33b9bfce1f0b160/stream?static=true"
         );
     }

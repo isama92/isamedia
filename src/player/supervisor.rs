@@ -131,7 +131,10 @@ pub(super) async fn run(
     };
     let (reader, writer) = tokio::io::split(stream);
     let mut lines = BufReader::new(reader).lines();
-    let mut ipc = Ipc { writer, request_id: 0 };
+    let mut ipc = Ipc {
+        writer,
+        request_id: 0,
+    };
 
     // Everything below returns early only through the loop; errors while
     // driving mpv are reported but non-fatal where jfsh treated them so.
@@ -190,6 +193,13 @@ pub(super) async fn run(
                 let Some(msg) = ipc::parse_message(&line) else {
                     continue;
                 };
+                // Command replies: surface failures (e.g. a rejected loadfile).
+                if msg.event.is_none() {
+                    if let Some(error) = msg.error.as_deref().filter(|&e| e != "success") {
+                        tracing::warn!(error, line, "mpv command failed");
+                    }
+                    continue;
+                }
                 match msg.event.as_deref() {
                     Some("property-change") => match msg.name.as_deref() {
                         Some("time-pos") => {
