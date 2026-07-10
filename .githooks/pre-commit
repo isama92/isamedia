@@ -1,0 +1,41 @@
+#!/bin/sh
+# Block a commit when staged Rust code is not rustfmt-clean or trips clippy.
+#
+# Enable once per clone (see README, "Git hooks"):
+#   git config core.hooksPath .githooks
+set -eu
+
+# Nothing to check unless a .rs file is staged (added/copied/modified).
+if ! git diff --cached --name-only --diff-filter=ACM | grep -q '\.rs$'; then
+    exit 0
+fi
+
+# GUI git clients often don't inherit an interactive shell's PATH, so make
+# sure the rustup/cargo shim dir is reachable before looking for cargo.
+if [ -d "$HOME/.cargo/bin" ]; then
+    PATH="$HOME/.cargo/bin:$PATH"
+fi
+
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "Commit blocked: 'cargo' not found on PATH, cannot check the code." >&2
+    echo "Install Rust (https://rustup.rs) or add ~/.cargo/bin to your PATH." >&2
+    exit 1
+fi
+
+# Fast check first: formatting needs no compile.
+if ! cargo fmt --all --check; then
+    echo >&2
+    echo "Commit blocked: Rust code is not formatted." >&2
+    echo "Run 'cargo fmt --all', re-stage, and commit again." >&2
+    echo "(To bypass in an emergency: 'git commit --no-verify'.)" >&2
+    exit 1
+fi
+
+# Slower check: clippy compiles, so only reached once formatting is clean.
+if ! cargo clippy --all-targets -- -D warnings; then
+    echo >&2
+    echo "Commit blocked: clippy reported warnings." >&2
+    echo "Fix them (or try 'cargo clippy --fix'), re-stage, and commit again." >&2
+    echo "(To bypass in an emergency: 'git commit --no-verify'.)" >&2
+    exit 1
+fi

@@ -96,6 +96,19 @@ cargo test demo_server -- --ignored   # smoke test against demo.jellyfin.org
 cargo clippy --all-targets
 ```
 
+### Git hooks
+
+A committed `pre-commit` hook rejects a commit whose staged Rust changes are
+not `rustfmt`-clean or trip clippy. Enable it once per clone:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+When a `.rs` file is staged the hook runs `cargo fmt --all --check` first,
+then `cargo clippy --all-targets -- -D warnings`. Bypass it in an emergency
+with `git commit --no-verify`.
+
 Architecture notes: one central event loop (tokio mpsc channel); all state
 mutation is synchronous in the shell loop, every await lives in a spawned
 task. Apps implement the `MediaApp` trait (`src/app.rs`); adding Sonarr later
