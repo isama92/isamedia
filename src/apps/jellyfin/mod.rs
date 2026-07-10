@@ -446,6 +446,12 @@ impl MediaApp for JellyfinApp {
         false
     }
 
+    fn ready_to_quit(&self) -> bool {
+        // The player clears on Exited, which the supervisor emits only after
+        // mpv is gone and the final playback report has been flushed.
+        self.player.is_none()
+    }
+
     fn status_line(&self) -> Option<ratatui::text::Line<'static>> {
         let player = self.player.as_ref()?;
         let position = format_clock(player.now.position_secs);

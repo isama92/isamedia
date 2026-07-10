@@ -76,14 +76,34 @@ impl Shell {
                     needs_grace |= app.on_quit();
                 }
                 if needs_grace {
-                    // Give shutdown tasks (mpv quit, final playback report) a
-                    // moment before the runtime is torn down.
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    self.drain_shutdown().await;
                 }
                 break;
             }
         }
         Ok(())
+    }
+
+    /// Keep routing app events until every app has finished its shutdown
+    /// work (e.g. the player's Exited after mpv quit and the final playback
+    /// report) or the deadline passes. A fixed sleep would either waste time
+    /// or cut the final report short; this leaves as soon as the work is
+    /// actually done.
+    async fn drain_shutdown(&mut self) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !self.apps.iter().all(|app| app.ready_to_quit()) {
+            match tokio::time::timeout_at(deadline, self.rx.recv()).await {
+                Ok(Some(Event::App(app_event))) => {
+                    if let Some(app) = self.apps.iter_mut().find(|app| app.id() == app_event.app) {
+                        app.on_event(app_event.payload);
+                    }
+                }
+                // Ignore keys and ticks; the UI is already done.
+                Ok(Some(_)) => {}
+                // Channel closed or deadline reached: stop waiting.
+                Ok(None) | Err(_) => break,
+            }
+        }
     }
 
     fn on_key(&mut self, key: KeyEvent) {
