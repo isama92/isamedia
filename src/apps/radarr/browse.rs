@@ -13,12 +13,13 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 
+use crate::apps::downloads;
 use crate::event::AppSender;
 use crate::radarr::display::{self, MOVIE_SORTS, MovieSort, MovieStatus};
 use crate::radarr::{Client, HistoryRecord, Movie, QualityProfile, QueueItem, Release, RootFolder};
 use crate::ui::input::TextInput;
 use crate::ui::text::{truncate, wrap_text};
-use crate::ui::{prompt, theme};
+use crate::ui::{list, prompt, theme};
 
 use super::msg::{CommandKind, Msg};
 
@@ -49,6 +50,8 @@ enum Level {
     /// Add a new movie: a persistent search box over movie/lookup and its
     /// results, from which the add wizard starts.
     Add,
+    /// The download queue as a list the user can mark and remove from.
+    Downloads,
 }
 
 /// A pending yes/no decision; modal while set.
@@ -111,8 +114,11 @@ pub struct Browse {
     movie_cursor: usize,
     releases: Vec<Release>,
     release_cursor: usize,
-    /// Download queue, refreshed by the poll; drives every ↓ marker.
+    /// Download queue, refreshed by the poll; drives every ↓ marker and the
+    /// Downloads view.
     queue: Vec<QueueItem>,
+    /// Selection + prompt state for the Downloads level.
+    downloads: downloads::Downloads,
     /// History of the movie currently being searched interactively.
     history: Vec<HistoryRecord>,
 
@@ -192,6 +198,7 @@ impl Browse {
             releases: Vec::new(),
             release_cursor: 0,
             queue: Vec::new(),
+            downloads: downloads::Downloads::default(),
             history: Vec::new(),
             filter: TextInput::default(),
             filter_active: false,
@@ -354,7 +361,7 @@ impl Browse {
                 // grab) must also refresh the embedded copy the detail
                 // renders from.
                 let embedded = match &mut self.level {
-                    Level::MovieList | Level::Add => None,
+                    Level::MovieList | Level::Add | Level::Downloads => None,
                     Level::MovieDetail { movie } | Level::Search { movie } => Some(movie),
                 };
                 if let Some(movie) = embedded
@@ -386,7 +393,10 @@ impl Browse {
         }
         self.queue_loading = false;
         match result {
-            Ok(queue) => self.queue = queue,
+            Ok(queue) => {
+                self.queue = queue;
+                self.downloads.prune(&self.queue);
+            }
             Err(crate::radarr::Error::Unauthorized) => return true,
             Err(err) => tracing::debug!(%err, "queue poll failed"),
         }
@@ -470,6 +480,11 @@ impl Browse {
                 self.fetch_movies();
                 self.fetch_queue();
                 self.notice = Some("movie file deleted".into());
+            }
+            CommandKind::DeleteQueue => {
+                self.downloads.clear_marks();
+                self.fetch_queue();
+                self.notice = Some("removed from queue".into());
             }
         }
         false
@@ -626,6 +641,7 @@ impl Browse {
             Level::MovieDetail { .. } => None,
             Level::Search { .. } => Some((&mut self.release_cursor, self.releases.len())),
             Level::Add => Some((&mut self.add_cursor, self.add_results.len())),
+            Level::Downloads => Some((&mut self.downloads.cursor, self.queue.len())),
         }
     }
 
@@ -648,6 +664,8 @@ impl Browse {
                 }
             }
             Level::Add => self.start_add_flow(),
+            // Nothing to open; Space is intercepted earlier to toggle a mark.
+            Level::Downloads => {}
         }
     }
 
@@ -656,6 +674,10 @@ impl Browse {
     fn pop_level(&mut self) -> bool {
         match std::mem::replace(&mut self.level, Level::MovieList) {
             Level::MovieList => false,
+            Level::Downloads => {
+                self.downloads.reset();
+                true
+            }
             Level::MovieDetail { .. } => {
                 self.overview_fullscreen = false;
                 true
@@ -686,6 +708,7 @@ impl Browse {
 
     fn refresh(&mut self) {
         match &self.level {
+            Level::Downloads => self.fetch_queue(),
             Level::MovieList | Level::MovieDetail { .. } => {
                 self.fetch_movies();
                 self.fetch_queue();
@@ -1046,6 +1069,24 @@ impl Browse {
             return None;
         }
 
+        // The delete-downloads prompt is modal: toggles + commit/cancel.
+        if self.downloads.is_prompting() {
+            if let downloads::DeleteAction::Commit {
+                ids,
+                remove_from_client,
+                blocklist,
+            } = self.downloads.handle_prompt_key(key)
+            {
+                let client = self.client.clone();
+                self.spawn_command(CommandKind::DeleteQueue, async move {
+                    client
+                        .delete_queue_items(&ids, remove_from_client, blocklist)
+                        .await
+                });
+            }
+            return None;
+        }
+
         // Popups are modal: while open each owns every key.
         if self.confirm.is_some() {
             match key.code {
@@ -1160,6 +1201,13 @@ impl Browse {
                     *cursor += 1;
                 }
             }
+            // Opening Downloads must come before the `d` page-down alias
+            // below, but only claims `d` on the main list.
+            KeyCode::Char('d') if matches!(self.level, Level::MovieList) => {
+                self.level = Level::Downloads;
+                self.downloads.reset();
+                self.fetch_queue();
+            }
             KeyCode::PageUp | KeyCode::Char('b') | KeyCode::Char('u') => {
                 if let Some((cursor, _)) = self.cursor_and_len() {
                     *cursor = cursor.saturating_sub(page_jump);
@@ -1200,6 +1248,11 @@ impl Browse {
                     self.apply_filter();
                 }
             }
+            // On the Downloads level Space marks the highlighted row instead
+            // of opening anything.
+            KeyCode::Char(' ') if matches!(self.level, Level::Downloads) => {
+                self.downloads.toggle_mark(&self.queue);
+            }
             KeyCode::Enter | KeyCode::Char(' ') => self.open_selected(),
 
             KeyCode::Char('s') if matches!(self.level, Level::MovieList) => {
@@ -1227,6 +1280,7 @@ impl Browse {
                 {
                     self.rejections_popup = Some(0);
                 }
+                Level::Downloads => self.downloads.begin_delete(&self.queue),
                 _ => {}
             },
             KeyCode::Char('r') => self.refresh(),
@@ -1239,6 +1293,8 @@ impl Browse {
 
     pub fn draw(&mut self, frame: &mut Frame, area: Rect) {
         self.last_height = area.height;
+        // The background poll can shrink the queue under a stale cursor.
+        self.downloads.clamp(self.queue.len());
         let has_message = self.error.is_some() || self.notice.is_some();
         let show_filter = self.filter_active && matches!(self.level, Level::MovieList);
         let show_add_input = matches!(self.level, Level::Add);
@@ -1274,6 +1330,7 @@ impl Browse {
                 Level::MovieDetail { .. } => self.draw_movie_detail(frame, rows[3]),
                 Level::Search { .. } => self.draw_search(frame, rows[3]),
                 Level::Add => self.draw_add_results(frame, rows[3]),
+                Level::Downloads => self.draw_downloads(frame, rows[3]),
             }
         }
         self.draw_help(frame, rows[4]);
@@ -1314,6 +1371,7 @@ impl Browse {
             let (title, labels) = self.add_step_menu();
             prompt::draw_menu(frame, area, title, &labels, cursor);
         }
+        self.downloads.draw_prompt(frame, area);
     }
 
     fn breadcrumb(&self) -> String {
@@ -1328,6 +1386,14 @@ impl Browse {
                     "Add movie".to_string()
                 } else {
                     format!("Add movie / {term}")
+                }
+            }
+            Level::Downloads => {
+                let marked = self.downloads.marked();
+                if marked > 0 {
+                    format!("Downloads ({marked} marked)")
+                } else {
+                    format!("Downloads ({})", self.queue.len())
                 }
             }
         }
@@ -1387,7 +1453,7 @@ impl Browse {
         }
         let avail_height = area.height as usize;
         let items_per_page = (avail_height / 4).max(1);
-        let first = Self::window_start(self.add_cursor, self.add_results.len(), items_per_page);
+        let first = list::window_start(self.add_cursor, self.add_results.len(), items_per_page);
         let last = (first + items_per_page).min(self.add_results.len());
         let text_width = area.width.saturating_sub(6) as usize;
 
@@ -1431,35 +1497,7 @@ impl Browse {
             y += 4;
         }
         if self.add_results.len() > items_per_page {
-            Self::draw_scrollbar(buf, area, self.add_cursor, self.add_results.len());
-        }
-    }
-
-    /// The centered window of a cursor list: which item to draw first.
-    fn window_start(cursor: usize, len: usize, per_page: usize) -> usize {
-        let mut first = cursor.saturating_sub(per_page / 2);
-        if first > len.saturating_sub(per_page) {
-            first = len.saturating_sub(per_page);
-        }
-        first
-    }
-
-    fn draw_scrollbar(buf: &mut ratatui::buffer::Buffer, area: Rect, cursor: usize, len: usize) {
-        if len < 2 {
-            return;
-        }
-        let height = area.height as usize;
-        let x = area.x + area.width - 1;
-        let thumb = ((cursor as f64 / (len - 1) as f64) * (height - 1) as f64).round() as usize;
-        for i in 0..height {
-            let (symbol, style) = if i == thumb {
-                ("█", Style::new().fg(theme::accent_color()))
-            } else {
-                ("│", theme::dim())
-            };
-            buf[(x, area.y + i as u16)]
-                .set_symbol(symbol)
-                .set_style(style);
+            list::draw_scrollbar(buf, area, self.add_cursor, self.add_results.len());
         }
     }
 
@@ -1496,7 +1534,7 @@ impl Browse {
         }
         let avail_height = area.height as usize;
         let items_per_page = (avail_height / 3).max(1);
-        let first = Self::window_start(self.movie_cursor, self.movies.len(), items_per_page);
+        let first = list::window_start(self.movie_cursor, self.movies.len(), items_per_page);
         let last = (first + items_per_page).min(self.movies.len());
         let now = display::now_utc_iso();
         let text_width = area.width.saturating_sub(6) as usize;
@@ -1552,8 +1590,24 @@ impl Browse {
             y += 3;
         }
         if self.movies.len() > items_per_page {
-            Self::draw_scrollbar(buf, area, self.movie_cursor, self.movies.len());
+            list::draw_scrollbar(buf, area, self.movie_cursor, self.movies.len());
         }
+    }
+
+    /// The download queue as a markable list. The shared renderer handles
+    /// layout and selection; this only resolves the movie name from the cache
+    /// (falling back to the release title on the queue item).
+    fn draw_downloads(&self, frame: &mut Frame, area: Rect) {
+        self.downloads
+            .draw_list(frame, area, &self.queue, |item| downloads::DownloadRow {
+                name: item
+                    .movie_id
+                    .and_then(|id| self.all_movies.iter().find(|movie| movie.id == id))
+                    .and_then(|movie| movie.title.clone())
+                    .or_else(|| item.title.clone())
+                    .unwrap_or_else(|| "(unknown)".to_string()),
+                ..Default::default()
+            });
     }
 
     /// Movie header — title, "year • rating • runtime", wrapped overview
@@ -1761,7 +1815,7 @@ impl Browse {
             );
         }
         if lines.len() > height {
-            Self::draw_scrollbar(buf, area, self.overview_scroll, max_scroll + 1);
+            list::draw_scrollbar(buf, area, self.overview_scroll, max_scroll + 1);
         }
     }
 
@@ -1778,7 +1832,7 @@ impl Browse {
         }
         let avail_height = area.height as usize;
         let items_per_page = (avail_height / 3).max(1);
-        let first = Self::window_start(self.release_cursor, self.releases.len(), items_per_page);
+        let first = list::window_start(self.release_cursor, self.releases.len(), items_per_page);
         let last = (first + items_per_page).min(self.releases.len());
         let text_width = area.width.saturating_sub(6) as usize;
 
@@ -1832,7 +1886,7 @@ impl Browse {
             y += 3;
         }
         if self.releases.len() > items_per_page {
-            Self::draw_scrollbar(buf, area, self.release_cursor, self.releases.len());
+            list::draw_scrollbar(buf, area, self.release_cursor, self.releases.len());
         }
     }
 
@@ -1849,6 +1903,14 @@ impl Browse {
         if self.confirm.is_some() {
             return vec![("y/enter", "confirm"), ("n/esc", "cancel")];
         }
+        if self.downloads.is_prompting() {
+            return vec![
+                ("j/k", "move"),
+                ("space", "toggle"),
+                ("enter", "remove"),
+                ("esc", "cancel"),
+            ];
+        }
         if self.sort_menu.is_some() || self.search_menu.is_some() {
             return vec![("esc", "close"), ("enter", "select")];
         }
@@ -1863,11 +1925,17 @@ impl Browse {
             Level::MovieList => {
                 entries.push(("enter", "open"));
                 entries.push(("a", "add"));
+                entries.push(("d", "downloads"));
                 entries.push(("/", "filter"));
                 if self.filter_active {
                     entries.push(("esc", "clear"));
                 }
                 entries.push(("s", "sort"));
+            }
+            Level::Downloads => {
+                entries.push(("esc", "back"));
+                entries.push(("space", "mark"));
+                entries.push(("x", "remove"));
             }
             Level::MovieDetail { movie } => {
                 entries.push(("esc", "back"));

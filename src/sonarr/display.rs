@@ -236,6 +236,7 @@ mod tests {
             episode: Some(QueueEpisode {
                 id: 102,
                 season_number: 1,
+                ..QueueEpisode::default()
             }),
             ..QueueItem::default()
         }];
