@@ -133,7 +133,7 @@ impl LoginForm {
         let buf = frame.buffer_mut();
         Line::from(Span::styled(
             " isamedia ",
-            Style::new().bg(theme::ACCENT).fg(theme::FG),
+            Style::new().bg(theme::ACCENT).fg(theme::CHROME_FG),
         ))
         .render(rows[0], buf);
 
