@@ -449,7 +449,7 @@ impl Browse {
         // episodes drill inside a shows library is the exception and loads
         // like any other series.
         if self.tab == Tab::Libraries && self.current_series.is_none() {
-            self.fetch_library_page(0);
+            self.fetch_library_page(0, PAGE_SIZE);
             return;
         }
         let fetch_gen = self.begin_fetch();
@@ -478,10 +478,13 @@ impl Browse {
         });
     }
 
-    /// Request one page of the current library level. `start_index == 0`
-    /// replaces the list (navigation, sort/filter change, refresh); a later
-    /// index appends as the user scrolls.
-    fn fetch_library_page(&mut self, start_index: usize) {
+    /// Request `limit` items of the current library level starting at
+    /// `start_index`. `start_index == 0` replaces the list (navigation,
+    /// sort/filter change, refresh); a later index appends as the user scrolls.
+    /// `limit` is normally `PAGE_SIZE`; a position-preserving refresh
+    /// (`refetch_in_place`) passes the loaded count to reload every page
+    /// scrolled through in one request.
+    fn fetch_library_page(&mut self, start_index: usize, limit: usize) {
         let fetch_gen = self.begin_fetch();
         let client = self.client.clone();
         let sender = self.sender.clone();
@@ -507,7 +510,8 @@ impl Browse {
                     });
                 });
             }
-            Some(query) => {
+            Some(mut query) => {
+                query.limit = limit;
                 tokio::spawn(async move {
                     let result = client.get_library_items(&query).await;
                     sender.send(Msg::LibraryItemsLoaded {
@@ -517,6 +521,27 @@ impl Browse {
                     });
                 });
             }
+        }
+    }
+
+    /// Re-fetch the current view after a local state change (watched toggle,
+    /// playback end) WITHOUT discarding the scroll position of a paginated
+    /// library. It reloads every page already scrolled through in one request,
+    /// so the reloaded list is the same length and the cursor still points at
+    /// the same item (`apply_filter` only clamps the cursor when it is out of
+    /// range). Every other view delegates to `fetch` with its existing refresh
+    /// behaviour unchanged: a drilled-in series rebuilds its seasons in place,
+    /// while the flat tabs reload the whole list (and may re-clamp the cursor
+    /// if the item set shifted).
+    fn refetch_in_place(&mut self) {
+        if self.tab == Tab::Libraries
+            && self.current_series.is_none()
+            && !matches!(self.lib_level, LibraryLevel::Root)
+        {
+            let loaded = self.all_items.len().max(PAGE_SIZE);
+            self.fetch_library_page(0, loaded);
+        } else {
+            self.fetch();
         }
     }
 
@@ -535,7 +560,7 @@ impl Browse {
             self.lib_total,
             self.loading,
         ) {
-            self.fetch_library_page(self.all_items.len());
+            self.fetch_library_page(self.all_items.len(), PAGE_SIZE);
         }
     }
 
@@ -551,7 +576,7 @@ impl Browse {
             && !self.loading
             && self.all_items.len() < self.lib_total
         {
-            self.fetch_library_page(self.all_items.len());
+            self.fetch_library_page(self.all_items.len(), PAGE_SIZE);
         }
     }
 
@@ -564,7 +589,7 @@ impl Browse {
         self.filter.clear();
         self.filter_active = false;
         self.filter_focused = false;
-        self.fetch_library_page(0);
+        self.fetch_library_page(0, PAGE_SIZE);
     }
 
     /// Returns true when the server rejected the session token (the caller
@@ -584,13 +609,13 @@ impl Browse {
         match result {
             Ok(items) => {
                 self.all_items = items;
-                self.filter.clear();
-                self.filter_active = false;
-                self.filter_focused = false;
                 if self.current_series.is_some() {
                     // These are the series' episodes: group them into seasons
                     // (the bottom region), keeping the current sub-view so a
                     // refresh does not kick the user back to the seasons list.
+                    // Keep the library filter intact so leaving the series
+                    // returns to the filtered library; the filter bar stays
+                    // hidden while drilled in (see `draw`).
                     self.build_seasons();
                     if self.season_cursor >= self.seasons.len() {
                         self.season_cursor = self.seasons.len().saturating_sub(1);
@@ -602,6 +627,11 @@ impl Browse {
                         self.rebuild_season_episodes();
                     }
                 } else {
+                    // A fresh top-level list (tab switch, search, refresh): the
+                    // previous filter no longer applies.
+                    self.filter.clear();
+                    self.filter_active = false;
+                    self.filter_focused = false;
                     self.apply_filter();
                 }
             }
@@ -646,7 +676,7 @@ impl Browse {
                     && page_len > 0
                     && self.all_items.len() < self.lib_total
                 {
-                    self.fetch_library_page(self.all_items.len());
+                    self.fetch_library_page(self.all_items.len(), PAGE_SIZE);
                 }
             }
             Err(crate::jellyfin::Error::Unauthorized) => return true,
@@ -669,8 +699,8 @@ impl Browse {
             return true;
         }
         self.loading = false;
-        self.fetch();
-        // After fetch(), which resets the error line; a toggle failure must
+        self.refetch_in_place();
+        // After the refetch, which resets the error line; a toggle failure must
         // outlive the refetch, not flash for a tick.
         if let Err(err) = result {
             self.error = Some(err.to_string());
@@ -719,7 +749,7 @@ impl Browse {
     /// otherwise it would flash for a single tick and vanish.
     pub fn on_playback_finished(&mut self) {
         let playback_error = self.error.take();
-        self.fetch();
+        self.refetch_in_place();
         self.error = playback_error;
     }
 
@@ -811,7 +841,7 @@ impl Browse {
                         self.filter.clear();
                         self.filter_active = false;
                         self.cursor = 0;
-                        self.fetch_library_page(0);
+                        self.fetch_library_page(0, PAGE_SIZE);
                     }
                     KeyCode::Enter
                     | KeyCode::Tab
@@ -823,7 +853,7 @@ impl Browse {
                             self.filter_active = false;
                         }
                         self.cursor = 0;
-                        self.fetch_library_page(0);
+                        self.fetch_library_page(0, PAGE_SIZE);
                     }
                     _ => {
                         self.filter.on_key(key);
@@ -877,7 +907,7 @@ impl Browse {
                     if sort != self.collection_sort {
                         self.collection_sort = sort;
                         self.cursor = 0;
-                        self.fetch_library_page(0);
+                        self.fetch_library_page(0, PAGE_SIZE);
                     }
                 }
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('s') => self.sort_menu = None,
@@ -976,7 +1006,7 @@ impl Browse {
                     self.filter_active = false;
                     if self.uses_server_filter() {
                         self.cursor = 0;
-                        self.fetch_library_page(0);
+                        self.fetch_library_page(0, PAGE_SIZE);
                     } else {
                         self.apply_filter();
                     }
@@ -1194,7 +1224,11 @@ impl Browse {
             Constraint::Length(if has_message { 1 } else { 0 }),
             Constraint::Length(2), // tab row + spacer
             Constraint::Length(if show_search { 2 } else { 0 }),
-            Constraint::Length(if self.filter_active { 2 } else { 0 }),
+            Constraint::Length(if self.filter_active && self.current_series.is_none() {
+                2
+            } else {
+                0
+            }),
             Constraint::Fill(1), // item list
             Constraint::Length(help_height),
         ])
@@ -1210,7 +1244,7 @@ impl Browse {
         if show_search {
             self.draw_input_row(frame, rows[2], "Search: ", &self.search);
         }
-        if self.filter_active {
+        if self.filter_active && self.current_series.is_none() {
             self.draw_input_row(frame, rows[3], "Filter: ", &self.filter);
         }
         if let Some(series) = self.current_series.clone() {
