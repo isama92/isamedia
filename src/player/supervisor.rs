@@ -82,9 +82,22 @@ enum Report {
 /// Reporter task: runs reports sequentially, preserving order. A backlog of
 /// progress reports for the same item collapses to the newest one, so an
 /// outage (enqueue every 3s, 30s timeout per attempt) cannot grow the queue.
-fn spawn_reporter(client: Client) -> (mpsc::UnboundedSender<Report>, tokio::task::JoinHandle<()>) {
+/// A 401 is signalled (once) over `unauthorized_tx` so the supervisor can
+/// surface the expired session; the reporter itself keeps draining.
+fn spawn_reporter(
+    client: Client,
+    unauthorized_tx: mpsc::UnboundedSender<()>,
+) -> (mpsc::UnboundedSender<Report>, tokio::task::JoinHandle<()>) {
     let (tx, mut rx) = mpsc::unbounded_channel::<Report>();
     let task = tokio::spawn(async move {
+        let mut signalled = false;
+        let mut signal_unauthorized = |unauthorized: bool| {
+            if unauthorized && !signalled {
+                signalled = true;
+                tracing::warn!("session token rejected while reporting playback state");
+                let _ = unauthorized_tx.send(());
+            }
+        };
         while let Some(mut report) = rx.recv().await {
             while let Ok(next) = rx.try_recv() {
                 match (&report, &next) {
@@ -94,18 +107,19 @@ fn spawn_reporter(client: Client) -> (mpsc::UnboundedSender<Report>, tokio::task
                         report = next;
                     }
                     _ => {
-                        send_report(&client, report).await;
+                        signal_unauthorized(send_report(&client, report).await);
                         report = next;
                     }
                 }
             }
-            send_report(&client, report).await;
+            signal_unauthorized(send_report(&client, report).await);
         }
     });
     (tx, task)
 }
 
-async fn send_report(client: &Client, report: Report) {
+/// Returns true when the server rejected the session token.
+async fn send_report(client: &Client, report: Report) -> bool {
     let (kind, item, result) = match &report {
         Report::Start { item_id, ticks } => (
             "start",
@@ -124,8 +138,14 @@ async fn send_report(client: &Client, report: Report) {
         ),
     };
     match result {
-        Ok(()) => tracing::info!(kind, item = %item, "reported playback state"),
-        Err(err) => tracing::error!(%err, kind, item = %item, "failed to report playback state"),
+        Ok(()) => {
+            tracing::info!(kind, item = %item, "reported playback state");
+            false
+        }
+        Err(err) => {
+            tracing::error!(%err, kind, item = %item, "failed to report playback state");
+            matches!(err, crate::jellyfin::Error::Unauthorized)
+        }
     }
 }
 
@@ -249,7 +269,12 @@ pub(super) async fn run(
     let mut quit_deadline: Option<Instant> = None;
     let mut cmd_open = true;
 
-    let (report_tx, reporter) = spawn_reporter(client.clone());
+    // Background tasks report a 401 here; the supervisor owns `emit` and
+    // raises SessionExpired (once) so the app can run its re-login flow.
+    let (unauthorized_tx, mut unauthorized_rx) = mpsc::unbounded_channel::<()>();
+    let mut session_expired = false;
+
+    let (report_tx, reporter) = spawn_reporter(client.clone(), unauthorized_tx.clone());
     // Media segment fetches land here; tagged with the item id so a result
     // arriving after an auto-advance is dropped instead of applied.
     let (seg_tx, mut seg_rx) =
@@ -353,10 +378,14 @@ pub(super) async fn run(
                             let item_id = current.id.clone();
                             let skip_types = skip_types.clone();
                             let seg_tx = seg_tx.clone();
+                            let unauthorized_tx = unauthorized_tx.clone();
                             tokio::spawn(async move {
                                 match client.get_media_segments(&item_id, &skip_types).await {
                                     Ok(segments) => {
                                         let _ = seg_tx.send((item_id, segments));
+                                    }
+                                    Err(crate::jellyfin::Error::Unauthorized) => {
+                                        let _ = unauthorized_tx.send(());
                                     }
                                     Err(err) => {
                                         tracing::error!(%err, "failed to get media segments");
@@ -404,6 +433,12 @@ pub(super) async fn run(
 
                     _ => {}
                 }
+            }
+
+            _ = unauthorized_rx.recv(), if !session_expired => {
+                session_expired = true;
+                tracing::info!("session expired during playback");
+                emit(PlayerEvent::SessionExpired);
             }
 
             segments = seg_rx.recv() => {
