@@ -2,10 +2,12 @@
 name = "isamedia"
 version = "0.1.1"
 edition = "2024"
-# Application binary, not a library: never published to crates.io. This also
-# tells release-plz to cut git tags and GitHub releases only, skipping the
-# registry.
-publish = false
+# Publishing to crates.io is disabled in .github/release-plz.toml
+# (publish = false), NOT here. A `publish = false` in this manifest marks the
+# package non-publishable, which makes release-plz skip creating the git tag
+# and GitHub release entirely (its release step only tags publishable crates).
+# Keep this manifest publishable so release-plz can tag; the toml still blocks
+# the actual crates.io publish.
 
 [dependencies]
 anyhow = "1.0.103"
