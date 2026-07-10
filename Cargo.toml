@@ -17,6 +17,7 @@ toml = "1.1.2"
 tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["json", "fmt"] }
+unicode-width = "0.2.2"
 uuid = { version = "1.23.4", features = ["v4"] }
 
 # TLS backend per platform: rustls on unix; on Windows the OS-native schannel
