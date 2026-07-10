@@ -116,6 +116,12 @@ impl Browse {
         self.items.get(self.cursor)
     }
 
+    /// Whether a text input currently swallows plain character keys (so
+    /// app-level shortcuts like `s` must stay out of the way).
+    pub fn input_focused(&self) -> bool {
+        self.search_focused || self.filter_focused
+    }
+
     pub fn fetch(&mut self) {
         self.loading = true;
         self.error = None;
