@@ -185,9 +185,16 @@ pub struct Browse {
     /// navigation; see [`crate::apps::auto_search`].
     monitors: Vec<Monitor>,
 
-    /// Full-screen scrollable overview on the detail level.
-    overview_fullscreen: bool,
+    /// The detail-level overview is expanded past its collapsed cap. When set,
+    /// the detail body (full overview plus file details) scrolls with
+    /// `overview_scroll`.
+    overview_expanded: bool,
     overview_scroll: usize,
+    /// Set every frame while rendering the detail: whether the overview is
+    /// longer than the collapsed cap, i.e. whether there is anything to expand.
+    /// Read by the key handler and help so `i` is only offered when it does
+    /// something (mirrors the render-derived `last_height`).
+    overview_truncatable: bool,
 
     show_full_help: bool,
     loading: bool,
@@ -249,8 +256,9 @@ impl Browse {
             add_flow: None,
             pending_search: false,
             monitors: Vec::new(),
-            overview_fullscreen: false,
+            overview_expanded: false,
             overview_scroll: 0,
+            overview_truncatable: false,
             show_full_help: false,
             loading: false,
             queue_loading: false,
@@ -620,6 +628,7 @@ impl Browse {
                 if pending_search {
                     self.start_auto_search(movie.id, movie_label(&movie));
                 }
+                self.overview_expanded = false;
                 self.overview_scroll = 0;
                 self.level = Level::MovieDetail { movie: *movie };
                 self.add_results.clear();
@@ -810,6 +819,8 @@ impl Browse {
         };
         self.fetch_movies();
         self.fetch_queue();
+        self.overview_expanded = false;
+        self.overview_scroll = 0;
         self.level = Level::MovieDetail { movie };
     }
 
@@ -861,6 +872,7 @@ impl Browse {
         match &self.level {
             Level::MovieList => {
                 if let Some(movie) = self.selected_movie().cloned() {
+                    self.overview_expanded = false;
                     self.overview_scroll = 0;
                     self.level = Level::MovieDetail { movie };
                 }
@@ -891,12 +903,15 @@ impl Browse {
                 true
             }
             Level::MovieDetail { .. } => {
-                self.overview_fullscreen = false;
+                self.overview_expanded = false;
+                self.overview_scroll = 0;
                 true
             }
             Level::Search { movie } => {
                 self.releases.clear();
                 self.history.clear();
+                self.overview_expanded = false;
+                self.overview_scroll = 0;
                 self.level = Level::MovieDetail { movie };
                 true
             }
@@ -1410,31 +1425,43 @@ impl Browse {
             return None;
         }
 
-        // Full-screen overview scrolls; everything else is closed off.
-        if self.overview_fullscreen {
+        // While the detail overview is expanded, the arrow keys scroll the
+        // detail body and Esc collapses it. Everything else falls through so
+        // the usual detail actions (search, delete, refresh) still work.
+        if self.overview_expanded && matches!(self.level, Level::MovieDetail { .. }) {
             let page = self.last_height.saturating_sub(4).max(1) as usize;
             match key.code {
                 KeyCode::Up => {
                     self.overview_scroll = self.overview_scroll.saturating_sub(1);
+                    return None;
                 }
-                KeyCode::Down => self.overview_scroll += 1,
+                KeyCode::Down => {
+                    self.overview_scroll += 1;
+                    return None;
+                }
                 KeyCode::PageUp | KeyCode::Left => {
                     self.overview_scroll = self.overview_scroll.saturating_sub(page);
+                    return None;
                 }
                 KeyCode::PageDown | KeyCode::Right => {
                     self.overview_scroll += page;
+                    return None;
                 }
-                KeyCode::Home | KeyCode::Char('g') => self.overview_scroll = 0,
-                KeyCode::End | KeyCode::Char('G') => self.overview_scroll = usize::MAX,
-                KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('i') => {
-                    self.overview_fullscreen = false;
+                KeyCode::Home | KeyCode::Char('g') => {
                     self.overview_scroll = 0;
+                    return None;
                 }
-                KeyCode::Char('?') => self.show_full_help = !self.show_full_help,
-                KeyCode::Char('q') => return Some(BrowseAction::Quit),
+                KeyCode::End | KeyCode::Char('G') => {
+                    self.overview_scroll = usize::MAX;
+                    return None;
+                }
+                KeyCode::Esc | KeyCode::Backspace => {
+                    self.overview_expanded = false;
+                    self.overview_scroll = 0;
+                    return None;
+                }
                 _ => {}
             }
-            return None;
         }
 
         let page_jump = (self.last_height / 5).max(1) as usize;
@@ -1513,8 +1540,15 @@ impl Browse {
                         .unwrap_or(0),
                 );
             }
-            KeyCode::Char('i') if matches!(self.level, Level::MovieDetail { .. }) => {
-                self.overview_fullscreen = true;
+            // Toggle the full description in place. Only bound when the
+            // overview is actually capped (`overview_truncatable`); the extra
+            // `overview_expanded` keeps `i` able to collapse even if the pane
+            // grew enough that the overview would now fit.
+            KeyCode::Char('i')
+                if matches!(self.level, Level::MovieDetail { .. })
+                    && (self.overview_truncatable || self.overview_expanded) =>
+            {
+                self.overview_expanded = !self.overview_expanded;
                 self.overview_scroll = 0;
             }
             KeyCode::Char('x') => match &self.level {
@@ -1587,16 +1621,12 @@ impl Browse {
         } else if show_add_input {
             self.draw_add_row(frame, rows[2]);
         }
-        if self.overview_fullscreen {
-            self.draw_overview_fullscreen(frame, rows[3]);
-        } else {
-            match &self.level {
-                Level::MovieList => self.draw_movie_list(frame, rows[3]),
-                Level::MovieDetail { .. } => self.draw_movie_detail(frame, rows[3]),
-                Level::Search { .. } => self.draw_search(frame, rows[3]),
-                Level::Add => self.draw_add_results(frame, rows[3]),
-                Level::Downloads => self.draw_downloads(frame, rows[3]),
-            }
+        match &self.level {
+            Level::MovieList => self.draw_movie_list(frame, rows[3]),
+            Level::MovieDetail { .. } => self.draw_movie_detail(frame, rows[3]),
+            Level::Search { .. } => self.draw_search(frame, rows[3]),
+            Level::Add => self.draw_add_results(frame, rows[3]),
+            Level::Downloads => self.draw_downloads(frame, rows[3]),
         }
         self.draw_help(frame, rows[4]);
 
@@ -1878,17 +1908,11 @@ impl Browse {
             });
     }
 
-    /// Movie header — title, "year • rating • runtime", wrapped overview
-    /// capped at ~40% of the space. Returns the area left below it for the
-    /// file block / status line.
+    /// Movie header — title and "year • rating • runtime", pinned above the
+    /// scrollable detail body. Returns the area left below it for the body
+    /// (overview plus the file block / status line).
     fn draw_movie_header(&self, frame: &mut Frame, area: Rect, movie: &Movie) -> Rect {
         let buf = frame.buffer_mut();
-        let text_width = area.width.saturating_sub(6) as usize;
-
-        let overview_lines = wrap_text(movie.overview.as_deref().unwrap_or_default(), text_width);
-        let overview_cap = ((area.height as usize) * 2 / 5).max(1);
-        let shown_overview = overview_lines.len().min(overview_cap);
-        let overview_truncated = overview_lines.len() > overview_cap;
 
         let mut y = area.y;
         let mut line = |text: Line, y: &mut u16| {
@@ -1915,175 +1939,201 @@ impl Browse {
             );
         }
         y += 1;
-        for text in overview_lines.iter().take(shown_overview) {
-            line(
-                Line::from(Span::styled(
-                    format!("  {text}"),
-                    Style::new().fg(theme::fg()),
-                )),
-                &mut y,
-            );
-        }
-        if overview_truncated {
-            line(
-                Line::from(Span::styled("  … (i: full overview)", theme::dim())),
-                &mut y,
-            );
-        }
-        y += 1;
 
         let bottom = area.y + area.height;
         Rect::new(area.x, y.min(bottom), area.width, bottom.saturating_sub(y))
     }
 
-    fn draw_movie_detail(&self, frame: &mut Frame, area: Rect) {
-        let Level::MovieDetail { movie } = &self.level else {
-            return;
-        };
-        let area = self.draw_movie_header(frame, area, movie);
-        let buf = frame.buffer_mut();
-        if area.height == 0 {
-            return;
-        }
-
-        // No file: one status line instead of the file block.
-        let Some(file) = &movie.movie_file else {
-            let queue_entry = display::movie_queue_entry(&self.queue, movie.id);
-            let status = display::movie_status(movie, queue_entry, &display::now_utc_iso());
-            let hint = match status {
-                MovieStatus::Missing => Span::styled("  (enter: search)", theme::dim()),
-                _ => Span::raw(""),
+    /// The movie detail: title/meta pinned by `draw_movie_header`, then a
+    /// scrollable body of the overview and the file block (or status line).
+    /// Collapsed, the overview is capped to ~40% of the pane and the body does
+    /// not scroll; `i` (only offered when capped) expands it to the full
+    /// overview, and the body then scrolls with `overview_scroll`.
+    fn draw_movie_detail(&mut self, frame: &mut Frame, area: Rect) {
+        // Build the pinned header and the body under an immutable borrow of
+        // `self.level`, then store the derived flag and render the scroll
+        // window under a mutable one.
+        let (body, lines, truncatable) = {
+            let Level::MovieDetail { movie } = &self.level else {
+                return;
             };
-            Line::from(vec![Span::raw("  "), Self::status_span(&status), hint]).render(
-                Rect::new(area.x, area.y, area.width.saturating_sub(1), 1),
-                buf,
-            );
-            return;
-        };
+            let body = self.draw_movie_header(frame, area, movie);
+            let text_width = body.width.saturating_sub(6) as usize;
 
-        let text_width = area.width.saturating_sub(16) as usize;
-        let none = || "-".to_string();
-        let mut entries: Vec<(&str, String)> = vec![
-            (
-                "Path",
-                file.path
-                    .as_deref()
-                    .map(|path| truncate(path, text_width))
-                    .unwrap_or_else(none),
-            ),
-            ("Size", display::format_size(file.size)),
-            (
-                "Quality",
-                file.quality
-                    .as_ref()
-                    .and_then(|q| q.quality.name.clone())
-                    .unwrap_or_else(none),
-            ),
-        ];
-        let languages: Vec<&str> = file
-            .languages
-            .iter()
-            .filter_map(|language| language.name.as_deref())
-            .collect();
-        let language = if languages.is_empty() {
-            file.language
-                .as_ref()
-                .and_then(|language| language.name.clone())
-                .unwrap_or_else(none)
-        } else {
-            languages.join(", ")
-        };
-        entries.push(("Language", language));
-        if let Some(info) = &file.media_info {
-            let join = |parts: Vec<Option<String>>| {
-                let joined: Vec<String> = parts.into_iter().flatten().collect();
-                if joined.is_empty() {
-                    none()
-                } else {
-                    joined.join(" • ")
-                }
+            let overview_lines =
+                wrap_text(movie.overview.as_deref().unwrap_or_default(), text_width);
+            // Cap relative to the full detail area (as before) so the collapsed
+            // view always leaves room for the file block below the overview.
+            let cap = ((area.height as usize) * 2 / 5).max(1);
+            let truncatable = overview_lines.len() > cap;
+            let shown = if self.overview_expanded {
+                overview_lines.len()
+            } else {
+                overview_lines.len().min(cap)
             };
-            entries.push((
-                "Video",
-                join(vec![
-                    info.video_codec.clone(),
-                    info.resolution.clone(),
-                    info.video_dynamic_range.clone(),
-                ]),
-            ));
-            entries.push((
-                "Audio",
-                join(vec![
-                    info.audio_codec.clone(),
-                    info.audio_channels.map(|channels| format!("{channels} ch")),
-                    info.audio_languages.clone(),
-                ]),
-            ));
-            entries.push((
-                "Subtitles",
-                info.subtitles
-                    .clone()
-                    .filter(|subs| !subs.is_empty())
-                    .unwrap_or_else(none),
-            ));
-            entries.push((
-                "Runtime",
-                info.run_time
-                    .clone()
-                    .or_else(|| display::format_runtime(movie.runtime))
-                    .unwrap_or_else(none),
-            ));
-        }
-        if let Some(edition) = file
-            .edition
-            .as_deref()
-            .filter(|edition| !edition.is_empty())
-        {
-            entries.push(("Edition", edition.to_string()));
-        }
 
-        for (row, (label, value)) in entries.iter().enumerate() {
-            if row as u16 >= area.height {
-                break;
+            let mut lines: Vec<Line> = Vec::new();
+            for text in overview_lines.iter().take(shown) {
+                lines.push(Line::from(Span::styled(
+                    format!("  {text}"),
+                    Style::new().fg(theme::fg()),
+                )));
             }
-            Line::from(vec![
-                Span::styled(format!("  {label:<11}"), theme::selected()),
-                Span::styled(format!(" {value}"), Style::new().fg(theme::fg())),
-            ])
-            .render(
-                Rect::new(area.x, area.y + row as u16, area.width.saturating_sub(1), 1),
-                buf,
-            );
-        }
-    }
+            if truncatable {
+                let hint = if self.overview_expanded {
+                    "  (i: collapse)"
+                } else {
+                    "  … (i: expand)"
+                };
+                lines.push(Line::from(Span::styled(hint, theme::dim())));
+            }
+            lines.push(Line::from(""));
 
-    fn draw_overview_fullscreen(&mut self, frame: &mut Frame, area: Rect) {
-        let Level::MovieDetail { movie } = &self.level else {
-            return;
+            match &movie.movie_file {
+                // No file: one status line instead of the file block.
+                None => {
+                    let queue_entry = display::movie_queue_entry(&self.queue, movie.id);
+                    let status = display::movie_status(movie, queue_entry, &display::now_utc_iso());
+                    let hint = match status {
+                        MovieStatus::Missing => Span::styled("  (enter: search)", theme::dim()),
+                        _ => Span::raw(""),
+                    };
+                    lines.push(Line::from(vec![
+                        Span::raw("  "),
+                        Self::status_span(&status),
+                        hint,
+                    ]));
+                }
+                Some(file) => {
+                    let path_width = body.width.saturating_sub(16) as usize;
+                    let none = || "-".to_string();
+                    let mut entries: Vec<(&str, String)> = vec![
+                        (
+                            "Path",
+                            file.path
+                                .as_deref()
+                                .map(|path| truncate(path, path_width))
+                                .unwrap_or_else(none),
+                        ),
+                        ("Size", display::format_size(file.size)),
+                        (
+                            "Quality",
+                            file.quality
+                                .as_ref()
+                                .and_then(|q| q.quality.name.clone())
+                                .unwrap_or_else(none),
+                        ),
+                    ];
+                    let languages: Vec<&str> = file
+                        .languages
+                        .iter()
+                        .filter_map(|language| language.name.as_deref())
+                        .collect();
+                    let language = if languages.is_empty() {
+                        file.language
+                            .as_ref()
+                            .and_then(|language| language.name.clone())
+                            .unwrap_or_else(none)
+                    } else {
+                        languages.join(", ")
+                    };
+                    entries.push(("Language", language));
+                    if let Some(info) = &file.media_info {
+                        let join = |parts: Vec<Option<String>>| {
+                            let joined: Vec<String> = parts.into_iter().flatten().collect();
+                            if joined.is_empty() {
+                                none()
+                            } else {
+                                joined.join(" • ")
+                            }
+                        };
+                        entries.push((
+                            "Video",
+                            join(vec![
+                                info.video_codec.clone(),
+                                info.resolution.clone(),
+                                info.video_dynamic_range.clone(),
+                            ]),
+                        ));
+                        entries.push((
+                            "Audio",
+                            join(vec![
+                                info.audio_codec.clone(),
+                                info.audio_channels.map(|channels| format!("{channels} ch")),
+                                info.audio_languages.clone(),
+                            ]),
+                        ));
+                        entries.push((
+                            "Subtitles",
+                            info.subtitles
+                                .clone()
+                                .filter(|subs| !subs.is_empty())
+                                .unwrap_or_else(none),
+                        ));
+                        entries.push((
+                            "Runtime",
+                            info.run_time
+                                .clone()
+                                .or_else(|| display::format_runtime(movie.runtime))
+                                .unwrap_or_else(none),
+                        ));
+                    }
+                    if let Some(edition) = file
+                        .edition
+                        .as_deref()
+                        .filter(|edition| !edition.is_empty())
+                    {
+                        entries.push(("Edition", edition.to_string()));
+                    }
+
+                    for (label, value) in entries {
+                        lines.push(Line::from(vec![
+                            Span::styled(format!("  {label:<11}"), theme::selected()),
+                            Span::styled(format!(" {value}"), Style::new().fg(theme::fg())),
+                        ]));
+                    }
+                }
+            }
+
+            (body, lines, truncatable)
         };
+
+        self.overview_truncatable = truncatable;
+
+        let height = body.height as usize;
+        if height == 0 {
+            self.overview_scroll = 0;
+            return;
+        }
+
+        // Only the expanded body scrolls; collapsed always fits (or clips as
+        // before) and shows no scrollbar.
+        let total = lines.len();
+        if self.overview_expanded {
+            self.overview_scroll = self.overview_scroll.min(total.saturating_sub(height));
+        } else {
+            self.overview_scroll = 0;
+        }
+
         let buf = frame.buffer_mut();
-        let text_width = area.width.saturating_sub(4) as usize;
-        let lines = wrap_text(movie.overview.as_deref().unwrap_or_default(), text_width);
-        let height = area.height as usize;
-        let max_scroll = lines.len().saturating_sub(height);
-        self.overview_scroll = self.overview_scroll.min(max_scroll);
-        for (row, text) in lines
-            .iter()
+        for (row, line) in lines
+            .into_iter()
             .skip(self.overview_scroll)
             .take(height)
             .enumerate()
         {
-            Line::from(Span::styled(
-                format!("  {text}"),
-                Style::new().fg(theme::fg()),
-            ))
-            .render(
-                Rect::new(area.x, area.y + row as u16, area.width.saturating_sub(1), 1),
+            line.render(
+                Rect::new(body.x, body.y + row as u16, body.width.saturating_sub(1), 1),
                 buf,
             );
         }
-        if lines.len() > height {
-            list::draw_scrollbar(buf, area, self.overview_scroll, max_scroll + 1);
+        if self.overview_expanded && total > height {
+            list::draw_scrollbar(
+                buf,
+                body,
+                self.overview_scroll,
+                total.saturating_sub(height) + 1,
+            );
         }
     }
 
@@ -2199,9 +2249,6 @@ impl Browse {
         if self.rejections_popup.is_some() {
             return vec![("esc", "close")];
         }
-        if self.overview_fullscreen {
-            return vec![("esc/i", "back"), ("↑/↓", "scroll")];
-        }
         let mut entries: Vec<(&'static str, &'static str)> = Vec::new();
         match &self.level {
             Level::MovieList => {
@@ -2226,7 +2273,20 @@ impl Browse {
                     entries.push(("x", "delete file"));
                 }
                 entries.push(("z", "delete"));
-                entries.push(("i", "overview"));
+                // Only offered when the overview is actually capped.
+                if self.overview_truncatable {
+                    entries.push((
+                        "i",
+                        if self.overview_expanded {
+                            "collapse"
+                        } else {
+                            "expand"
+                        },
+                    ));
+                }
+                if self.overview_expanded {
+                    entries.push(("↑/↓", "scroll"));
+                }
             }
             Level::Search { .. } => {
                 entries.push(("esc", "back"));
