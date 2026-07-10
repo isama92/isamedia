@@ -136,7 +136,9 @@ pub struct MpvMessage {
 
 pub fn parse_message(line: &str) -> Option<MpvMessage> {
     serde_json::from_str(line)
-        .map_err(|err| tracing::warn!(%err, line, "failed to parse mpv message"))
+        .map_err(
+            |err| tracing::warn!(%err, line = %redact_secrets(line), "failed to parse mpv message"),
+        )
         .ok()
 }
 
@@ -403,6 +405,19 @@ mod tests {
 
         // No secrets: unchanged.
         assert_eq!(redact_secrets("plain text"), "plain text");
+    }
+
+    #[test]
+    fn redacts_secrets_from_raw_reply_line() {
+        // A raw inbound line (the parse-failure and command-failure warns) can
+        // carry the subtitle URL's api_key and the loadfile header's
+        // X-Emby-Token; both must be stripped before the line reaches a log.
+        let line = r#"{"request_id":3,"error":"success","data":{"filename":"https://x/v?api_key=subkey123","http-header-fields":["X-Emby-Token: hdrkey456"]}}"#;
+        let redacted = redact_secrets(line);
+        assert!(!redacted.contains("subkey123"), "{redacted}");
+        assert!(!redacted.contains("hdrkey456"), "{redacted}");
+        assert!(redacted.contains("api_key=REDACTED"), "{redacted}");
+        assert!(redacted.contains("X-Emby-Token: REDACTED"), "{redacted}");
     }
 
     #[test]
