@@ -144,6 +144,7 @@ impl Shell {
         if target == self.active {
             return;
         }
+        self.apps[self.active].deactivate();
         self.active = target;
         let app = &mut self.apps[target];
         app.activate();

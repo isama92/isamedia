@@ -47,6 +47,10 @@ pub struct RadarrApp {
     /// Fetch-generation allocator shared with every Browse instance, so
     /// generations stay monotonic across re-connects.
     browse_gen: Arc<std::sync::atomic::AtomicU64>,
+    /// Whether this is the visible tab; the browse pauses its periodic queue
+    /// poll while hidden. Tracked on the app (not just the browse) so a browse
+    /// created while the tab is in the background starts paused too.
+    active: bool,
 }
 
 impl RadarrApp {
@@ -58,6 +62,7 @@ impl RadarrApp {
             screen: Screen::Boot,
             auth_gen: 0,
             browse_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            active: false,
         }
     }
 
@@ -143,6 +148,9 @@ impl RadarrApp {
                     browse.notice =
                         Some("connected over plain http://; traffic is unencrypted".into());
                 }
+                // If the connect finished after the user switched away, start
+                // the browse paused so it doesn't poll a hidden tab.
+                browse.set_active(self.active);
                 self.screen = Screen::Browse(browse);
             }
             // No key stored yet: first run, show a clean form.
@@ -175,6 +183,7 @@ impl MediaApp for RadarrApp {
     }
 
     fn activate(&mut self) {
+        self.active = true;
         if let Screen::Boot = self.screen {
             let host = self.config.lock().unwrap().radarr.host.clone();
             if host.is_empty() {
@@ -183,6 +192,15 @@ impl MediaApp for RadarrApp {
                 self.screen = Screen::Connecting;
                 self.spawn_connect(host, None);
             }
+        } else if let Screen::Browse(browse) = &mut self.screen {
+            browse.set_active(true);
+        }
+    }
+
+    fn deactivate(&mut self) {
+        self.active = false;
+        if let Screen::Browse(browse) = &mut self.screen {
+            browse.set_active(false);
         }
     }
 

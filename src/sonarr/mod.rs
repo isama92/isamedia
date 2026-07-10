@@ -6,7 +6,10 @@
 pub mod display;
 pub mod models;
 
+use std::sync::Arc;
+
 use reqwest::Method;
+use tokio::sync::Mutex;
 
 pub use crate::arr::Error;
 pub use models::{
@@ -18,6 +21,11 @@ use crate::arr::models::Page;
 #[derive(Clone, Debug)] // derived Debug is safe: Transport redacts the key
 pub struct Client {
     transport: crate::arr::Transport,
+    /// Serialises the season-monitor read-modify-write (see
+    /// [`set_season_monitored`](Self::set_season_monitored)). Shared across
+    /// clones, so two quick toggles run one after the other instead of both
+    /// GETting the pre-toggle series and the second PUT reverting the first.
+    season_monitor_lock: Arc<Mutex<()>>,
 }
 
 impl Client {
@@ -25,7 +33,10 @@ impl Client {
     /// comes back as `Error::Unauthorized` so the UI can re-prompt for it.
     pub async fn connect(host: &str, api_key: String) -> Result<Self, Error> {
         let transport = crate::arr::Transport::connect(host, api_key).await?;
-        Ok(Self { transport })
+        Ok(Self {
+            transport,
+            season_monitor_lock: Arc::new(Mutex::new(())),
+        })
     }
 
     pub fn host(&self) -> &str {
@@ -245,12 +256,20 @@ impl Client {
     /// Toggle a season's monitored flag. Season monitoring lives inside the
     /// series object and there is no per-season editor, so fetch the series as
     /// raw JSON, flip the matching season, and PUT it back.
+    ///
+    /// The whole read-modify-write runs under `season_monitor_lock`: without
+    /// it, toggling two seasons in quick succession spawns two overlapping
+    /// GET-modify-PUT cycles, and the second GET can read the pre-first-PUT
+    /// series and revert the first season. The endpoint offers no optimistic
+    /// concurrency (no ETag), so serialising the cycles is the only way to
+    /// avoid the lost update.
     pub async fn set_season_monitored(
         &self,
         series_id: i64,
         season_number: i32,
         monitored: bool,
     ) -> Result<(), Error> {
+        let _guard = self.season_monitor_lock.lock().await;
         let mut series: serde_json::Value = self
             .transport
             .request(
