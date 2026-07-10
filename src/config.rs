@@ -197,6 +197,38 @@ fn write_owner_only(path: &Path, raw: &str) -> Result<()> {
         std::fs::create_dir_all(dir)
             .with_context(|| format!("creating config directory {}", dir.display()))?;
     }
+    // Write to a sibling temp file, then rename it over the target, so a crash
+    // or power loss mid-write can never leave a zero-length or partial
+    // `config.toml` (which would block startup) or `language_overrides.json`
+    // (which would be silently reset, losing per-show track choices). rename
+    // replaces an existing file atomically on unix and via
+    // MOVEFILE_REPLACE_EXISTING on Windows. The temp is a sibling so it shares
+    // the target's volume (rename stays atomic) and lands with the temp's 0600
+    // mode, which is why there is no post-write chmod: the old file is replaced
+    // wholesale, so a pre-existing looser file is tightened for free with no
+    // world-readable window. The pid tag keeps a leftover temp from a crashed
+    // run from colliding with a live write.
+    let mut tmp_name = path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_default();
+    tmp_name.push(format!(".{}.tmp", std::process::id()));
+    let tmp = path.with_file_name(tmp_name);
+
+    if let Err(err) = write_tmp_owner_only(&tmp, raw) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err);
+    }
+    if let Err(err) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err).with_context(|| format!("replacing config file {}", path.display()));
+    }
+    Ok(())
+}
+
+/// Create `tmp` fresh, owner-only, write `raw`, and flush it to disk before
+/// the caller renames it into place.
+fn write_tmp_owner_only(tmp: &Path, raw: &str) -> Result<()> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -205,18 +237,13 @@ fn write_owner_only(path: &Path, raw: &str) -> Result<()> {
         options.mode(0o600);
     }
     let mut file = options
-        .open(path)
-        .with_context(|| format!("writing config file {}", path.display()))?;
+        .open(tmp)
+        .with_context(|| format!("creating temp config file {}", tmp.display()))?;
     use std::io::Write;
     file.write_all(raw.as_bytes())
-        .with_context(|| format!("writing config file {}", path.display()))?;
-    // The mode above only applies on creation; also tighten a file that
-    // already existed with looser permissions.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
+        .with_context(|| format!("writing temp config file {}", tmp.display()))?;
+    file.sync_all()
+        .with_context(|| format!("flushing temp config file {}", tmp.display()))?;
     Ok(())
 }
 
@@ -251,6 +278,46 @@ mod tests {
         assert_eq!(parsed.jellyfin.skip_segments, config.jellyfin.skip_segments);
         assert_eq!(parsed.sonarr.host, config.sonarr.host);
         assert_eq!(parsed.radarr.host, config.radarr.host);
+    }
+
+    #[test]
+    fn write_is_atomic_and_owner_only() {
+        let dir = std::env::temp_dir().join(format!("isamedia-test-cfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("config.toml");
+
+        let config = Config {
+            jellyfin: JellyfinConfig {
+                host: "https://demo.jellyfin.org".into(),
+                ..JellyfinConfig::default()
+            },
+            ..Config::default()
+        };
+
+        config.save(&path).unwrap();
+        // Writing again must replace the existing file, not fail.
+        config.save(&path).unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let parsed: Config = toml::from_str(&raw).unwrap();
+        assert_eq!(parsed.jellyfin.host, config.jellyfin.host);
+
+        // The temp file is renamed into place, so nothing is left beside the
+        // target.
+        let leftover_tmp = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .any(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"));
+        assert!(!leftover_tmp, "temp file left behind after save");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -7,6 +7,10 @@ pub mod ipc;
 mod supervisor;
 pub mod ticks;
 
+/// Shutdown budget the shell's quit drain must respect; defined by the
+/// supervisor, which owns the mpv-quit and report-flush timeouts it sums.
+pub(crate) use supervisor::SHUTDOWN_BUDGET;
+
 use tokio::sync::mpsc;
 
 use crate::config::{LanguagePrefs, TrackPreference};
