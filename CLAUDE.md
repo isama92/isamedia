@@ -152,6 +152,39 @@ is I/O-bound on network calls, not compute-bound).
 
 ## Version control
 
+- The repo is a bare clone with per-branch worktrees living inside it:
+
+  ```
+  isamedia/
+    .bare/                 # bare git dir
+    .git                   # file containing "gitdir: ./.bare"
+    main/                  # worktree of main
+    feature/<branch-name>/ # worktree of a feature branch
+  ```
+
+  Run git from the `isamedia/` root or from inside a worktree.
+- Never commit directly to `main`. Start every new feature on its own branch
+  named `feature/<branch-name>`, checked out in its own worktree so several
+  features progress at once without recloning:
+
+  ```sh
+  git worktree add feature/<branch-name> -b feature/<branch-name>
+  ```
+
+  Use matching prefixes for non-feature work: `fix/`, `docs/`, `chore/`,
+  `refactor/`.
+- Each worktree builds into its own `target/` by default, so a fresh feature
+  recompiles from scratch and uses more disk. Sharing one build directory
+  across worktrees (via `CARGO_TARGET_DIR`, or `build.target-dir` in a
+  user-level `~/.cargo/config.toml`) avoids that, at the cost of serialising
+  concurrent builds since cargo locks the target dir. Choose per your
+  disk-versus-parallel-build trade-off.
+- Keep branches short-lived: rebase on `main` regularly and open one PR per
+  feature. Run the full "Before finishing a change" checklist and confirm it
+  is green before pushing.
+- After a branch merges, clean up: `git worktree remove feature/<branch-name>`
+  and delete the branch so stale worktrees and merged branches don't
+  accumulate.
 - Clear, descriptive commit messages.
 - No commented-out code, no debug `println!`/`dbg!` left behind.
 - Don't leave a newly introduced `.unwrap()` in code that ships.
