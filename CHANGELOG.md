@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5](https://github.com/isama92/isamedia/compare/v0.1.4...v0.1.5) - 2026-07-09
+
+### Added
+
+- make Sonarr and Jellyfin list rows easier to scan ([#19](https://github.com/isama92/isamedia/pull/19))
+
 ## [0.1.4](https://github.com/isama92/isamedia/compare/v0.1.3...v0.1.4) - 2026-07-09
 
 ### Added
