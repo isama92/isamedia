@@ -61,6 +61,18 @@ impl Client {
             .await
     }
 
+    /// Remove queue items by id. See `arr::Transport::delete_queue_items`.
+    pub async fn delete_queue_items(
+        &self,
+        ids: &[i64],
+        remove_from_client: bool,
+        blocklist: bool,
+    ) -> Result<(), Error> {
+        self.transport
+            .delete_queue_items(ids, remove_from_client, blocklist)
+            .await
+    }
+
     /// Look up series to add, by free text or by `tvdb:<id>`; the server
     /// parses the prefix itself, so id searches need no special handling.
     /// Returned as raw JSON: POST /series requires fields the typed `Series`

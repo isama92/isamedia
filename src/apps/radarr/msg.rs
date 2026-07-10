@@ -70,4 +70,5 @@ pub enum CommandKind {
     AutoSearch,
     Grab,
     DeleteFile,
+    DeleteQueue,
 }

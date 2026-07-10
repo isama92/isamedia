@@ -65,8 +65,20 @@ pub struct QueueItem {
     pub sizeleft: f64,
     pub status: Option<String>,
     pub title: Option<String>,
+    /// Both backends carry the release languages inline on the queue record.
+    pub languages: Vec<Language>,
+    pub quality: Option<QualityWrapper>,
+    /// Remaining time, "HH:MM:SS" or "d.HH:MM:SS"; absent once finished or
+    /// while stalled.
+    pub timeleft: Option<String>,
+    /// The download lifecycle stage ("downloading", "importing", ...) —
+    /// finer-grained than `status`.
+    pub tracked_download_state: Option<String>,
+    /// "ok" | "warning" | "error"; drives the warning marker in the view.
+    pub tracked_download_status: Option<String>,
     /// Present when a Sonarr queue is requested with includeEpisode; carries
-    /// the season number for the per-season downloading marker.
+    /// the season number for the per-season downloading marker plus the
+    /// number/title the Downloads view renders.
     pub episode: Option<QueueEpisode>,
 }
 
@@ -75,6 +87,8 @@ pub struct QueueItem {
 pub struct QueueEpisode {
     pub id: i64,
     pub season_number: i32,
+    pub episode_number: i32,
+    pub title: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -146,7 +160,12 @@ mod tests {
                     "sizeleft": 870000000.0,
                     "status": "downloading",
                     "title": "Black.Clover.S01E06.1080p.WEB.H264",
-                    "episode": { "id": 102, "seasonNumber": 1 }
+                    "timeleft": "00:12:30",
+                    "trackedDownloadState": "downloading",
+                    "trackedDownloadStatus": "ok",
+                    "languages": [ { "id": 1, "name": "English" } ],
+                    "quality": { "quality": { "id": 3, "name": "WEBDL-1080p" } },
+                    "episode": { "id": 102, "seasonNumber": 1, "episodeNumber": 6, "title": "The Man Who Cuts Death" }
                 }
             ]
         }"#;
@@ -155,7 +174,21 @@ mod tests {
         let item = &page.records[0];
         assert_eq!(item.episode_id, Some(102));
         assert_eq!(item.movie_id, None);
-        assert_eq!(item.episode.as_ref().unwrap().season_number, 1);
+        let episode = item.episode.as_ref().unwrap();
+        assert_eq!(episode.season_number, 1);
+        assert_eq!(episode.episode_number, 6);
+        assert_eq!(episode.title.as_deref(), Some("The Man Who Cuts Death"));
+        assert_eq!(item.timeleft.as_deref(), Some("00:12:30"));
+        assert_eq!(
+            item.languages.first().and_then(|l| l.name.as_deref()),
+            Some("English")
+        );
+        assert_eq!(
+            item.quality
+                .as_ref()
+                .and_then(|q| q.quality.name.as_deref()),
+            Some("WEBDL-1080p")
+        );
         assert!(item.sizeleft < item.size);
     }
 
@@ -172,7 +205,10 @@ mod tests {
                     "size": 32000000000.0,
                     "sizeleft": 8000000000.0,
                     "status": "downloading",
-                    "title": "Interstellar.2014.2160p.BluRay.x265"
+                    "title": "Interstellar.2014.2160p.BluRay.x265",
+                    "timeleft": "01:42:07",
+                    "languages": [ { "id": 1, "name": "English" } ],
+                    "quality": { "quality": { "id": 19, "name": "Bluray-2160p" } }
                 }
             ]
         }"#;
@@ -182,6 +218,17 @@ mod tests {
         assert_eq!(item.series_id, None);
         assert_eq!(item.episode_id, None);
         assert!(item.episode.is_none());
+        assert_eq!(item.timeleft.as_deref(), Some("01:42:07"));
+        assert_eq!(
+            item.quality
+                .as_ref()
+                .and_then(|q| q.quality.name.as_deref()),
+            Some("Bluray-2160p")
+        );
+        assert_eq!(
+            item.languages.first().and_then(|l| l.name.as_deref()),
+            Some("English")
+        );
     }
 
     #[test]

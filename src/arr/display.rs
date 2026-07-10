@@ -12,6 +12,60 @@ pub fn queue_progress(item: &QueueItem) -> u8 {
     done.clamp(0.0, 100.0) as u8
 }
 
+/// The first language name a queue item carries (mirrors `release_language`).
+pub fn queue_language(item: &QueueItem) -> Option<String> {
+    item.languages
+        .iter()
+        .find_map(|language| language.name.clone())
+}
+
+/// The quality/format name a queue item was grabbed at, if any.
+pub fn queue_quality(item: &QueueItem) -> Option<String> {
+    item.quality
+        .as_ref()
+        .and_then(|wrapper| wrapper.quality.name.clone())
+}
+
+/// Remaining time as the server reports it ("HH:MM:SS" / "d.HH:MM:SS"), or a
+/// dash when finished/stalled and no estimate is available.
+pub fn queue_timeleft(item: &QueueItem) -> String {
+    match item.timeleft.as_deref() {
+        Some(value) if !value.trim().is_empty() => value.to_string(),
+        _ => "-".to_string(),
+    }
+}
+
+/// A short status for the Downloads view: the download lifecycle state, with
+/// the percent appended while still downloading and a marker when the server
+/// flags a warning or error. Multi-word camelCase states are spelled out;
+/// already-readable single-word ones ("importing", "completed", "queued")
+/// pass through unchanged.
+pub fn queue_state_label(item: &QueueItem) -> String {
+    let raw = item
+        .tracked_download_state
+        .as_deref()
+        .or(item.status.as_deref())
+        .unwrap_or("queued");
+    let pretty = match raw {
+        "importPending" => "import pending",
+        "failedPending" => "failed",
+        "downloadClientUnavailable" => "client unavailable",
+        "delay" => "delayed",
+        other => other,
+    };
+    let mut label = if raw.eq_ignore_ascii_case("downloading") {
+        format!("{pretty} {}%", queue_progress(item))
+    } else {
+        pretty.to_string()
+    };
+    match item.tracked_download_status.as_deref() {
+        Some("warning") => label = format!("{label} (warning)"),
+        Some("error") => label = format!("{label} (error)"),
+        _ => {}
+    }
+    label
+}
+
 pub fn format_size(bytes: i64) -> String {
     const UNITS: [(&str, f64); 3] = [
         ("GiB", 1024.0 * 1024.0 * 1024.0),
@@ -175,6 +229,61 @@ mod tests {
         assert_eq!(queue_progress(&item(1000.0, 0.0)), 100);
         // sizeleft above size (server hiccup) must not underflow.
         assert_eq!(queue_progress(&item(1000.0, 2000.0)), 0);
+    }
+
+    #[test]
+    fn queue_language_and_quality() {
+        let item = QueueItem {
+            languages: vec![Language {
+                name: Some("Japanese".into()),
+            }],
+            quality: quality("Bluray-1080p"),
+            ..QueueItem::default()
+        };
+        assert_eq!(queue_language(&item).as_deref(), Some("Japanese"));
+        assert_eq!(queue_quality(&item).as_deref(), Some("Bluray-1080p"));
+
+        let empty = QueueItem::default();
+        assert_eq!(queue_language(&empty), None);
+        assert_eq!(queue_quality(&empty), None);
+    }
+
+    #[test]
+    fn queue_timeleft_falls_back_to_dash() {
+        let with = QueueItem {
+            timeleft: Some("00:12:30".into()),
+            ..QueueItem::default()
+        };
+        assert_eq!(queue_timeleft(&with), "00:12:30");
+        assert_eq!(queue_timeleft(&QueueItem::default()), "-");
+    }
+
+    #[test]
+    fn queue_state_label_variants() {
+        let downloading = QueueItem {
+            size: 1000.0,
+            sizeleft: 370.0,
+            tracked_download_state: Some("downloading".into()),
+            tracked_download_status: Some("ok".into()),
+            ..QueueItem::default()
+        };
+        assert_eq!(queue_state_label(&downloading), "downloading 63%");
+
+        let importing = QueueItem {
+            tracked_download_state: Some("importPending".into()),
+            ..QueueItem::default()
+        };
+        assert_eq!(queue_state_label(&importing), "import pending");
+
+        let warned = QueueItem {
+            status: Some("completed".into()),
+            tracked_download_status: Some("warning".into()),
+            ..QueueItem::default()
+        };
+        assert_eq!(queue_state_label(&warned), "completed (warning)");
+
+        // No state or status at all reads as queued.
+        assert_eq!(queue_state_label(&QueueItem::default()), "queued");
     }
 
     #[test]
