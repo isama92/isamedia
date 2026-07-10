@@ -5,7 +5,8 @@
 use super::models::{Movie, QueueItem};
 
 pub use crate::arr::display::{
-    format_size, now_utc_iso, previously_grabbed, queue_progress, release_line2,
+    GLYPH_DOWNLOADING, GLYPH_GRABBED, GLYPH_REJECTED, SYMBOL_LEGEND, format_size, now_utc_iso,
+    previously_grabbed, queue_progress, release_line2,
 };
 
 /// One movie's status, in priority order: an active download beats

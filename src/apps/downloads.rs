@@ -139,12 +139,12 @@ impl Downloads {
             return DeleteAction::Consumed;
         }
         match key.code {
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Up => {
                 if let Some(prompt) = self.prompt.as_mut() {
                     prompt.focus = prompt.focus.saturating_sub(1);
                 }
             }
-            KeyCode::Down | KeyCode::Char('j') => {
+            KeyCode::Down => {
                 if let Some(prompt) = self.prompt.as_mut() {
                     prompt.focus = (prompt.focus + 1).min(1);
                 }

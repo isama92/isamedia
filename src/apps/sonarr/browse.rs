@@ -18,13 +18,13 @@ use crate::apps::delete_prompt::{self, DeletePrompt};
 use crate::apps::downloads;
 use crate::event::AppSender;
 use crate::sonarr::display::{self, EpStatus, SERIES_SORTS, SeriesSort};
-use crate::sonarr::models::Season;
+use crate::sonarr::models::{EpisodeFile, Season};
 use crate::sonarr::{
     Client, Command, Episode, HistoryRecord, QualityProfile, QueueItem, Release, RootFolder, Series,
 };
 use crate::ui::input::TextInput;
 use crate::ui::text::{truncate, wrap_text};
-use crate::ui::{list, prompt, theme};
+use crate::ui::{help, list, prompt, theme};
 
 use super::msg::{CommandKind, Msg};
 
@@ -122,6 +122,79 @@ fn series_label(series: &Series) -> String {
     }
 }
 
+/// The downloaded-file detail rows (Path/Size/Quality/Language + media-info)
+/// shown in the episode-info view. Media rows appear only when `media_info` is
+/// present. Free function so it can be reused and tested without a `Browse`.
+fn episode_file_rows(file: &EpisodeFile, path_width: usize) -> Vec<(&'static str, String)> {
+    let none = || "-".to_string();
+    let mut rows: Vec<(&'static str, String)> = vec![
+        (
+            "Path",
+            file.path
+                .as_deref()
+                .map(|path| truncate(path, path_width))
+                .unwrap_or_else(none),
+        ),
+        ("Size", display::format_size(file.size)),
+        (
+            "Quality",
+            file.quality
+                .as_ref()
+                .and_then(|q| q.quality.name.clone())
+                .unwrap_or_else(none),
+        ),
+    ];
+    let languages: Vec<&str> = file
+        .languages
+        .iter()
+        .filter_map(|language| language.name.as_deref())
+        .collect();
+    let language = if languages.is_empty() {
+        file.language
+            .as_ref()
+            .and_then(|language| language.name.clone())
+            .unwrap_or_else(none)
+    } else {
+        languages.join(", ")
+    };
+    rows.push(("Language", language));
+    if let Some(info) = &file.media_info {
+        let join = |parts: Vec<Option<String>>| {
+            let joined: Vec<String> = parts.into_iter().flatten().collect();
+            if joined.is_empty() {
+                none()
+            } else {
+                joined.join(" • ")
+            }
+        };
+        rows.push((
+            "Video",
+            join(vec![
+                info.video_codec.clone(),
+                info.resolution.clone(),
+                info.video_dynamic_range.clone(),
+            ]),
+        ));
+        rows.push((
+            "Audio",
+            join(vec![
+                info.audio_codec.clone(),
+                info.audio_channels.map(|channels| format!("{channels} ch")),
+                info.audio_languages.clone(),
+            ]),
+        ));
+        rows.push((
+            "Subtitles",
+            info.subtitles
+                .clone()
+                .filter(|subs| !subs.is_empty())
+                .unwrap_or_else(none),
+        ));
+        rows.push(("Runtime", info.run_time.clone().unwrap_or_else(none)));
+    }
+    rows
+}
+
 pub struct Browse {
     pub client: Client,
     sender: AppSender,
@@ -193,9 +266,8 @@ pub struct Browse {
     /// navigation; see [`crate::apps::auto_search`].
     monitors: Vec<Monitor>,
 
-    /// Full-screen scrollable overview on the show level.
-    overview_fullscreen: bool,
-    overview_scroll: usize,
+    /// Scroll offset into the episode-info view (`Level::EpisodeDetail`).
+    info_scroll: usize,
 
     show_full_help: bool,
     loading: bool,
@@ -260,8 +332,7 @@ impl Browse {
             add_flow: None,
             pending_search: false,
             monitors: Vec::new(),
-            overview_fullscreen: false,
-            overview_scroll: 0,
+            info_scroll: 0,
             show_full_help: false,
             loading: false,
             queue_loading: false,
@@ -672,7 +743,7 @@ impl Browse {
                     self.start_auto_search(series.id, series_label(&series));
                 }
                 self.season_cursor = 0;
-                self.overview_scroll = 0;
+                self.info_scroll = 0;
                 self.level = Level::Show { series: *series };
                 self.add_results.clear();
                 self.add_results_raw.clear();
@@ -925,7 +996,7 @@ impl Browse {
             Level::SeriesList => {
                 if let Some(series) = self.selected_series().cloned() {
                     self.season_cursor = 0;
-                    self.overview_scroll = 0;
+                    self.info_scroll = 0;
                     self.level = Level::Show { series };
                     self.fetch_queue();
                 }
@@ -940,18 +1011,12 @@ impl Browse {
                     self.level = Level::Episodes { series, season };
                 }
             }
-            Level::Episodes { series, season } => {
-                let (series, season) = (series.clone(), season.clone());
-                let Some(episode) = self.selected_episode().cloned() else {
-                    return;
-                };
-                if episode.has_file && episode.episode_file.is_some() {
-                    self.level = Level::EpisodeDetail {
-                        series,
-                        season,
-                        episode,
-                    };
-                } else {
+            Level::Episodes { .. } => {
+                // Enter always searches (Auto/Interactive) for any episode,
+                // including a downloaded one, so upgrades are reachable. The
+                // episode info/file details live under `i` instead. The popup
+                // reads the level + selected episode, so stay on Episodes.
+                if self.selected_episode().is_some() {
                     self.search_menu = Some(0);
                 }
             }
@@ -978,10 +1043,7 @@ impl Browse {
                 self.downloads.reset();
                 true
             }
-            Level::Show { .. } => {
-                self.overview_fullscreen = false;
-                true
-            }
+            Level::Show { .. } => true,
             Level::Episodes { series, .. } => {
                 self.level = Level::Show { series };
                 true
@@ -1366,12 +1428,12 @@ impl Browse {
         if self.add_flow.is_some() {
             let count = self.add_step_option_count();
             match key.code {
-                KeyCode::Up | KeyCode::Char('k') => {
+                KeyCode::Up => {
                     if let Some(flow) = self.add_flow.as_mut() {
                         flow.cursor = flow.cursor.saturating_sub(1);
                     }
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
+                KeyCode::Down => {
                     if let Some(flow) = self.add_flow.as_mut() {
                         flow.cursor = (flow.cursor + 1).min(count.saturating_sub(1));
                     }
@@ -1440,10 +1502,10 @@ impl Browse {
 
         if let Some(selected) = self.sort_menu {
             match key.code {
-                KeyCode::Up | KeyCode::Char('k') => {
+                KeyCode::Up => {
                     self.sort_menu = Some(selected.saturating_sub(1));
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
+                KeyCode::Down => {
                     self.sort_menu = Some((selected + 1).min(SERIES_SORTS.len() - 1));
                 }
                 KeyCode::Enter => {
@@ -1466,10 +1528,10 @@ impl Browse {
         }
         if let Some(selected) = self.search_menu {
             match key.code {
-                KeyCode::Up | KeyCode::Char('k') => {
+                KeyCode::Up => {
                     self.search_menu = Some(selected.saturating_sub(1));
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
+                KeyCode::Down => {
                     self.search_menu = Some((selected + 1).min(SEARCH_MENU_OPTIONS.len() - 1));
                 }
                 KeyCode::Enter => {
@@ -1487,10 +1549,10 @@ impl Browse {
                 .map(|release| release.rejections.len())
                 .unwrap_or(0);
             match key.code {
-                KeyCode::Up | KeyCode::Char('k') => {
+                KeyCode::Up => {
                     self.rejections_popup = Some(selected.saturating_sub(1));
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
+                KeyCode::Down => {
                     self.rejections_popup = Some((selected + 1).min(count.saturating_sub(1)));
                 }
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('x') => {
@@ -1501,25 +1563,32 @@ impl Browse {
             return None;
         }
 
-        // Full-screen overview scrolls; everything else is closed off.
-        if self.overview_fullscreen {
+        // The episode-info view keeps the series header pinned and scrolls its
+        // body; it owns scroll, delete, and close keys while open.
+        if matches!(self.level, Level::EpisodeDetail { .. }) {
             let page = self.last_height.saturating_sub(4).max(1) as usize;
             match key.code {
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.overview_scroll = self.overview_scroll.saturating_sub(1);
+                KeyCode::Up => self.info_scroll = self.info_scroll.saturating_sub(1),
+                KeyCode::Down => self.info_scroll += 1,
+                KeyCode::PageUp | KeyCode::Left => {
+                    self.info_scroll = self.info_scroll.saturating_sub(page);
                 }
-                KeyCode::Down | KeyCode::Char('j') => self.overview_scroll += 1,
-                KeyCode::PageUp | KeyCode::Char('b') | KeyCode::Char('u') => {
-                    self.overview_scroll = self.overview_scroll.saturating_sub(page);
+                KeyCode::PageDown | KeyCode::Right => self.info_scroll += page,
+                KeyCode::Home | KeyCode::Char('g') => self.info_scroll = 0,
+                KeyCode::End | KeyCode::Char('G') => self.info_scroll = usize::MAX,
+                KeyCode::Char('x') => {
+                    if let Level::EpisodeDetail { episode, .. } = &self.level
+                        && let Some(file) = &episode.episode_file
+                    {
+                        self.confirm = Some(Confirm::DeleteFile { file_id: file.id });
+                    }
                 }
-                KeyCode::PageDown | KeyCode::Char('f') | KeyCode::Char('d') => {
-                    self.overview_scroll += page;
+                KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('i') => {
+                    self.pop_level();
+                    self.info_scroll = 0;
                 }
-                KeyCode::Home | KeyCode::Char('g') => self.overview_scroll = 0,
-                KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('v') => {
-                    self.overview_fullscreen = false;
-                    self.overview_scroll = 0;
-                }
+                KeyCode::Char('r') => self.refresh(),
+                KeyCode::Char('?') => self.show_full_help = !self.show_full_help,
                 KeyCode::Char('q') => return Some(BrowseAction::Quit),
                 _ => {}
             }
@@ -1528,31 +1597,31 @@ impl Browse {
 
         let page_jump = (self.last_height / 5).max(1) as usize;
         match key.code {
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Up => {
                 if let Some((cursor, _)) = self.cursor_and_len() {
                     *cursor = cursor.saturating_sub(1);
                 }
             }
-            KeyCode::Down | KeyCode::Char('j') => {
+            KeyCode::Down => {
                 if let Some((cursor, len)) = self.cursor_and_len()
                     && *cursor + 1 < len
                 {
                     *cursor += 1;
                 }
             }
-            // Opening Downloads must come before the `d` page-down alias
-            // below, but only claims `d` on the series list.
+            // `d` opens Downloads on the series list only; it is no longer a
+            // page-down alias, so it is unbound on every other level.
             KeyCode::Char('d') if matches!(self.level, Level::SeriesList) => {
                 self.level = Level::Downloads;
                 self.downloads.reset();
                 self.fetch_queue();
             }
-            KeyCode::PageUp | KeyCode::Char('b') | KeyCode::Char('u') => {
+            KeyCode::PageUp | KeyCode::Left => {
                 if let Some((cursor, _)) = self.cursor_and_len() {
                     *cursor = cursor.saturating_sub(page_jump);
                 }
             }
-            KeyCode::PageDown | KeyCode::Char('f') | KeyCode::Char('d') => {
+            KeyCode::PageDown | KeyCode::Right => {
                 if let Some((cursor, len)) = self.cursor_and_len() {
                     *cursor = (*cursor + page_jump).min(len.saturating_sub(1));
                 }
@@ -1602,20 +1671,26 @@ impl Browse {
                         .unwrap_or(0),
                 );
             }
-            KeyCode::Char('v')
-                if matches!(self.level, Level::Show { .. } | Level::Episodes { .. }) =>
-            {
-                self.overview_fullscreen = true;
-                self.overview_scroll = 0;
-            }
-            // `x` deletes on the episode detail and shows rejections in the
-            // search results; the levels are disjoint.
-            KeyCode::Char('x') => match &self.level {
-                Level::EpisodeDetail { episode, .. } => {
-                    if let Some(file) = &episode.episode_file {
-                        self.confirm = Some(Confirm::DeleteFile { file_id: file.id });
-                    }
+            // Open the selected episode's info (description + file details),
+            // keeping the series header pinned. Clone out before reassigning
+            // `self.level` (the same borrow dance as `open_selected`).
+            KeyCode::Char('i') if matches!(self.level, Level::Episodes { .. }) => {
+                if let Some(episode) = self.selected_episode().cloned()
+                    && let Level::Episodes { series, season } = &self.level
+                {
+                    let series = series.clone();
+                    let season = season.clone();
+                    self.info_scroll = 0;
+                    self.level = Level::EpisodeDetail {
+                        series,
+                        season,
+                        episode,
+                    };
                 }
+            }
+            // `x` shows rejections in the search results and removes from the
+            // queue; deleting an episode file lives in the episode-info view.
+            KeyCode::Char('x') => match &self.level {
                 Level::Search { .. }
                     if self
                         .selected_release()
@@ -1653,7 +1728,11 @@ impl Browse {
         let show_filter = self.filter_active && matches!(self.level, Level::SeriesList);
         let show_add_input = matches!(self.level, Level::Add);
         let show_input = show_filter || show_add_input;
-        let help_height = if self.show_full_help { 8 } else { 1 };
+        let help_height = if self.show_full_help {
+            help::rows(&self.help_sections())
+        } else {
+            1
+        };
 
         let rows = Layout::vertical([
             Constraint::Length(if has_message { 1 } else { 0 }),
@@ -1676,18 +1755,14 @@ impl Browse {
         } else if show_add_input {
             self.draw_add_row(frame, rows[2]);
         }
-        if self.overview_fullscreen {
-            self.draw_overview_fullscreen(frame, rows[3]);
-        } else {
-            match &self.level {
-                Level::SeriesList => self.draw_series_list(frame, rows[3]),
-                Level::Show { .. } => self.draw_show(frame, rows[3]),
-                Level::Episodes { .. } => self.draw_episodes(frame, rows[3]),
-                Level::EpisodeDetail { .. } => self.draw_episode_detail(frame, rows[3]),
-                Level::Search { .. } => self.draw_search(frame, rows[3]),
-                Level::Add => self.draw_add_results(frame, rows[3]),
-                Level::Downloads => self.draw_downloads(frame, rows[3]),
-            }
+        match &self.level {
+            Level::SeriesList => self.draw_series_list(frame, rows[3]),
+            Level::Show { .. } => self.draw_show(frame, rows[3]),
+            Level::Episodes { .. } => self.draw_episodes(frame, rows[3]),
+            Level::EpisodeDetail { .. } => self.draw_episode_info(frame, rows[3]),
+            Level::Search { .. } => self.draw_search(frame, rows[3]),
+            Level::Add => self.draw_add_results(frame, rows[3]),
+            Level::Downloads => self.draw_downloads(frame, rows[3]),
         }
         self.draw_help(frame, rows[4]);
 
@@ -1960,18 +2035,44 @@ impl Browse {
         self.draw_two_line_list(frame, area, self.series_cursor, &rows, "  No series.");
     }
 
-    /// Series header — title, "year • rating", wrapped overview capped at
-    /// ~40% of the space — shared by the show and episode levels so drilling
-    /// into a season keeps the series info on screen. Returns the area left
-    /// below it (possibly zero-height) for the level's list.
+    /// Series header — title, "year • rating", and the full series overview
+    /// (clamped to ~600 chars, like the Jellyfin app) — shared by the show,
+    /// episodes, and episode-info levels so the series stays on screen. Always
+    /// keeps a few rows for the list below and returns that leftover area.
     fn draw_series_header(&self, frame: &mut Frame, area: Rect, series: &Series) -> Rect {
+        const OVERVIEW_MAX_CHARS: usize = 600;
+        const MIN_LIST_ROWS: u16 = 4;
+
         let buf = frame.buffer_mut();
         let text_width = area.width.saturating_sub(6) as usize;
 
-        let overview_lines = wrap_text(series.overview.as_deref().unwrap_or_default(), text_width);
-        let overview_cap = ((area.height as usize) * 2 / 5).max(1);
-        let shown_overview = overview_lines.len().min(overview_cap);
-        let overview_truncated = overview_lines.len() > overview_cap;
+        let overview_raw = series.overview.as_deref().unwrap_or_default();
+        let overview = if overview_raw.chars().count() > OVERVIEW_MAX_CHARS {
+            let clipped: String = overview_raw.chars().take(OVERVIEW_MAX_CHARS).collect();
+            format!("{}…", clipped.trim_end())
+        } else {
+            overview_raw.to_string()
+        };
+        let overview_lines = wrap_text(&overview, text_width);
+
+        let mut meta = Vec::new();
+        if let Some(year) = series.year {
+            meta.push(year.to_string());
+        }
+        if let Some(ratings) = &series.ratings
+            && ratings.value > 0.0
+        {
+            meta.push(format!("{:.1}", ratings.value));
+        }
+
+        // Reserve a few rows for the list: title + optional meta + two spacers.
+        let fixed = 1 + (!meta.is_empty()) as u16 + 2;
+        let room = area
+            .height
+            .saturating_sub(MIN_LIST_ROWS)
+            .saturating_sub(fixed) as usize;
+        let shown_overview = overview_lines.len().min(room.max(1));
+        let overview_truncated = overview_lines.len() > shown_overview;
 
         let mut y = area.y;
         let mut line = |text: Line, y: &mut u16| {
@@ -1990,15 +2091,6 @@ impl Browse {
             )),
             &mut y,
         );
-        let mut meta = Vec::new();
-        if let Some(year) = series.year {
-            meta.push(year.to_string());
-        }
-        if let Some(ratings) = &series.ratings
-            && ratings.value > 0.0
-        {
-            meta.push(format!("{:.1}", ratings.value));
-        }
         if !meta.is_empty() {
             line(
                 Line::from(Span::styled(
@@ -2019,10 +2111,7 @@ impl Browse {
             );
         }
         if overview_truncated {
-            line(
-                Line::from(Span::styled("  … (v: full overview)", theme::dim())),
-                &mut y,
-            );
+            line(Line::from(Span::styled("  …", theme::dim())), &mut y);
         }
         y += 1;
 
@@ -2077,7 +2166,10 @@ impl Browse {
                 vec![Span::styled(format!("   {label}"), style)]
             };
             if downloading {
-                spans.push(Span::styled(" ↓", Style::new().fg(theme::accent_bright())));
+                spans.push(Span::styled(
+                    format!(" {}", display::GLYPH_DOWNLOADING),
+                    Style::new().fg(theme::accent_bright()),
+                ));
             }
             Line::from(spans).render(
                 Rect::new(
@@ -2091,37 +2183,6 @@ impl Browse {
         }
         if series.seasons.len() > per_page {
             list::draw_scrollbar(buf, list_area, self.season_cursor, series.seasons.len());
-        }
-    }
-
-    fn draw_overview_fullscreen(&mut self, frame: &mut Frame, area: Rect) {
-        let series = match &self.level {
-            Level::Show { series } | Level::Episodes { series, .. } => series,
-            _ => return,
-        };
-        let buf = frame.buffer_mut();
-        let text_width = area.width.saturating_sub(4) as usize;
-        let lines = wrap_text(series.overview.as_deref().unwrap_or_default(), text_width);
-        let height = area.height as usize;
-        let max_scroll = lines.len().saturating_sub(height);
-        self.overview_scroll = self.overview_scroll.min(max_scroll);
-        for (row, text) in lines
-            .iter()
-            .skip(self.overview_scroll)
-            .take(height)
-            .enumerate()
-        {
-            Line::from(Span::styled(
-                format!("  {text}"),
-                Style::new().fg(theme::fg()),
-            ))
-            .render(
-                Rect::new(area.x, area.y + row as u16, area.width.saturating_sub(1), 1),
-                buf,
-            );
-        }
-        if lines.len() > height {
-            list::draw_scrollbar(buf, area, self.overview_scroll, max_scroll + 1);
         }
     }
 
@@ -2179,7 +2240,7 @@ impl Browse {
                     Span::styled(quality.clone(), Style::new().fg(theme::fg()))
                 }
                 EpStatus::Downloading(percent) => Span::styled(
-                    format!("↓ {percent}%"),
+                    format!("{} {percent}%", display::GLYPH_DOWNLOADING),
                     Style::new().fg(theme::accent_bright()),
                 ),
                 EpStatus::Missing => Span::styled("missing".to_string(), theme::error()),
@@ -2252,104 +2313,93 @@ impl Browse {
         });
     }
 
-    fn draw_episode_detail(&self, frame: &mut Frame, area: Rect) {
-        let Level::EpisodeDetail { episode, .. } = &self.level else {
-            return;
-        };
-        let buf = frame.buffer_mut();
-        let Some(file) = &episode.episode_file else {
-            return;
-        };
-        let text_width = area.width.saturating_sub(16) as usize;
+    /// The selected episode's info: the pinned series header, then the
+    /// episode's code/title, meta, its own description, and (if downloaded) the
+    /// file details. Scrolls with `info_scroll`.
+    fn draw_episode_info(&mut self, frame: &mut Frame, area: Rect) {
+        // Draw the pinned header and build the scrollable body under an
+        // immutable borrow, then clamp/scroll under a mutable one.
+        let (body, lines) = {
+            let Level::EpisodeDetail {
+                series, episode, ..
+            } = &self.level
+            else {
+                return;
+            };
+            let body = self.draw_series_header(frame, area, series);
+            let text_width = body.width.saturating_sub(4) as usize;
 
-        let none = || "-".to_string();
-        let mut entries: Vec<(&str, String)> = vec![
-            (
-                "Episode",
+            let mut lines: Vec<Line> = Vec::new();
+            lines.push(Line::from(Span::styled(
                 format!(
-                    "{}  {}",
+                    "  {}  {}",
                     display::episode_code(episode.season_number, episode.episode_number),
                     episode.title.as_deref().unwrap_or("")
                 ),
-            ),
-            ("Aired", episode.air_date.clone().unwrap_or_else(none)),
-            (
-                "Path",
-                file.path
-                    .as_deref()
-                    .map(|path| truncate(path, text_width))
-                    .unwrap_or_else(none),
-            ),
-            ("Size", display::format_size(file.size)),
-            (
-                "Quality",
-                file.quality
-                    .as_ref()
-                    .and_then(|q| q.quality.name.clone())
-                    .unwrap_or_else(none),
-            ),
-        ];
-        let languages: Vec<&str> = file
-            .languages
-            .iter()
-            .filter_map(|language| language.name.as_deref())
-            .collect();
-        let language = if languages.is_empty() {
-            file.language
-                .as_ref()
-                .and_then(|language| language.name.clone())
-                .unwrap_or_else(none)
-        } else {
-            languages.join(", ")
-        };
-        entries.push(("Language", language));
-        if let Some(info) = &file.media_info {
-            let join = |parts: Vec<Option<String>>| {
-                let joined: Vec<String> = parts.into_iter().flatten().collect();
-                if joined.is_empty() {
-                    none()
-                } else {
-                    joined.join(" • ")
-                }
-            };
-            entries.push((
-                "Video",
-                join(vec![
-                    info.video_codec.clone(),
-                    info.resolution.clone(),
-                    info.video_dynamic_range.clone(),
-                ]),
-            ));
-            entries.push((
-                "Audio",
-                join(vec![
-                    info.audio_codec.clone(),
-                    info.audio_channels.map(|channels| format!("{channels} ch")),
-                    info.audio_languages.clone(),
-                ]),
-            ));
-            entries.push((
-                "Subtitles",
-                info.subtitles
-                    .clone()
-                    .filter(|subs| !subs.is_empty())
-                    .unwrap_or_else(none),
-            ));
-            entries.push(("Runtime", info.run_time.clone().unwrap_or_else(none)));
-        }
-
-        for (row, (label, value)) in entries.iter().enumerate() {
-            if row as u16 >= area.height {
-                break;
+                Style::new()
+                    .fg(theme::accent_bright())
+                    .add_modifier(Modifier::BOLD),
+            )));
+            let mut meta: Vec<String> = Vec::new();
+            if let Some(aired) = &episode.air_date {
+                meta.push(format!("Aired {aired}"));
             }
-            Line::from(vec![
-                Span::styled(format!("  {label:<11}"), theme::selected()),
-                Span::styled(format!(" {value}"), Style::new().fg(theme::fg())),
-            ])
-            .render(
-                Rect::new(area.x, area.y + row as u16, area.width.saturating_sub(1), 1),
+            if let Some(runtime) = episode.runtime {
+                meta.push(format!("{runtime}m"));
+            }
+            if !meta.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", meta.join(" · ")),
+                    theme::dim(),
+                )));
+            }
+            // File details first (or "not downloaded"), then the description.
+            if let Some(file) = &episode.episode_file {
+                lines.push(Line::from(""));
+                for (label, value) in
+                    episode_file_rows(file, body.width.saturating_sub(16) as usize)
+                {
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("  {label:<11}"), theme::selected()),
+                        Span::styled(format!(" {value}"), Style::new().fg(theme::fg())),
+                    ]));
+                }
+            } else {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled("  Not downloaded.", theme::dim())));
+            }
+            lines.push(Line::from(""));
+            let overview = episode
+                .overview
+                .as_deref()
+                .unwrap_or("No overview available.");
+            for text in wrap_text(overview, text_width) {
+                lines.push(Line::from(Span::styled(
+                    format!("  {text}"),
+                    Style::new().fg(theme::fg()),
+                )));
+            }
+            (body, lines)
+        };
+
+        let buf = frame.buffer_mut();
+        let total = lines.len();
+        let height = body.height as usize;
+        let max_scroll = total.saturating_sub(height);
+        self.info_scroll = self.info_scroll.min(max_scroll);
+        for (row, line) in lines
+            .into_iter()
+            .skip(self.info_scroll)
+            .take(height)
+            .enumerate()
+        {
+            line.render(
+                Rect::new(body.x, body.y + row as u16, body.width.saturating_sub(1), 1),
                 buf,
             );
+        }
+        if total > height {
+            list::draw_scrollbar(buf, body, self.info_scroll, max_scroll + 1);
         }
     }
 
@@ -2368,10 +2418,16 @@ impl Browse {
                     theme::dim(),
                 )];
                 if release.rejected {
-                    detail.push(Span::styled(" !", theme::error()));
+                    detail.push(Span::styled(
+                        format!(" {}", display::GLYPH_REJECTED),
+                        theme::error(),
+                    ));
                 }
                 if display::previously_grabbed(&self.history, release) {
-                    detail.push(Span::styled(" ✓", Style::new().fg(theme::accent_bright())));
+                    detail.push(Span::styled(
+                        format!(" {}", display::GLYPH_GRABBED),
+                        Style::new().fg(theme::accent_bright()),
+                    ));
                 }
                 (title, detail)
             })
@@ -2392,14 +2448,14 @@ impl Browse {
             return vec![("esc", "unfocus"), ("enter", "search")];
         }
         if self.add_flow.is_some() {
-            return vec![("j/k", "move"), ("enter", "next"), ("esc", "cancel")];
+            return vec![("↑/↓", "move"), ("enter", "next"), ("esc", "cancel")];
         }
         if self.confirm.is_some() {
             return vec![("y/enter", "confirm"), ("n/esc", "cancel")];
         }
         if self.delete_prompt.is_some() {
             return vec![
-                ("j/k", "move"),
+                ("↑/↓", "move"),
                 ("space", "toggle"),
                 ("enter", "delete"),
                 ("esc", "cancel"),
@@ -2407,7 +2463,7 @@ impl Browse {
         }
         if self.downloads.is_prompting() {
             return vec![
-                ("j/k", "move"),
+                ("↑/↓", "move"),
                 ("space", "toggle"),
                 ("enter", "remove"),
                 ("esc", "cancel"),
@@ -2418,9 +2474,6 @@ impl Browse {
         }
         if self.rejections_popup.is_some() {
             return vec![("esc", "close")];
-        }
-        if self.overview_fullscreen {
-            return vec![("esc/v", "back"), ("j/k", "scroll")];
         }
         let mut entries: Vec<(&'static str, &'static str)> = Vec::new();
         match &self.level {
@@ -2443,16 +2496,18 @@ impl Browse {
                 entries.push(("esc", "back"));
                 entries.push(("enter", "open season"));
                 entries.push(("z", "delete"));
-                entries.push(("v", "overview"));
             }
             Level::Episodes { .. } => {
                 entries.push(("esc", "back"));
-                entries.push(("enter", "details/search"));
-                entries.push(("v", "overview"));
+                entries.push(("enter", "search"));
+                entries.push(("i", "info"));
             }
-            Level::EpisodeDetail { .. } => {
-                entries.push(("esc", "back"));
-                entries.push(("x", "delete file"));
+            Level::EpisodeDetail { episode, .. } => {
+                entries.push(("↑/↓", "scroll"));
+                if episode.episode_file.is_some() {
+                    entries.push(("x", "delete file"));
+                }
+                entries.push(("esc/i", "back"));
             }
             Level::Search { .. } => {
                 entries.push(("esc", "back"));
@@ -2483,9 +2538,29 @@ impl Browse {
         entries
     }
 
+    /// Columns for the expanded (`?`) help: shared navigation, the
+    /// level-aware `help_entries`, and the symbol legend as its own labelled
+    /// column so the glyphs are never mistaken for keybindings.
+    fn help_sections(&self) -> Vec<help::Section> {
+        vec![
+            help::Section {
+                title: "Move",
+                entries: help::NAV.to_vec(),
+            },
+            help::Section {
+                title: "Actions",
+                entries: self.help_entries(),
+            },
+            help::Section {
+                title: "Symbols",
+                entries: display::SYMBOL_LEGEND.to_vec(),
+            },
+        ]
+    }
+
     fn draw_help(&self, frame: &mut Frame, area: Rect) {
-        let buf = frame.buffer_mut();
         if !self.show_full_help {
+            let buf = frame.buffer_mut();
             let mut spans = vec![Span::raw("  ")];
             for (i, (key, desc)) in self.help_entries().into_iter().enumerate() {
                 if i > 0 {
@@ -2497,57 +2572,73 @@ impl Browse {
             Line::from(spans).render(area, buf);
             return;
         }
-
-        let columns: [&[(&str, &str)]; 3] = [
-            &[
-                ("↑/k", "up"),
-                ("↓/j", "down"),
-                ("pgup/b/u", "page up"),
-                ("pgdn/f/d", "page down"),
-                ("g/home", "go to start"),
-                ("G/end", "go to end"),
-            ],
-            &[
-                ("enter", "open/select"),
-                ("esc", "back/clear"),
-                ("/", "filter series"),
-                ("s", "sort series"),
-                ("v", "full overview"),
-                ("r", "refresh"),
-            ],
-            &[
-                ("x", "delete file / rejections"),
-                ("z", "delete series"),
-                ("! ✓", "rejected / grabbed before"),
-                ("↓", "downloading"),
-                ("q", "quit"),
-                ("?", "close help"),
-            ],
-        ];
-        let areas = Layout::horizontal([
-            Constraint::Length(26),
-            Constraint::Length(26),
-            Constraint::Length(34),
-        ])
-        .split(area);
-        for (column, column_area) in columns.iter().zip(areas.iter()) {
-            for (row, (key, desc)) in column.iter().enumerate() {
-                if (row as u16) < column_area.height {
-                    let line_area = Rect::new(
-                        column_area.x,
-                        column_area.y + row as u16,
-                        column_area.width,
-                        1,
-                    );
-                    Line::from(vec![
-                        Span::styled(format!("  {key:<10}"), Style::new().fg(theme::dim_color())),
-                        Span::styled(desc.to_string(), theme::dim()),
-                    ])
-                    .render(line_area, buf);
-                }
-            }
-        }
+        help::draw(frame, area, &self.help_sections());
     }
 }
 
 const SEARCH_MENU_OPTIONS: [&str; 3] = ["Auto search", "Interactive search", "Cancel"];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::arr::models::Quality;
+    use crate::sonarr::models::{Language, MediaInfo, QualityWrapper};
+
+    #[test]
+    fn episode_file_rows_include_media_info() {
+        let file = EpisodeFile {
+            id: 1,
+            path: Some("/tv/Show/S01E02.mkv".into()),
+            size: 1_500_000_000,
+            quality: Some(QualityWrapper {
+                quality: Quality {
+                    name: Some("Bluray-1080p".into()),
+                },
+            }),
+            languages: vec![Language {
+                name: Some("Japanese".into()),
+            }],
+            language: None,
+            media_info: Some(MediaInfo {
+                video_codec: Some("x264".into()),
+                resolution: Some("1920x1080".into()),
+                audio_codec: Some("FLAC".into()),
+                audio_channels: Some(2.0),
+                audio_languages: Some("jpn".into()),
+                subtitles: Some("eng".into()),
+                run_time: Some("23:41".into()),
+                ..Default::default()
+            }),
+        };
+        let rows = episode_file_rows(&file, 40);
+        let labels: Vec<&str> = rows.iter().map(|(label, _)| *label).collect();
+        assert_eq!(
+            labels,
+            [
+                "Path",
+                "Size",
+                "Quality",
+                "Language",
+                "Video",
+                "Audio",
+                "Subtitles",
+                "Runtime"
+            ]
+        );
+        let value = |label: &str| {
+            rows.iter()
+                .find(|(l, _)| *l == label)
+                .map(|(_, v)| v.as_str())
+                .unwrap()
+        };
+        assert_eq!(value("Quality"), "Bluray-1080p");
+        assert_eq!(value("Language"), "Japanese");
+        assert_eq!(value("Video"), "x264 • 1920x1080");
+        assert_eq!(value("Audio"), "FLAC • 2 ch • jpn");
+
+        // Without media_info only the four base rows appear.
+        let mut bare = file;
+        bare.media_info = None;
+        assert_eq!(episode_file_rows(&bare, 40).len(), 4);
+    }
+}
