@@ -99,27 +99,48 @@ impl TextInput {
     }
 
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
+        use unicode_width::UnicodeWidthChar;
+
         let shown: String = if self.masked {
             "•".repeat(self.value.chars().count())
         } else {
             self.value.clone()
         };
-        let mut spans: Vec<Span> = Vec::with_capacity(3);
-        if self.focused {
-            let chars: Vec<char> = shown.chars().collect();
-            let before: String = chars[..self.cursor].iter().collect();
-            let at = chars.get(self.cursor).copied().unwrap_or(' ');
-            let after: String = chars.get(self.cursor + 1..).unwrap_or(&[]).iter().collect();
-            spans.push(Span::styled(before, Style::new().fg(theme::FG)));
-            spans.push(Span::styled(
+        if !self.focused {
+            Line::styled(shown, Style::new().fg(theme::FG)).render(area, buf);
+            return;
+        }
+
+        let chars: Vec<char> = shown.chars().collect();
+        let cursor = self.cursor.min(chars.len());
+        let at = chars.get(cursor).copied().unwrap_or(' ');
+
+        // Horizontal scroll: when the value outgrows the field, show the
+        // window ending at the cursor instead of clipping it off the right
+        // edge. Walk back from the cursor cell, spending the area's column
+        // budget (display width, so double-width chars count as two).
+        let mut used = at.width().unwrap_or(1).max(1);
+        let mut start = cursor;
+        while start > 0 {
+            let char_width = chars[start - 1].width().unwrap_or(0);
+            if used + char_width > area.width as usize {
+                break;
+            }
+            used += char_width;
+            start -= 1;
+        }
+
+        let before: String = chars[start..cursor].iter().collect();
+        let after: String = chars.get(cursor + 1..).unwrap_or(&[]).iter().collect();
+        Line::from(vec![
+            Span::styled(before, Style::new().fg(theme::FG)),
+            Span::styled(
                 at.to_string(),
                 Style::new().add_modifier(Modifier::REVERSED),
-            ));
-            spans.push(Span::styled(after, Style::new().fg(theme::FG)));
-        } else {
-            spans.push(Span::styled(shown, Style::new().fg(theme::FG)));
-        }
-        Line::from(spans).render(area, buf);
+            ),
+            Span::styled(after, Style::new().fg(theme::FG)),
+        ])
+        .render(area, buf);
     }
 }
 
@@ -146,5 +167,32 @@ mod tests {
         input.on_key(key(KeyCode::Right));
         input.on_key(key(KeyCode::Char('x')));
         assert_eq!(input.value(), "éxll");
+    }
+
+    fn rendered_row(input: &TextInput, width: u16) -> String {
+        let area = Rect::new(0, 0, width, 1);
+        let mut buf = Buffer::empty(area);
+        input.render(area, &mut buf);
+        (0..width)
+            .map(|x| buf[(x, 0)].symbol().to_string())
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
+    #[test]
+    fn scrolls_to_keep_cursor_visible() {
+        let mut input = TextInput::with_value("https://jellyfin.example.com/media");
+        input.focused = true;
+        // Cursor at the end: the window shows the value's tail, not its head
+        // (with the cursor's phantom space taking the last column).
+        assert_eq!(rendered_row(&input, 10), "com/media");
+        // Cursor at the start: the window shows the head.
+        input.on_key(key(KeyCode::Home));
+        assert_eq!(rendered_row(&input, 10), "https://je");
+        // Short values are unaffected.
+        let mut short = TextInput::with_value("demo");
+        short.focused = true;
+        assert_eq!(rendered_row(&short, 10), "demo");
     }
 }
