@@ -59,6 +59,16 @@ impl LoginForm {
             .map(|e| e.to_string())
     }
 
+    /// Plain http means the password and token cross the network unencrypted.
+    /// Legitimate on a trusted LAN, but worth a visible nudge.
+    fn plain_http(&self) -> bool {
+        self.host
+            .value()
+            .trim()
+            .to_ascii_lowercase()
+            .starts_with("http://")
+    }
+
     fn valid(&self) -> bool {
         !self.host.value().is_empty()
             && self.host_error().is_none()
@@ -144,6 +154,12 @@ impl LoginForm {
         self.host.render(input_area, buf);
         if let Some(err) = self.host_error() {
             Line::styled(format!(" {err}"), theme::dim()).render(rows[3], buf);
+        } else if self.plain_http() {
+            Line::styled(
+                " http:// sends credentials unencrypted; prefer https://",
+                theme::dim(),
+            )
+            .render(rows[3], buf);
         }
 
         let (label_area, input_area) = field_area(rows[4]);

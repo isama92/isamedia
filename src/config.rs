@@ -60,10 +60,24 @@ impl Config {
                 .with_context(|| format!("creating config directory {}", dir.display()))?;
         }
         let raw = toml::to_string_pretty(self).context("serializing config")?;
-        std::fs::write(path, raw)
-            .with_context(|| format!("writing config file {}", path.display()))?;
         // No secrets in here, but the file still names your server and
-        // account; keep it private to the user.
+        // account; create it owner-only from the start rather than chmodding
+        // after the fact, so it is never world-readable even briefly.
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(path)
+            .with_context(|| format!("writing config file {}", path.display()))?;
+        use std::io::Write;
+        file.write_all(raw.as_bytes())
+            .with_context(|| format!("writing config file {}", path.display()))?;
+        // The mode above only applies on creation; also tighten a config
+        // file that already existed with looser permissions.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

@@ -52,10 +52,16 @@ fn init_logging(
     let Some(path) = path else {
         return Ok(None);
     };
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
+    // The log names the server, media titles and every (redacted) mpv
+    // command; keep it owner-only like the config file.
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
     let (writer, guard) = tracing_appender::non_blocking(file);
     tracing_subscriber::fmt()
         .json()
