@@ -151,7 +151,9 @@ fn title_key(series: &Series) -> String {
 
 pub fn sort_series(list: &mut [Series], sort: SeriesSort) {
     match sort {
-        SeriesSort::TitleAz => list.sort_by_key(title_key),
+        // `sort_by_cached_key`, not `sort_by_key`: the latter reruns the
+        // String-allocating key on both sides of every comparison.
+        SeriesSort::TitleAz => list.sort_by_cached_key(title_key),
         // Missing years sink to the bottom of the newest-first list.
         SeriesSort::Year => {
             list.sort_by_key(|series| std::cmp::Reverse(series.year.unwrap_or(i32::MIN)))

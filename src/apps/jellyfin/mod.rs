@@ -209,9 +209,18 @@ impl JellyfinApp {
                     )
                 })
                 .await;
-                if let Ok((token, password)) = secrets {
-                    creds.token = token.unwrap_or_default();
-                    creds.password = password.unwrap_or_default();
+                match secrets {
+                    Ok((token, password)) => {
+                        creds.token = token.unwrap_or_default();
+                        creds.password = password.unwrap_or_default();
+                    }
+                    // The blocking keyring read panicked or was cancelled. Log
+                    // the cause (it carries no secret material) instead of
+                    // silently falling through to a bare "authentication
+                    // failed" from the empty-credential connect below.
+                    Err(err) => {
+                        tracing::warn!(%err, "reading stored Jellyfin secrets failed");
+                    }
                 }
             }
             let result = Client::connect(creds).await;

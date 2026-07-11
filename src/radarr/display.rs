@@ -153,7 +153,9 @@ fn title_key(movie: &Movie) -> String {
 
 pub fn sort_movies(list: &mut [Movie], sort: MovieSort) {
     match sort {
-        MovieSort::TitleAz => list.sort_by_key(title_key),
+        // `sort_by_cached_key`, not `sort_by_key`: the latter reruns the
+        // String-allocating key on both sides of every comparison.
+        MovieSort::TitleAz => list.sort_by_cached_key(title_key),
         // Missing years sink to the bottom of the newest-first list.
         MovieSort::Year => {
             list.sort_by_key(|movie| std::cmp::Reverse(movie.year.unwrap_or(i32::MIN)))

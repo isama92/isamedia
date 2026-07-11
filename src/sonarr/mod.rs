@@ -16,8 +16,6 @@ pub use models::{
     Command, Episode, HistoryRecord, QualityProfile, QueueItem, Release, RootFolder, Series,
 };
 
-use crate::arr::models::Page;
-
 #[derive(Clone, Debug)] // derived Debug is safe: Transport redacts the key
 pub struct Client {
     transport: crate::arr::Transport,
@@ -321,24 +319,22 @@ impl Client {
     }
 
     /// Past grab/import/delete events of one episode, for the
-    /// "grabbed before" marker in interactive search results. Paginated,
-    /// unlike Radarr's /history/movie.
+    /// "grabbed before" marker in interactive search results. Sonarr's
+    /// `/history` is paginated (unlike Radarr's `/history/movie`), so follow the
+    /// pages to completion; a single page would drop the marker on episodes
+    /// with a long history.
     pub async fn get_history(&self, episode_id: i64) -> Result<Vec<HistoryRecord>, Error> {
+        const HISTORY_PAGE_SIZE: usize = 100;
+        const HISTORY_MAX_PAGES: usize = 20;
         let episode_id = episode_id.to_string();
-        let page: Page<HistoryRecord> = self
-            .transport
-            .request(
-                Method::GET,
+        self.transport
+            .paginate(
                 "/api/v3/history",
-                &[
-                    ("episodeId", episode_id.as_str()),
-                    ("page", "1"),
-                    ("pageSize", "100"),
-                ],
-                None,
+                &[("episodeId", episode_id.as_str())],
+                HISTORY_PAGE_SIZE,
+                HISTORY_MAX_PAGES,
             )
-            .await?;
-        Ok(page.records)
+            .await
     }
 }
 
