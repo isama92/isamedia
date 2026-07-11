@@ -3,7 +3,7 @@
 //! nowhere to cancel back to on the entry screen).
 
 use ratatui::Frame;
-use ratatui::crossterm::event::KeyEvent;
+use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::text::Line;
 use ratatui::widgets::Widget;
@@ -23,6 +23,10 @@ mod field {
 
 pub enum LoginAction {
     Submit,
+    /// Esc pressed while an auth attempt is in flight: abandon it (the app
+    /// bumps `auth_gen` so the pending result is dropped) instead of leaving
+    /// the form locked until the request timeout.
+    Cancel,
 }
 
 pub struct LoginForm {
@@ -93,7 +97,10 @@ impl LoginForm {
 
     pub fn on_key(&mut self, key: KeyEvent) -> Option<LoginAction> {
         if self.busy {
-            return None;
+            // A submit against a black-holed host would otherwise lock the form
+            // until the request timeout; Esc abandons the attempt and returns
+            // control. Every other key stays ignored while busy.
+            return (key.code == KeyCode::Esc).then_some(LoginAction::Cancel);
         }
         match self.form.on_key(key) {
             FormEvent::Save => {
@@ -151,5 +158,40 @@ impl LoginForm {
             Line::styled(" enter: connect   tab: next field", theme::dim())
         };
         line.render(row, frame.buffer_mut());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn form() -> LoginForm {
+        LoginForm::from_config(&JellyfinConfig::default())
+    }
+
+    #[test]
+    fn esc_while_busy_cancels_the_attempt() {
+        let mut form = form();
+        form.busy = true;
+        assert!(matches!(
+            form.on_key(KeyEvent::from(KeyCode::Esc)),
+            Some(LoginAction::Cancel)
+        ));
+    }
+
+    #[test]
+    fn other_keys_are_ignored_while_busy() {
+        let mut form = form();
+        form.busy = true;
+        assert!(form.on_key(KeyEvent::from(KeyCode::Char('a'))).is_none());
+        assert!(form.on_key(KeyEvent::from(KeyCode::Enter)).is_none());
+    }
+
+    #[test]
+    fn esc_is_ignored_when_not_busy() {
+        // The entry screen has nowhere to cancel back to, so Esc is a no-op
+        // unless an attempt is in flight.
+        let mut form = form();
+        assert!(form.on_key(KeyEvent::from(KeyCode::Esc)).is_none());
     }
 }

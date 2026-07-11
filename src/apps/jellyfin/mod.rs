@@ -416,18 +416,29 @@ impl MediaApp for JellyfinApp {
                 _ => None,
             },
             Screen::Login(form) => {
-                if let Some(LoginAction::Submit) = form.on_key(key) {
-                    form.busy = true;
-                    form.error = None;
-                    let (host, username, password) =
-                        (form.host(), form.username(), form.password());
-                    let mut creds = self.credentials();
-                    creds.host = host;
-                    creds.username = username;
-                    creds.password = password;
-                    // Fresh username/password auth: no stored token or user id.
-                    creds.user_id = String::new();
-                    self.spawn_connect(creds, false);
+                match form.on_key(key) {
+                    Some(LoginAction::Submit) => {
+                        form.busy = true;
+                        form.error = None;
+                        let (host, username, password) =
+                            (form.host(), form.username(), form.password());
+                        let mut creds = self.credentials();
+                        creds.host = host;
+                        creds.username = username;
+                        creds.password = password;
+                        // Fresh username/password auth: no stored token or user id.
+                        creds.user_id = String::new();
+                        self.spawn_connect(creds, false);
+                    }
+                    Some(LoginAction::Cancel) => {
+                        // Release the form, then invalidate the in-flight attempt
+                        // so its AuthDone is dropped on arrival (like the
+                        // Connecting screen's Esc). Form use precedes the self
+                        // borrow so this borrow-checks like the Submit arm.
+                        form.busy = false;
+                        self.auth_gen += 1;
+                    }
+                    None => {}
                 }
                 None
             }

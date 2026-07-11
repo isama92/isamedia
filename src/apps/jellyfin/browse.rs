@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
@@ -25,6 +26,11 @@ const PAGE_SIZE: usize = 100;
 /// Fetch the next page once the cursor is within this many rows of the end
 /// of the loaded window.
 const FETCH_AHEAD: usize = 20;
+/// How many times a page in the client-filter load-everything chain is retried
+/// after a transient error before the chain gives up. Bounded with exponential
+/// backoff so one failed page cannot leave the filter matching a partial list,
+/// nor hammer a struggling self-hosted server.
+const FILTER_LOAD_MAX_RETRIES: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -338,6 +344,9 @@ pub struct Browse {
     gen_counter: Arc<AtomicU64>,
     /// Generation of this instance's latest fetch; older results are stale.
     fetch_gen: u64,
+    /// Consecutive failures of the current client-filter chain page, capped by
+    /// `FILTER_LOAD_MAX_RETRIES`; reset on any successful page.
+    filter_load_attempts: u32,
     has_fetched: bool,
     spinner_frame: usize,
     /// Terminal height from the last draw, for jfsh-style page jumps.
@@ -374,6 +383,7 @@ impl Browse {
             notice: None,
             gen_counter,
             fetch_gen: 0,
+            filter_load_attempts: 0,
             has_fetched: false,
             spinner_frame: 0,
             last_height: 24,
@@ -485,6 +495,15 @@ impl Browse {
     /// (`refetch_in_place`) passes the loaded count to reload every page
     /// scrolled through in one request.
     fn fetch_library_page(&mut self, start_index: usize, limit: usize) {
+        self.fetch_library_page_after(start_index, limit, Duration::ZERO);
+    }
+
+    /// Like `fetch_library_page` but delays the request by `delay`, used by the
+    /// client-filter chain's bounded retry so a transient page error does not
+    /// halt the load permanently. Carries a fresh `fetch_gen` like every fetch,
+    /// so a delayed page landing after the user navigates away is dropped as
+    /// stale by the guard in `on_library_items_loaded`.
+    fn fetch_library_page_after(&mut self, start_index: usize, limit: usize, delay: Duration) {
         let fetch_gen = self.begin_fetch();
         let client = self.client.clone();
         let sender = self.sender.clone();
@@ -502,6 +521,9 @@ impl Browse {
             // Root: /Views is a handful of entries, one unpaginated request.
             None => {
                 tokio::spawn(async move {
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
                     let result = client.get_libraries().await;
                     sender.send(Msg::LibraryItemsLoaded {
                         fetch_gen,
@@ -513,6 +535,9 @@ impl Browse {
             Some(mut query) => {
                 query.limit = limit;
                 tokio::spawn(async move {
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
                     let result = client.get_library_items(&query).await;
                     sender.send(Msg::LibraryItemsLoaded {
                         fetch_gen,
@@ -576,6 +601,8 @@ impl Browse {
             && !self.loading
             && self.all_items.len() < self.lib_total
         {
+            // Fresh chain: give it a full retry budget.
+            self.filter_load_attempts = 0;
             self.fetch_library_page(self.all_items.len(), PAGE_SIZE);
         }
     }
@@ -589,6 +616,7 @@ impl Browse {
         self.filter.clear();
         self.filter_active = false;
         self.filter_focused = false;
+        self.filter_load_attempts = 0;
         self.fetch_library_page(0, PAGE_SIZE);
     }
 
@@ -658,6 +686,9 @@ impl Browse {
         self.loading = false;
         match result {
             Ok(page) => {
+                // A page landed: the chain made progress, so restore the full
+                // retry budget for the next page.
+                self.filter_load_attempts = 0;
                 self.lib_total = page.total_record_count.max(0) as usize;
                 let page_len = page.items.len();
                 if start_index == 0 {
@@ -680,7 +711,23 @@ impl Browse {
                 }
             }
             Err(crate::jellyfin::Error::Unauthorized) => return true,
-            Err(err) => self.error = Some(err.to_string()),
+            Err(err) => {
+                // A transient error mid client-filter chain would otherwise end
+                // the chain silently, leaving the filter matching a partial
+                // list. Retry the same page with exponential backoff before
+                // giving up, so one bad page does not strand the load.
+                let in_filter_chain = self.filter_active
+                    && !self.uses_server_filter()
+                    && self.all_items.len() < self.lib_total;
+                if in_filter_chain && self.filter_load_attempts < FILTER_LOAD_MAX_RETRIES {
+                    self.filter_load_attempts += 1;
+                    let backoff = Duration::from_millis(500u64 << (self.filter_load_attempts - 1));
+                    self.fetch_library_page_after(start_index, PAGE_SIZE, backoff);
+                } else {
+                    self.filter_load_attempts = 0;
+                    self.error = Some(err.to_string());
+                }
+            }
         }
         false
     }
@@ -1133,8 +1180,15 @@ impl Browse {
                 }
                 KeyCode::Enter | KeyCode::Char(' ') => self.enter_season(),
                 KeyCode::Esc | KeyCode::Backspace => {
-                    // Leave the series, back to the tab's list.
+                    // Leave the series, back to the tab's list. Clear the
+                    // series' episodes so nothing from it is playable during
+                    // the refetch: once current_series is None, Enter routes to
+                    // the top-level play handler, and current_item() must not
+                    // still return a stale episode until the tab list lands.
                     self.current_series = None;
+                    self.series_view = SeriesView::Seasons;
+                    self.items.clear();
+                    self.seasons.clear();
                     self.cursor = 0;
                     self.fetch();
                 }

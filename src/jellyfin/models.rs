@@ -122,6 +122,9 @@ pub struct AuthUser {
 pub struct PlaybackInfo<'a> {
     pub item_id: &'a str,
     pub position_ticks: i64,
+    /// Reported on the Progress endpoint so Jellyfin can show the session as
+    /// paused; `false` for start/stopped, which the server ignores.
+    pub is_paused: bool,
 }
 
 #[cfg(test)]
