@@ -132,6 +132,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn playback_info_serialises_pascal_case_field_names() {
+        // The field names are a silent wire contract with Jellyfin; a rename
+        // typo would type-check but break reporting (notably IsPaused, which
+        // the dashboard reads to show a paused session).
+        let value = serde_json::to_value(PlaybackInfo {
+            item_id: "abc123",
+            position_ticks: 42,
+            is_paused: true,
+        })
+        .unwrap();
+        assert_eq!(value["ItemId"], "abc123");
+        assert_eq!(value["PositionTicks"], 42);
+        assert_eq!(value["IsPaused"], true);
+    }
+
+    #[test]
     fn deserializes_item() {
         let raw = r#"{
             "Name": "The Expanse",

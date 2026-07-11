@@ -489,10 +489,11 @@ impl MediaApp for JellyfinApp {
             Msg::LibraryItemsLoaded {
                 fetch_gen,
                 start_index,
+                limit,
                 result,
             } => {
                 if let Screen::Browse(browse) = &mut self.screen
-                    && browse.on_library_items_loaded(fetch_gen, start_index, result)
+                    && browse.on_library_items_loaded(fetch_gen, start_index, limit, result)
                 {
                     self.on_session_expired();
                 }

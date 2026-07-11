@@ -528,6 +528,7 @@ impl Browse {
                     sender.send(Msg::LibraryItemsLoaded {
                         fetch_gen,
                         start_index: 0,
+                        limit,
                         result,
                     });
                 });
@@ -542,6 +543,7 @@ impl Browse {
                     sender.send(Msg::LibraryItemsLoaded {
                         fetch_gen,
                         start_index,
+                        limit,
                         result,
                     });
                 });
@@ -678,6 +680,7 @@ impl Browse {
         &mut self,
         fetch_gen: u64,
         start_index: usize,
+        limit: usize,
         result: Result<crate::jellyfin::ItemsResponse, crate::jellyfin::Error>,
     ) -> bool {
         if fetch_gen != self.fetch_gen {
@@ -722,7 +725,10 @@ impl Browse {
                 if in_filter_chain && self.filter_load_attempts < FILTER_LOAD_MAX_RETRIES {
                     self.filter_load_attempts += 1;
                     let backoff = Duration::from_millis(500u64 << (self.filter_load_attempts - 1));
-                    self.fetch_library_page_after(start_index, PAGE_SIZE, backoff);
+                    // Retry the exact failed request: `limit` may exceed
+                    // PAGE_SIZE (a position-preserving refresh), so reusing it
+                    // avoids shrinking the list to one page then re-growing it.
+                    self.fetch_library_page_after(start_index, limit, backoff);
                 } else {
                     self.filter_load_attempts = 0;
                     self.error = Some(err.to_string());
