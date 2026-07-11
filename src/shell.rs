@@ -24,6 +24,10 @@ pub struct Shell {
     /// per loop iteration so a backend configured (or removed) in Settings
     /// shows up (or disappears) on the very next frame.
     visible: Vec<bool>,
+    /// The tab display order as a permutation of `apps` indices, from the user's
+    /// `Config::tab_order`. Refreshed each loop iteration alongside `visible`,
+    /// so a reorder made in Settings reflows the tab bar on the next frame.
+    order: Vec<usize>,
     config: Arc<Mutex<Config>>,
     config_path: PathBuf,
     rx: mpsc::UnboundedReceiver<Event>,
@@ -34,6 +38,21 @@ fn compute_visible(apps: &[Box<dyn MediaApp>]) -> Vec<bool> {
     apps.iter().map(|app| app.is_configured()).collect()
 }
 
+/// The display order of `apps` from the persisted `Config::tab_order`, falling
+/// back to build order for anything the user has not placed (see
+/// `apps::order_indices`).
+fn compute_order(apps: &[Box<dyn MediaApp>], config: &Mutex<Config>) -> Vec<usize> {
+    let ids: Vec<&str> = apps.iter().map(|app| app.id()).collect();
+    let saved = config.lock().unwrap().tab_order.clone();
+    crate::apps::order_indices(&ids, &saved)
+}
+
+/// The first visible tab in display order, or 0 if none is visible (Settings is
+/// always visible, so in practice one always exists).
+fn first_visible(order: &[usize], visible: &[bool]) -> usize {
+    order.iter().copied().find(|&i| visible[i]).unwrap_or(0)
+}
+
 impl Shell {
     pub fn new(
         apps: Vec<Box<dyn MediaApp>>,
@@ -42,18 +61,21 @@ impl Shell {
         rx: mpsc::UnboundedReceiver<Event>,
     ) -> Self {
         let visible = compute_visible(&apps);
+        let order = compute_order(&apps, &config);
         let last_app = config.lock().unwrap().last_app.clone();
         // `last_app` may point at an app whose backend was since removed;
-        // fall back to the first visible tab (Settings is always visible, so
-        // one exists — and on a fresh config it is the only one).
+        // fall back to the first visible tab in display order (Settings is
+        // always visible, so one exists — and on a fresh config it is the only
+        // one).
         let active = last_app
             .and_then(|id| apps.iter().position(|app| app.id() == id))
             .filter(|&i| visible[i])
-            .unwrap_or_else(|| visible.iter().position(|&v| v).unwrap_or(0));
+            .unwrap_or_else(|| first_visible(&order, &visible));
         Self {
             apps,
             active,
             visible,
+            order,
             config,
             config_path,
             rx,
@@ -61,10 +83,15 @@ impl Shell {
         }
     }
 
-    /// The tab-bar order: indices of the visible apps. `ctrl+N` targets the
-    /// Nth entry of this list, so the shortcuts renumber as tabs appear.
+    /// The tab-bar order: the visible apps, in the user's display order.
+    /// `ctrl+N` targets the Nth entry of this list, so the shortcuts renumber as
+    /// tabs appear and follow a reordering.
     fn visible_indices(&self) -> Vec<usize> {
-        (0..self.apps.len()).filter(|&i| self.visible[i]).collect()
+        self.order
+            .iter()
+            .copied()
+            .filter(|&i| self.visible[i])
+            .collect()
     }
 
     /// Re-derive tab visibility and reset any app whose configuration was
@@ -78,11 +105,14 @@ impl Shell {
             }
         }
         self.visible = new;
+        // Pick up a reorder made in Settings (shares the config mutex) so the
+        // tab bar and `ctrl+N` targets follow it on this frame.
+        self.order = compute_order(&self.apps, &self.config);
         if !self.visible[self.active] {
             // Unreachable through Settings-driven removal (Settings is the
             // active tab then, and it is always visible), but keep the
             // invariant that `active` is a visible tab.
-            let fallback = self.visible.iter().position(|&v| v).unwrap_or(0);
+            let fallback = first_visible(&self.order, &self.visible);
             self.switch_to(fallback);
         }
     }
@@ -91,7 +121,15 @@ impl Shell {
         self.apps[self.active].activate();
         loop {
             self.refresh_visibility();
-            terminal.draw(|frame| render(frame, &mut self.apps, self.active, &self.visible))?;
+            terminal.draw(|frame| {
+                render(
+                    frame,
+                    &mut self.apps,
+                    self.active,
+                    &self.visible,
+                    &self.order,
+                )
+            })?;
             let Some(event) = self.rx.recv().await else {
                 break;
             };
@@ -232,7 +270,13 @@ impl Shell {
 /// the body.
 const STATUS_BAR_MAX_ROWS: usize = 3;
 
-fn render(frame: &mut Frame, apps: &mut [Box<dyn MediaApp>], active: usize, visible: &[bool]) {
+fn render(
+    frame: &mut Frame,
+    apps: &mut [Box<dyn MediaApp>],
+    active: usize,
+    visible: &[bool],
+    order: &[usize],
+) {
     // Each app's status line gets its own row, so a now-playing bar and an
     // auto-search status show at the same time. Collected before the (mutable)
     // body draw, since `status_line` borrows the apps immutably.
@@ -246,7 +290,7 @@ fn render(frame: &mut Frame, apps: &mut [Box<dyn MediaApp>], active: usize, visi
     ])
     .areas(frame.area());
 
-    render_app_tabs(frame, tabs_area, apps, active, visible);
+    render_app_tabs(frame, tabs_area, apps, active, visible, order);
     apps[active].draw(frame, body_area);
     let visible_count = visible.iter().filter(|&&v| v).count();
     render_status_bar(frame, status_area, status_lines, visible_count);
@@ -274,9 +318,10 @@ fn render_app_tabs(
     apps: &[Box<dyn MediaApp>],
     active: usize,
     visible: &[bool],
+    order: &[usize],
 ) {
     let mut spans = vec![Span::raw(" ")];
-    for (i, app) in apps.iter().enumerate() {
+    for &i in order {
         if !visible[i] {
             continue;
         }
@@ -285,7 +330,7 @@ fn render_app_tabs(
         } else {
             Style::new().fg(theme::fg())
         };
-        spans.push(Span::styled(format!(" {} ", app.title()), style));
+        spans.push(Span::styled(format!(" {} ", apps[i].title()), style));
         spans.push(Span::raw("  "));
     }
     let [tabs_row, rule_row] =
@@ -510,6 +555,34 @@ mod tests {
         assert_eq!(shell.active, 0, "Right wraps over visible tabs");
         shell.on_key(ctrl(KeyCode::Left));
         assert_eq!(shell.active, 2, "Left wraps over visible tabs");
+    }
+
+    #[test]
+    fn tab_order_config_drives_display_and_ctrl_digits() {
+        // A saved order puts c first, then a, then b — independent of the vec
+        // order the apps were built in.
+        let (a, _a) = mock("a", false, false);
+        let (b, _b) = mock("b", false, false);
+        let (c, _c) = mock("c", false, false);
+        let config = Config {
+            tab_order: vec!["c".into(), "a".into(), "b".into()],
+            ..Config::default()
+        };
+        let mut shell = shell_with_config(vec![Box::new(a), Box::new(b), Box::new(c)], config);
+        shell.refresh_visibility();
+
+        // Display order and ctrl targets follow tab_order: c(2), a(0), b(1).
+        assert_eq!(shell.visible_indices(), vec![2, 0, 1]);
+        assert_eq!(
+            shell.active, 2,
+            "initial tab is the first in the saved order (c)"
+        );
+        shell.on_key(ctrl(KeyCode::Char('2')));
+        assert_eq!(shell.active, 0, "ctrl+2 -> second in the saved order (a)");
+        shell.on_key(ctrl(KeyCode::Char('3')));
+        assert_eq!(shell.active, 1, "ctrl+3 -> third in the saved order (b)");
+        shell.on_key(ctrl(KeyCode::Char('1')));
+        assert_eq!(shell.active, 2, "ctrl+1 -> first in the saved order (c)");
     }
 
     #[test]
