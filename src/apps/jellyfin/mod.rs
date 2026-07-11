@@ -552,6 +552,11 @@ impl MediaApp for JellyfinApp {
     fn stop_player(&mut self) -> bool {
         if let Some(player) = &self.player {
             player.stop();
+            // The replace prompt (only set while a player exists) asked whether
+            // to replace this playback; stopping makes it meaningless, so
+            // dismiss it too rather than leave a dangling modal over a stopped
+            // player now that `s` reaches here without going through on_key.
+            self.pending_play = None;
             true
         } else {
             false
