@@ -48,7 +48,7 @@ runs).
 
 ## Requirements
 
-- mpv in `PATH`
+- mpv in `PATH` (see [installing mpv](https://mpv.io/installation/))
 - A Jellyfin server (10.9+; media segment skipping needs 10.10+, which added
   the `/MediaSegments` API)
 - Optionally, a Radarr (v3+) and/or Sonarr (v4) server for the *arr tabs;
@@ -193,6 +193,28 @@ The config file holds no secrets. Credentials live in the OS keyring under the
 only used to re-authenticate automatically when the token expires; leave the
 field empty at login to not store one.
 
+### mpv config
+
+isamedia plays in your own mpv and uses your global mpv config (it does not pass
+`--no-config`), so any tuning lives in your mpv config, not in isamedia. A
+ready-to-use setup ships in [`contrib/mpv/`](contrib/mpv): a ModernZ on-screen
+controller theme, custom keybindings that pair with the app, and a contextual
+Skip button for chaptered files.
+
+It is optional. To adopt it, install mpv (see
+[installing mpv](https://mpv.io/installation/)), back up any existing mpv config,
+then copy the folder into your mpv config directory:
+
+```sh
+mkdir -p ~/.config/mpv
+cp -r contrib/mpv/. ~/.config/mpv/
+```
+
+On Windows, mpv reads `%APPDATA%\mpv\` instead. Read
+[`contrib/mpv/input.conf`](contrib/mpv/input.conf) to see and customise the full
+set of keybindings, and [`contrib/mpv/README.md`](contrib/mpv/README.md) for what
+each file does and the third-party licensing.
+
 ### Themes
 
 Two light themes ship: Catppuccin Latte (default) and Solarized Light. Open the
@@ -236,4 +258,10 @@ supervisor task (`src/player/supervisor.rs`).
 
 Behaviour, keybindings and the Jellyfin/mpv integration are ported from
 [jfsh](https://github.com/hacel/jfsh) by hacel (public domain / Unlicense).
+
+The bundled mpv config in [`contrib/mpv/`](contrib/mpv) ships
+[ModernZ](https://github.com/Samillion/ModernZ) by Samillion (LGPL-2.1), a modern
+mpv on-screen controller derived from mpv's `osc.lua` via maoiscat's
+mpv-osc-modern and the ModernX forks. Its licence text is kept alongside it in
+`contrib/mpv/LICENSE-ModernZ`.
 
