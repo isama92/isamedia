@@ -171,6 +171,13 @@ impl JellyfinApp {
             PlayerEvent::SessionExpired => self.on_session_expired(),
             PlayerEvent::Exited => {
                 self.player = None;
+                // Playback ended on its own (track finished or mpv was closed),
+                // so a pending replace prompt no longer has anything to replace.
+                // Drop it: left set it strands the "Replace current playback?"
+                // modal over stopped playback, and with the now-playing bar gone
+                // `s` can no longer reach here to dismiss it. Only ever set while
+                // a player existed, and stale exits are dropped before this runs.
+                self.pending_play = None;
                 if let Screen::Browse(browse) = &mut self.screen {
                     browse.on_playback_finished();
                 }
