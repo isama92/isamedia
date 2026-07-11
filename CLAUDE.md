@@ -49,10 +49,9 @@ is I/O-bound on network calls, not compute-bound).
 - `status_line` may surface cross-tab state (e.g. a now-playing bar visible
   from another tab). `on_quit` returns `true` to request a short shutdown
   grace period for flush work such as the mpv quit and final playback report.
-- Adding an app (Sonarr, Radarr) means writing its module and swapping its
-  `ComingSoonApp` entry in `apps::build_apps`; the shell needs no changes.
-  Implement the full trait, including the generation-counter pattern on every
-  async path.
+- Adding an app means writing its module and registering it in
+  `apps::build_apps`; the shell needs no changes. Implement the full trait,
+  including the generation-counter pattern on every async path.
 
 ## REST client rules
 
