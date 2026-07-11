@@ -126,6 +126,16 @@ struct PendingEdit {
     season_folder: bool,
 }
 
+/// The open "Auto/Interactive search" menu: the highlighted option plus the
+/// episode captured when it opened. Snapshotting the episode (rather than
+/// re-reading the list cursor on Enter) means an episodes refetch that lands
+/// under the open menu and re-sorts the list cannot make the choice fire for a
+/// different episode. Mirrors how `FormMode::Add` snapshots its body.
+struct SearchMenu {
+    cursor: usize,
+    episode: Episode,
+}
+
 /// What the browse screen wants its parent (the Sonarr app) to do.
 pub enum BrowseAction {
     Quit,
@@ -231,8 +241,10 @@ pub struct Browse {
     level: Level,
 
     all_series: Vec<Series>,
-    /// Currently visible series (filter applied).
-    series: Vec<Series>,
+    /// Indices into `all_series` for the currently visible rows (filter
+    /// applied). Holding indices rather than cloned `Series` keeps filtering a
+    /// large library cheap on every keystroke.
+    filtered: Vec<usize>,
     series_cursor: usize,
     season_cursor: usize,
     episodes: Vec<Episode>,
@@ -254,8 +266,9 @@ pub struct Browse {
 
     /// Sort popup cursor into `SERIES_SORTS`; `None` when closed.
     sort_menu: Option<usize>,
-    /// "Auto search / Interactive search / Cancel" popup cursor.
-    search_menu: Option<usize>,
+    /// "Auto search / Interactive search / Cancel" popup, with the episode it
+    /// was opened on; `None` when closed.
+    search_menu: Option<SearchMenu>,
     confirm: Option<Confirm>,
     /// The delete-series prompt (files / import-list-exclusion toggles); modal
     /// while set, opened with `z` on the show page.
@@ -343,7 +356,7 @@ impl Browse {
             sender,
             level: Level::SeriesList,
             all_series: Vec::new(),
-            series: Vec::new(),
+            filtered: Vec::new(),
             series_cursor: 0,
             season_cursor: 0,
             episodes: Vec::new(),
@@ -686,7 +699,10 @@ impl Browse {
         false
     }
 
-    /// Same contract as `on_series_loaded`.
+    /// Unlike the list loaders, a command *failure* is surfaced even when
+    /// superseded: a delete/grab/toggle that didn't take is a discrete outcome
+    /// the user must learn about, not a stale snapshot to discard silently. A
+    /// stale *success* is still dropped (the newer fetch already reflects it).
     #[must_use]
     pub fn on_command_done(
         &mut self,
@@ -694,17 +710,22 @@ impl Browse {
         kind: CommandKind,
         result: Result<(), crate::sonarr::Error>,
     ) -> bool {
-        if fetch_gen != self.fetch_gen {
-            return false; // superseded: the user moved on meanwhile
-        }
         if matches!(result, Err(crate::sonarr::Error::Unauthorized)) {
-            return true;
+            return true; // a revoked key must re-auth regardless of staleness
         }
-        self.loading = false;
-        if let Err(err) = result {
+        if let Err(err) = &result {
             self.error = Some(err.to_string());
+            // A newer fetch owns `loading` on the stale path; only clear it
+            // when this command is still the current generation.
+            if fetch_gen == self.fetch_gen {
+                self.loading = false;
+            }
             return false;
         }
+        if fetch_gen != self.fetch_gen {
+            return false; // superseded success: the newer fetch already reflects it
+        }
+        self.loading = false;
         match kind {
             CommandKind::AutoSearch => {
                 self.notice = Some("search started; grabbed downloads appear in the queue".into());
@@ -1083,13 +1104,14 @@ impl Browse {
 
     fn apply_filter(&mut self) {
         if !self.filter_active || self.filter.value().is_empty() {
-            self.series = self.all_series.clone();
+            self.filtered = (0..self.all_series.len()).collect();
         } else {
             let needle = self.filter.value().to_lowercase();
-            self.series = self
+            self.filtered = self
                 .all_series
                 .iter()
-                .filter(|series| {
+                .enumerate()
+                .filter(|(_, series)| {
                     series
                         .title
                         .as_deref()
@@ -1097,16 +1119,18 @@ impl Browse {
                         .to_lowercase()
                         .contains(&needle)
                 })
-                .cloned()
+                .map(|(index, _)| index)
                 .collect();
         }
-        if self.series_cursor >= self.series.len() {
+        if self.series_cursor >= self.filtered.len() {
             self.series_cursor = 0;
         }
     }
 
     fn selected_series(&self) -> Option<&Series> {
-        self.series.get(self.series_cursor)
+        self.filtered
+            .get(self.series_cursor)
+            .and_then(|&index| self.all_series.get(index))
     }
 
     fn selected_episode(&self) -> Option<&Episode> {
@@ -1121,7 +1145,7 @@ impl Browse {
     /// on the (list-less) episode detail.
     fn cursor_and_len(&mut self) -> Option<(&mut usize, usize)> {
         match &self.level {
-            Level::SeriesList => Some((&mut self.series_cursor, self.series.len())),
+            Level::SeriesList => Some((&mut self.series_cursor, self.filtered.len())),
             Level::Show { series } => {
                 let len = series.seasons.len();
                 Some((&mut self.season_cursor, len))
@@ -1157,10 +1181,11 @@ impl Browse {
             Level::Episodes { .. } => {
                 // Enter always searches (Auto/Interactive) for any episode,
                 // including a downloaded one, so upgrades are reachable. The
-                // episode info/file details live under `i` instead. The popup
-                // reads the level + selected episode, so stay on Episodes.
-                if self.selected_episode().is_some() {
-                    self.search_menu = Some(0);
+                // episode info/file details live under `i` instead. Snapshot
+                // the episode so a refetch landing under the open menu can't
+                // retarget the choice; stay on Episodes.
+                if let Some(episode) = self.selected_episode().cloned() {
+                    self.search_menu = Some(SearchMenu { cursor: 0, episode });
                 }
             }
             Level::EpisodeDetail { .. } => {}
@@ -1281,11 +1306,8 @@ impl Browse {
         }
     }
 
-    fn on_search_menu_choice(&mut self, choice: usize) {
+    fn on_search_menu_choice(&mut self, choice: usize, episode: Episode) {
         let Level::Episodes { series, season } = &self.level else {
-            return;
-        };
-        let Some(episode) = self.selected_episode().cloned() else {
             return;
         };
         match choice {
@@ -1814,17 +1836,22 @@ impl Browse {
             }
             return None;
         }
-        if let Some(selected) = self.search_menu {
+        if let Some(cursor) = self.search_menu.as_ref().map(|menu| menu.cursor) {
             match key.code {
                 KeyCode::Up => {
-                    self.search_menu = Some(selected.saturating_sub(1));
+                    if let Some(menu) = self.search_menu.as_mut() {
+                        menu.cursor = cursor.saturating_sub(1);
+                    }
                 }
                 KeyCode::Down => {
-                    self.search_menu = Some((selected + 1).min(SEARCH_MENU_OPTIONS.len() - 1));
+                    if let Some(menu) = self.search_menu.as_mut() {
+                        menu.cursor = (cursor + 1).min(SEARCH_MENU_OPTIONS.len() - 1);
+                    }
                 }
                 KeyCode::Enter => {
-                    self.search_menu = None;
-                    self.on_search_menu_choice(selected);
+                    if let Some(menu) = self.search_menu.take() {
+                        self.on_search_menu_choice(menu.cursor, menu.episode);
+                    }
                 }
                 KeyCode::Esc | KeyCode::Char('q') => self.search_menu = None,
                 _ => {}
@@ -2110,13 +2137,13 @@ impl Browse {
             let labels: Vec<&str> = SERIES_SORTS.iter().map(|sort| sort.label()).collect();
             prompt::draw_menu(frame, area, "Sort by", &labels, selected);
         }
-        if let Some(selected) = self.search_menu {
+        if let Some(menu) = &self.search_menu {
             prompt::draw_menu(
                 frame,
                 area,
                 "Episode search",
                 &SEARCH_MENU_OPTIONS,
-                selected,
+                menu.cursor,
             );
         }
         if let Some(selected) = self.rejections_popup {
@@ -2359,8 +2386,9 @@ impl Browse {
     fn draw_series_list(&self, frame: &mut Frame, area: Rect) {
         let text_width = area.width.saturating_sub(6) as usize;
         let rows: Vec<(String, Vec<Span<'static>>)> = self
-            .series
+            .filtered
             .iter()
+            .filter_map(|&index| self.all_series.get(index))
             .map(|series| {
                 let title = truncate(series.title.as_deref().unwrap_or("(untitled)"), text_width);
                 let overview = series.overview.as_deref().unwrap_or_default();

@@ -321,24 +321,44 @@ impl Client {
     }
 
     /// Past grab/import/delete events of one episode, for the
-    /// "grabbed before" marker in interactive search results. Paginated,
-    /// unlike Radarr's /history/movie.
+    /// "grabbed before" marker in interactive search results. Sonarr's
+    /// `/history` is paginated (unlike Radarr's `/history/movie`), so follow the
+    /// pages to completion; a single page would drop the marker on episodes
+    /// with a long history. Bounded by `MAX_PAGES` so a runaway `totalRecords`
+    /// can't loop forever.
     pub async fn get_history(&self, episode_id: i64) -> Result<Vec<HistoryRecord>, Error> {
+        const PAGE_SIZE: usize = 100;
+        const MAX_PAGES: usize = 20;
         let episode_id = episode_id.to_string();
-        let page: Page<HistoryRecord> = self
-            .transport
-            .request(
-                Method::GET,
-                "/api/v3/history",
-                &[
-                    ("episodeId", episode_id.as_str()),
-                    ("page", "1"),
-                    ("pageSize", "100"),
-                ],
-                None,
-            )
-            .await?;
-        Ok(page.records)
+        let page_size = PAGE_SIZE.to_string();
+        let mut records: Vec<HistoryRecord> = Vec::new();
+        for page in 1..=MAX_PAGES {
+            let page = page.to_string();
+            let response: Page<HistoryRecord> = self
+                .transport
+                .request(
+                    Method::GET,
+                    "/api/v3/history",
+                    &[
+                        ("episodeId", episode_id.as_str()),
+                        ("page", page.as_str()),
+                        ("pageSize", page_size.as_str()),
+                    ],
+                    None,
+                )
+                .await?;
+            let fetched = response.records.len();
+            records.extend(response.records);
+            // Stop on a short/last page or once every record is in hand.
+            if fetched < PAGE_SIZE || records.len() as i64 >= response.total_records {
+                return Ok(records);
+            }
+        }
+        tracing::debug!(
+            episode_id = %episode_id,
+            "history exceeded {MAX_PAGES} pages; older grab markers may be missing"
+        );
+        Ok(records)
     }
 }
 

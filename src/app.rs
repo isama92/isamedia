@@ -15,12 +15,6 @@ pub fn modified_char(key: &KeyEvent) -> bool {
 
 pub type AppId = &'static str;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AppStatus {
-    Ready,
-    ComingSoon,
-}
-
 /// Things an app can ask the shell to do in response to a key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellRequest {
@@ -37,10 +31,6 @@ pub trait MediaApp {
 
     /// Tab label.
     fn title(&self) -> &'static str;
-
-    fn status(&self) -> AppStatus {
-        AppStatus::Ready
-    }
 
     /// Called when the app becomes the active tab (including at boot).
     fn activate(&mut self) {}

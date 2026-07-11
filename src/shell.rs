@@ -12,7 +12,7 @@ use ratatui::widgets::Widget;
 use ratatui::{DefaultTerminal, Frame};
 use tokio::sync::mpsc;
 
-use crate::app::{AppStatus, MediaApp, ShellRequest};
+use crate::app::{MediaApp, ShellRequest};
 use crate::config::Config;
 use crate::event::Event;
 use crate::ui::theme;
@@ -186,7 +186,7 @@ fn render(frame: &mut Frame, apps: &mut [Box<dyn MediaApp>], active: usize) {
 
     render_app_tabs(frame, tabs_area, apps, active);
     apps[active].draw(frame, body_area);
-    render_status_bar(frame, status_area, status_lines);
+    render_status_bar(frame, status_area, status_lines, apps.len());
 }
 
 /// Every app's status line, active app first so its row leads, then the others
@@ -206,15 +206,10 @@ fn render_app_tabs(frame: &mut Frame, area: Rect, apps: &[Box<dyn MediaApp>], ac
     for (i, app) in apps.iter().enumerate() {
         let style = if i == active {
             theme::selected()
-        } else if app.status() == AppStatus::ComingSoon {
-            theme::dim()
         } else {
             Style::new().fg(theme::fg())
         };
         spans.push(Span::styled(format!(" {} ", app.title()), style));
-        if app.status() == AppStatus::ComingSoon {
-            spans.push(Span::styled("(soon)", theme::dim()));
-        }
         spans.push(Span::raw("  "));
     }
     let [tabs_row, rule_row] =
@@ -224,10 +219,13 @@ fn render_app_tabs(frame: &mut Frame, area: Rect, apps: &[Box<dyn MediaApp>], ac
         .render(rule_row, frame.buffer_mut());
 }
 
-fn render_status_bar(frame: &mut Frame, area: Rect, lines: Vec<Line<'static>>) {
+fn render_status_bar(frame: &mut Frame, area: Rect, lines: Vec<Line<'static>>, app_count: usize) {
     if lines.is_empty() {
-        Line::styled(" ctrl+←/→ or ctrl+1..4: switch app", theme::dim())
-            .render(area, frame.buffer_mut());
+        Line::styled(
+            format!(" ctrl+←/→ or ctrl+1..{app_count}: switch app"),
+            theme::dim(),
+        )
+        .render(area, frame.buffer_mut());
         return;
     }
     // One row per line; the area was sized to match in `render`.
