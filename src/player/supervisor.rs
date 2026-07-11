@@ -43,8 +43,13 @@ pub(crate) const SHUTDOWN_BUDGET: Duration = QUIT_GRACE
 static OLD_MPV: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
 
 async fn is_old_mpv() -> bool {
-    *OLD_MPV
-        .get_or_init(|| async {
+    // `get_or_try_init` caches an `Ok` for the whole session but leaves the cell
+    // unset on `Err`, so a definitive answer (or a persistent spawn failure) is
+    // memoised while a transient timeout is retried on the next playback. That
+    // stops a single 5s hang from locking in "modern mpv" against a genuinely
+    // old binary for the rest of the session.
+    OLD_MPV
+        .get_or_try_init(|| async {
             let probe = tokio::process::Command::new("mpv")
                 .arg("--version")
                 .kill_on_drop(true)
@@ -58,21 +63,26 @@ async fn is_old_mpv() -> bool {
                              prepended to the playlist"
                         );
                     }
-                    old
+                    Ok(old)
                 }
+                // A spawn failure (e.g. mpv missing) is persistent, so cache it.
                 Ok(Err(err)) => {
                     tracing::debug!(%err, "failed to run mpv --version");
-                    false
+                    Ok(false)
                 }
                 // Timing out (dropping the future) kills the child via
-                // `kill_on_drop`. Assume a modern mpv rather than wedging.
+                // `kill_on_drop`. Assume a modern mpv for this playback, but
+                // return `Err` so the transient result is not memoised.
                 Err(_) => {
                     tracing::warn!("mpv --version timed out; assuming a modern mpv");
-                    false
+                    Err(())
                 }
             }
         })
         .await
+        .ok()
+        .copied()
+        .unwrap_or(false)
 }
 
 /// The order items get loaded into mpv, which is also the order mpv assigns

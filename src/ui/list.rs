@@ -16,10 +16,13 @@ pub fn window_start(cursor: usize, len: usize, per_page: usize) -> usize {
 }
 
 /// Draw a one-column scrollbar down the right edge of `area`, its thumb at the
-/// cursor's relative position. A no-op for lists too short to scroll or a
-/// zero-width/zero-height area (which would otherwise underflow the edge and
-/// thumb arithmetic below).
+/// cursor's relative position. A no-op for lists too short to scroll. The area
+/// is clamped to the buffer first, so a zero-size area (which would otherwise
+/// underflow the edge/thumb arithmetic) or one that runs past the buffer (which
+/// would index out of bounds) degrades to drawing only the cells that exist.
+/// Callers pass an in-bounds area, so the clamp is normally a no-op.
 pub fn draw_scrollbar(buf: &mut ratatui::buffer::Buffer, area: Rect, cursor: usize, len: usize) {
+    let area = area.intersection(buf.area);
     if len < 2 || area.height == 0 || area.width == 0 {
         return;
     }
@@ -58,6 +61,16 @@ mod tests {
             draw_scrollbar(&mut buf, area, 3, 10);
             assert_eq!(buf, Buffer::empty(backing));
         }
+    }
+
+    #[test]
+    fn scrollbar_does_not_index_past_the_buffer() {
+        // Defensive: an area larger than or offset beyond the buffer must clamp
+        // to the existing cells instead of indexing out of bounds.
+        let mut buf = Buffer::empty(Rect::new(0, 0, 5, 5));
+        draw_scrollbar(&mut buf, Rect::new(3, 3, 10, 10), 5, 20); // runs past the edge
+        draw_scrollbar(&mut buf, Rect::new(20, 20, 4, 4), 5, 20); // no overlap at all
+        // Reaching here without a panic is the assertion.
     }
 
     #[test]
