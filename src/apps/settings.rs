@@ -1061,17 +1061,20 @@ impl MediaApp for SettingsApp {
             return None;
         }
 
-        // The remove confirmation is modal; like the Jellyfin replace-playback
-        // prompt, `q` means "no" here, not quit.
+        // The remove confirmation is modal. Only y/n act, per the
+        // `prompt::draw_confirm` key contract: Enter on the Remove row opened
+        // this prompt, so honouring Enter here would let a double-tap delete
+        // the credentials; even Esc and `q` are ignored, an explicit `n` is
+        // the only way out.
         if let Editor::ConfirmRemove { backend } = self.editor {
             if crate::app::modified_char(&key) {
                 return None;
             }
             match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
                     self.remove_backend(backend);
                 }
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
+                KeyCode::Char('n') | KeyCode::Char('N') => {
                     self.editor = Editor::BackendMenu { backend, cursor: 0 };
                 }
                 _ => {}
@@ -1892,7 +1895,7 @@ mod tests {
     }
 
     #[test]
-    fn remove_needs_confirmation_and_esc_cancels() {
+    fn remove_confirmation_only_acts_on_y_and_n() {
         // NOTE: this test never presses `y` on the confirmation:
         // `remove_backend` spawns onto the tokio runtime (absent in a plain
         // #[test]) and its task would touch the developer's real keyring.
@@ -1916,22 +1919,33 @@ mod tests {
         let text = draw_to_text(&mut settings);
         assert!(text.contains("Remove Radarr"), "{text}");
 
-        // n, Esc and q all decline; nothing was cleared.
+        // Enter opened the prompt, so a second Enter must not confirm it;
+        // Esc, q and other keys are ignored too. The prompt stays open and
+        // nothing is cleared.
+        for code in [
+            KeyCode::Enter,
+            KeyCode::Esc,
+            KeyCode::Char('q'),
+            KeyCode::Backspace,
+        ] {
+            assert!(settings.on_key(KeyEvent::from(code)).is_none());
+            assert!(
+                matches!(settings.editor, Editor::ConfirmRemove { .. }),
+                "{code:?} must neither confirm nor dismiss the prompt"
+            );
+        }
+        assert_eq!(
+            settings.config.lock().unwrap().radarr.host,
+            "https://radarr.example"
+        );
+
+        // Only an explicit n declines.
         settings.on_key(KeyEvent::from(KeyCode::Char('n')));
         assert!(matches!(settings.editor, Editor::BackendMenu { .. }));
         assert_eq!(
             settings.config.lock().unwrap().radarr.host,
             "https://radarr.example"
         );
-        settings.editor = Editor::ConfirmRemove {
-            backend: Setting::Radarr,
-        };
-        assert!(
-            settings
-                .on_key(KeyEvent::from(KeyCode::Char('q')))
-                .is_none()
-        );
-        assert!(matches!(settings.editor, Editor::BackendMenu { .. }));
     }
 
     #[test]

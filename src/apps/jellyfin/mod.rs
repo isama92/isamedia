@@ -411,20 +411,22 @@ impl MediaApp for JellyfinApp {
     }
 
     fn on_key(&mut self, key: KeyEvent) -> Option<ShellRequest> {
-        // The replace-playback prompt is modal.
+        // The replace-playback prompt is modal. Only y/n act, per the
+        // `prompt::draw_confirm` key contract: Enter opened the prompt, so
+        // honouring it here would let a double-tap replace by accident.
         if self.pending_play.is_some() {
             if crate::app::modified_char(&key) {
                 return None;
             }
             match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
                     let item = self.pending_play.take().unwrap();
                     if let Some(old) = self.player.take() {
                         old.stop();
                     }
                     self.start_playback(item);
                 }
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
+                KeyCode::Char('n') | KeyCode::Char('N') => {
                     self.pending_play = None;
                 }
                 _ => {}
