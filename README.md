@@ -35,10 +35,14 @@ runs).
 
 ### Shell and Settings
 
-- Switch apps with `ctrl+←/→` or `ctrl+1..4`. Each app owns its own keymap;
-  press `?` in any tab for the always-accurate contextual help.
+- Switch between the visible tabs with `ctrl+←/→` or `ctrl+1..9`. A backend's
+  tab only appears once it is configured in Settings, so on a fresh install
+  Settings is the only tab. Each app owns its own keymap; press `?` in any
+  tab for the always-accurate contextual help.
 - The Settings tab covers the theme and accent, backend credentials
-  (Jellyfin, Radarr and Sonarr), and the Jellyfin language preferences.
+  (Jellyfin, Radarr and Sonarr), and the Jellyfin language preferences. Each
+  backend row also offers Remove, which clears the host from the config,
+  deletes the stored credentials from the keyring, and hides the tab again.
 - Log in once; the token is stored in the OS keyring (Secret Service on
   Linux, Credential Manager on Windows) and reused on later runs.
 
@@ -93,8 +97,8 @@ below cover the common cases.
 | Key | Action |
 | --- | --- |
 | `ctrl+c` | quit |
-| `ctrl+←/→` | previous / next app |
-| `ctrl+1..4` | jump to app (Jellyfin, Radarr, Sonarr, Settings) |
+| `ctrl+←/→` | previous / next visible app |
+| `ctrl+1..9` | jump to the Nth visible tab (fixed order: Jellyfin, Radarr, Sonarr, Settings; numbers compact over the tabs that are shown) |
 | `↑` `↓` | move selection |
 | `←/→` or `pgup/pgdn` | previous / next page (in lists) |
 | `g` / `home`, `G` / `end` | start / end of list |
@@ -138,17 +142,22 @@ below cover the common cases.
 | Key | Action |
 | --- | --- |
 | `↑` `↓` | move between rows |
-| `enter` | open a row; in a form, save or advance |
+| `enter` | open a row or submenu entry; in a form, save or advance |
 | `←/→` | cycle a select field in a credential form |
 | `tab` | move between form fields |
-| `esc` | cancel a form |
+| `esc` | back out of a form or submenu |
+| `y` / `n` | confirm / cancel removing a backend |
 | type | filter the language picker |
+
+A backend row opens a small submenu: Credentials (the host and secret form),
+Language (Jellyfin only), and, once the backend is configured, Remove.
 
 ## Configuration
 
 `~/.config/isamedia/config.toml` on Linux (`%APPDATA%\isamedia\config\` on
-Windows), created on first run. The login screen collects host and credentials
-the first time; after that the stored token is used.
+Windows), created on first run. On first start only the Settings tab is
+visible: configure a backend there (host and credentials) and its tab
+appears; after that the stored token is used on every launch.
 
 ```toml
 last_app = "jellyfin"
@@ -187,7 +196,8 @@ field empty at login to not store one.
 ### Themes
 
 Two light themes ship: Catppuccin Latte (default) and Solarized Light. Open the
-Settings tab (`ctrl+4`), press `enter` on a row to open its choice list, pick
+Settings tab (the last tab, e.g. `ctrl+1` on a fresh install or `ctrl+4` with
+every backend configured), press `enter` on a row to open its choice list, pick
 with the arrow keys and `enter`. Catppuccin Latte also offers five accent
 colours (rosewater, mauve, green, sky, lavender); Solarized Light has none.
 Selections are saved to `theme` and `accent` in the config. Both are light

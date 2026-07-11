@@ -159,8 +159,9 @@ impl Config {
         Ok(dirs.config_dir().join("config.toml"))
     }
 
-    /// Load the config, creating an empty one on first run (the login screen
-    /// collects credentials).
+    /// Load the config, creating an empty one on first run (the Settings tab
+    /// collects backend hosts and credentials; until one is configured it is
+    /// the only visible tab).
     pub fn load_or_init(path: &Path) -> Result<Self> {
         let mut config = if path.exists() {
             let raw = std::fs::read_to_string(path)

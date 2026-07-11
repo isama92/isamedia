@@ -182,6 +182,17 @@ impl MediaApp for RadarrApp {
         "Radarr"
     }
 
+    fn is_configured(&self) -> bool {
+        !self.config.lock().unwrap().radarr.host.is_empty()
+    }
+
+    fn on_removed(&mut self) {
+        // Dropping the Browse discards its client and stops its polling; the
+        // bumped generation makes any in-flight connect result land stale.
+        self.auth_gen += 1;
+        self.screen = Screen::Boot;
+    }
+
     fn activate(&mut self) {
         self.active = true;
         if let Screen::Boot = self.screen {

@@ -1570,15 +1570,17 @@ impl Browse {
             return None;
         }
 
-        // Popups are modal: while open each owns every key.
+        // Popups are modal: while open each owns every key. Only y/n act,
+        // per the `prompt::draw_confirm` key contract: Enter is what opened
+        // the grab confirm, so honouring it would let a double-tap confirm.
         if self.confirm.is_some() {
             match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
                     if let Some(confirm) = self.confirm.take() {
                         self.execute_confirm(confirm);
                     }
                 }
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
+                KeyCode::Char('n') | KeyCode::Char('N') => {
                     self.confirm = None;
                 }
                 _ => {}
@@ -2529,7 +2531,7 @@ impl Browse {
             ];
         }
         if self.confirm.is_some() {
-            return vec![("y/enter", "confirm"), ("n/esc", "cancel")];
+            return vec![("y", "confirm"), ("n", "cancel")];
         }
         if self.delete_prompt.is_some() {
             return vec![

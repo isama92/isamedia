@@ -32,6 +32,21 @@ pub trait MediaApp {
     /// Tab label.
     fn title(&self) -> &'static str;
 
+    /// Whether this app is configured enough to deserve a tab. The shell
+    /// hides unconfigured apps from the tab bar and the switching shortcuts
+    /// until Settings configures them, so an implementation must mirror the
+    /// app's own `activate` gate (an invisible tab can never be activated).
+    /// Defaults to true for apps that need no configuration (Settings).
+    fn is_configured(&self) -> bool {
+        true
+    }
+
+    /// Called by the shell when this app's configuration was removed while
+    /// it was live (`is_configured` flipped to false): stop playback and
+    /// background work and return to the pre-activation state, so a later
+    /// re-configuration starts clean from `activate`.
+    fn on_removed(&mut self) {}
+
     /// Called when the app becomes the active tab (including at boot).
     fn activate(&mut self) {}
 

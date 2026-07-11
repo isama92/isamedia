@@ -7,6 +7,12 @@ use ratatui::widgets::{Block, BorderType, Clear, Widget};
 use crate::ui::theme;
 
 /// Centered modal yes/no prompt, drawn over whatever is below it.
+///
+/// Key contract for callers: accept only `y`/`Y` to confirm and `n`/`N` to
+/// decline, and ignore everything else — in particular Enter and Esc. These
+/// prompts guard actions that are hard or impossible to undo, and Enter is
+/// usually the key that opened them, so honouring it would let a double-tap
+/// confirm by accident.
 pub fn draw_confirm(frame: &mut Frame, area: Rect, question: &str) {
     // max-then-min, not clamp(24, area.width): clamp panics when the
     // terminal is narrower than the 24-column minimum.
