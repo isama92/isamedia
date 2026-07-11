@@ -20,10 +20,18 @@ use crate::ui::theme;
 pub struct Shell {
     apps: Vec<Box<dyn MediaApp>>,
     active: usize,
+    /// Which apps currently deserve a tab, parallel to `apps`. Refreshed once
+    /// per loop iteration so a backend configured (or removed) in Settings
+    /// shows up (or disappears) on the very next frame.
+    visible: Vec<bool>,
     config: Arc<Mutex<Config>>,
     config_path: PathBuf,
     rx: mpsc::UnboundedReceiver<Event>,
     should_quit: bool,
+}
+
+fn compute_visible(apps: &[Box<dyn MediaApp>]) -> Vec<bool> {
+    apps.iter().map(|app| app.is_configured()).collect()
 }
 
 impl Shell {
@@ -33,13 +41,19 @@ impl Shell {
         config_path: PathBuf,
         rx: mpsc::UnboundedReceiver<Event>,
     ) -> Self {
+        let visible = compute_visible(&apps);
         let last_app = config.lock().unwrap().last_app.clone();
+        // `last_app` may point at an app whose backend was since removed;
+        // fall back to the first visible tab (Settings is always visible, so
+        // one exists — and on a fresh config it is the only one).
         let active = last_app
             .and_then(|id| apps.iter().position(|app| app.id() == id))
-            .unwrap_or(0);
+            .filter(|&i| visible[i])
+            .unwrap_or_else(|| visible.iter().position(|&v| v).unwrap_or(0));
         Self {
             apps,
             active,
+            visible,
             config,
             config_path,
             rx,
@@ -47,10 +61,37 @@ impl Shell {
         }
     }
 
+    /// The tab-bar order: indices of the visible apps. `ctrl+N` targets the
+    /// Nth entry of this list, so the shortcuts renumber as tabs appear.
+    fn visible_indices(&self) -> Vec<usize> {
+        (0..self.apps.len()).filter(|&i| self.visible[i]).collect()
+    }
+
+    /// Re-derive tab visibility and reset any app whose configuration was
+    /// removed while it was live (it can never be activated again, and e.g. a
+    /// removed Jellyfin must stop its player now, not on next activation).
+    fn refresh_visibility(&mut self) {
+        let new = compute_visible(&self.apps);
+        for (i, app) in self.apps.iter_mut().enumerate() {
+            if self.visible[i] && !new[i] {
+                app.on_removed();
+            }
+        }
+        self.visible = new;
+        if !self.visible[self.active] {
+            // Unreachable through Settings-driven removal (Settings is the
+            // active tab then, and it is always visible), but keep the
+            // invariant that `active` is a visible tab.
+            let fallback = self.visible.iter().position(|&v| v).unwrap_or(0);
+            self.switch_to(fallback);
+        }
+    }
+
     pub async fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         self.apps[self.active].activate();
         loop {
-            terminal.draw(|frame| render(frame, &mut self.apps, self.active))?;
+            self.refresh_visibility();
+            terminal.draw(|frame| render(frame, &mut self.apps, self.active, &self.visible))?;
             let Some(event) = self.rx.recv().await else {
                 break;
             };
@@ -122,19 +163,23 @@ impl Shell {
                     self.should_quit = true;
                     return;
                 }
-                KeyCode::Left => {
-                    let target = (self.active + self.apps.len() - 1) % self.apps.len();
-                    self.switch_to(target);
-                    return;
-                }
-                KeyCode::Right => {
-                    let target = (self.active + 1) % self.apps.len();
-                    self.switch_to(target);
+                KeyCode::Left | KeyCode::Right => {
+                    let targets = self.visible_indices();
+                    if targets.is_empty() {
+                        return;
+                    }
+                    let pos = targets.iter().position(|&i| i == self.active).unwrap_or(0);
+                    let step = if key.code == KeyCode::Left {
+                        targets.len() - 1
+                    } else {
+                        1
+                    };
+                    self.switch_to(targets[(pos + step) % targets.len()]);
                     return;
                 }
                 KeyCode::Char(c @ '1'..='9') => {
-                    let target = c as usize - '1' as usize;
-                    if target < self.apps.len() {
+                    let targets = self.visible_indices();
+                    if let Some(&target) = targets.get(c as usize - '1' as usize) {
                         self.switch_to(target);
                     }
                     return;
@@ -187,11 +232,11 @@ impl Shell {
 /// the body.
 const STATUS_BAR_MAX_ROWS: usize = 3;
 
-fn render(frame: &mut Frame, apps: &mut [Box<dyn MediaApp>], active: usize) {
+fn render(frame: &mut Frame, apps: &mut [Box<dyn MediaApp>], active: usize, visible: &[bool]) {
     // Each app's status line gets its own row, so a now-playing bar and an
     // auto-search status show at the same time. Collected before the (mutable)
     // body draw, since `status_line` borrows the apps immutably.
-    let status_lines = collect_status_lines(apps, active);
+    let status_lines = collect_status_lines(apps, active, visible);
     let status_rows = status_lines.len().clamp(1, STATUS_BAR_MAX_ROWS) as u16;
 
     let [tabs_area, body_area, status_area] = Layout::vertical([
@@ -201,26 +246,40 @@ fn render(frame: &mut Frame, apps: &mut [Box<dyn MediaApp>], active: usize) {
     ])
     .areas(frame.area());
 
-    render_app_tabs(frame, tabs_area, apps, active);
+    render_app_tabs(frame, tabs_area, apps, active, visible);
     apps[active].draw(frame, body_area);
-    render_status_bar(frame, status_area, status_lines, apps.len());
+    let visible_count = visible.iter().filter(|&&v| v).count();
+    render_status_bar(frame, status_area, status_lines, visible_count);
 }
 
-/// Every app's status line, active app first so its row leads, then the others
-/// (so e.g. a now-playing bar stays visible from another tab). Capped at
-/// [`STATUS_BAR_MAX_ROWS`].
-fn collect_status_lines(apps: &[Box<dyn MediaApp>], active: usize) -> Vec<Line<'static>> {
-    let active_id = apps[active].id();
-    std::iter::once(&apps[active])
-        .chain(apps.iter().filter(|app| app.id() != active_id))
-        .filter_map(|app| app.status_line())
+/// Every visible app's status line, active app first so its row leads, then
+/// the others (so e.g. a now-playing bar stays visible from another tab).
+/// Capped at [`STATUS_BAR_MAX_ROWS`].
+fn collect_status_lines(
+    apps: &[Box<dyn MediaApp>],
+    active: usize,
+    visible: &[bool],
+) -> Vec<Line<'static>> {
+    std::iter::once(active)
+        .chain((0..apps.len()).filter(|&i| i != active))
+        .filter(|&i| visible[i])
+        .filter_map(|i| apps[i].status_line())
         .take(STATUS_BAR_MAX_ROWS)
         .collect()
 }
 
-fn render_app_tabs(frame: &mut Frame, area: Rect, apps: &[Box<dyn MediaApp>], active: usize) {
+fn render_app_tabs(
+    frame: &mut Frame,
+    area: Rect,
+    apps: &[Box<dyn MediaApp>],
+    active: usize,
+    visible: &[bool],
+) {
     let mut spans = vec![Span::raw(" ")];
     for (i, app) in apps.iter().enumerate() {
+        if !visible[i] {
+            continue;
+        }
         let style = if i == active {
             theme::selected()
         } else {
@@ -236,13 +295,21 @@ fn render_app_tabs(frame: &mut Frame, area: Rect, apps: &[Box<dyn MediaApp>], ac
         .render(rule_row, frame.buffer_mut());
 }
 
-fn render_status_bar(frame: &mut Frame, area: Rect, lines: Vec<Line<'static>>, app_count: usize) {
+fn render_status_bar(
+    frame: &mut Frame,
+    area: Rect,
+    lines: Vec<Line<'static>>,
+    visible_count: usize,
+) {
     if lines.is_empty() {
-        Line::styled(
-            format!(" ctrl+←/→ or ctrl+1..{app_count}: switch app"),
-            theme::dim(),
-        )
-        .render(area, frame.buffer_mut());
+        // With a single tab there is nothing to switch to; point first-run
+        // users at Settings instead of advertising `ctrl+1..1`.
+        let hint = if visible_count <= 1 {
+            " configure a backend in the settings tab to add apps".to_string()
+        } else {
+            format!(" ctrl+←/→ or ctrl+1..{visible_count}: switch app")
+        };
+        Line::styled(hint, theme::dim()).render(area, frame.buffer_mut());
         return;
     }
     // One row per line; the area was sized to match in `render`.
@@ -260,13 +327,17 @@ mod tests {
 
     use crate::app::AppId;
 
-    /// A stand-in app that records whether its player was asked to stop and any
-    /// key routed to its `on_key`, so the shell's global-`s` handling can be
-    /// exercised without real apps.
+    /// A stand-in app that records whether its player was asked to stop, any
+    /// key routed to its `on_key`, and `on_removed` calls, so the shell's
+    /// global-`s` and tab-visibility handling can be exercised without real
+    /// apps. `configured` is shared so a test can flip it mid-run, like a
+    /// Settings save/removal would.
     struct MockApp {
         id: AppId,
         capturing: bool,
         has_player: bool,
+        configured: Arc<AtomicBool>,
+        removed: Arc<Mutex<usize>>,
         stopped: Arc<AtomicBool>,
         keys: Arc<Mutex<Vec<KeyEvent>>>,
     }
@@ -277,6 +348,12 @@ mod tests {
         }
         fn title(&self) -> &'static str {
             self.id
+        }
+        fn is_configured(&self) -> bool {
+            self.configured.load(Ordering::SeqCst)
+        }
+        fn on_removed(&mut self) {
+            *self.removed.lock().unwrap() += 1;
         }
         fn on_key(&mut self, key: KeyEvent) -> Option<ShellRequest> {
             self.keys.lock().unwrap().push(key);
@@ -297,32 +374,47 @@ mod tests {
         fn draw(&mut self, _frame: &mut Frame, _area: Rect) {}
     }
 
-    fn mock(
-        id: AppId,
-        capturing: bool,
-        has_player: bool,
-    ) -> (MockApp, Arc<AtomicBool>, Arc<Mutex<Vec<KeyEvent>>>) {
-        let stopped = Arc::new(AtomicBool::new(false));
-        let keys = Arc::new(Mutex::new(Vec::new()));
+    struct MockHandles {
+        configured: Arc<AtomicBool>,
+        removed: Arc<Mutex<usize>>,
+        stopped: Arc<AtomicBool>,
+        keys: Arc<Mutex<Vec<KeyEvent>>>,
+    }
+
+    fn mock(id: AppId, capturing: bool, has_player: bool) -> (MockApp, MockHandles) {
+        let handles = MockHandles {
+            configured: Arc::new(AtomicBool::new(true)),
+            removed: Arc::new(Mutex::new(0)),
+            stopped: Arc::new(AtomicBool::new(false)),
+            keys: Arc::new(Mutex::new(Vec::new())),
+        };
         let app = MockApp {
             id,
             capturing,
             has_player,
-            stopped: stopped.clone(),
-            keys: keys.clone(),
+            configured: handles.configured.clone(),
+            removed: handles.removed.clone(),
+            stopped: handles.stopped.clone(),
+            keys: handles.keys.clone(),
         };
-        (app, stopped, keys)
+        (app, handles)
     }
 
     fn shell(apps: Vec<Box<dyn MediaApp>>) -> Shell {
-        // A default config has no `last_app`, so the first app is active.
+        shell_with_config(apps, Config::default())
+    }
+
+    fn shell_with_config(apps: Vec<Box<dyn MediaApp>>, config: Config) -> Shell {
+        // `switch_to` persists `last_app`, so point the config at a scratch
+        // file instead of the working directory.
         let (_tx, rx) = mpsc::unbounded_channel();
-        Shell::new(
-            apps,
-            Arc::new(Mutex::new(Config::default())),
-            PathBuf::from("shell-test-config.toml"),
-            rx,
-        )
+        let path =
+            std::env::temp_dir().join(format!("isamedia-shell-test-{}.toml", std::process::id()));
+        Shell::new(apps, Arc::new(Mutex::new(config)), path, rx)
+    }
+
+    fn ctrl(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
     }
 
     fn press_s() -> KeyEvent {
@@ -333,36 +425,36 @@ mod tests {
     fn s_stops_a_background_player_from_another_tab() {
         // Active tab owns no player and is not capturing text; the player lives
         // on a background tab, exactly the case the feature fixes.
-        let (active, _active_stopped, active_keys) = mock("active", false, false);
-        let (player, player_stopped, _player_keys) = mock("player", false, true);
+        let (active, active_handles) = mock("active", false, false);
+        let (player, player_handles) = mock("player", false, true);
         let mut shell = shell(vec![Box::new(active), Box::new(player)]);
 
         shell.on_key(press_s());
 
         assert!(
-            player_stopped.load(Ordering::SeqCst),
+            player_handles.stopped.load(Ordering::SeqCst),
             "the background player should have been stopped"
         );
         assert!(
-            active_keys.lock().unwrap().is_empty(),
+            active_handles.keys.lock().unwrap().is_empty(),
             "a consumed `s` must not also reach the active app"
         );
     }
 
     #[test]
     fn s_is_left_for_typing_when_active_app_captures_text() {
-        let (active, _active_stopped, active_keys) = mock("active", true, false);
-        let (player, player_stopped, _player_keys) = mock("player", false, true);
+        let (active, active_handles) = mock("active", true, false);
+        let (player, player_handles) = mock("player", false, true);
         let mut shell = shell(vec![Box::new(active), Box::new(player)]);
 
         shell.on_key(press_s());
 
         assert!(
-            !player_stopped.load(Ordering::SeqCst),
+            !player_handles.stopped.load(Ordering::SeqCst),
             "playback must not stop while the active app is capturing text"
         );
         assert_eq!(
-            active_keys.lock().unwrap().len(),
+            active_handles.keys.lock().unwrap().len(),
             1,
             "`s` should fall through to the active app as text"
         );
@@ -370,15 +462,94 @@ mod tests {
 
     #[test]
     fn s_falls_through_when_nothing_is_playing() {
-        let (active, _stopped, active_keys) = mock("active", false, false);
+        let (active, active_handles) = mock("active", false, false);
         let mut shell = shell(vec![Box::new(active)]);
 
         shell.on_key(press_s());
 
         assert_eq!(
-            active_keys.lock().unwrap().len(),
+            active_handles.keys.lock().unwrap().len(),
             1,
             "with no player to stop, `s` reaches the active app"
         );
+    }
+
+    #[test]
+    fn ctrl_digits_map_to_visible_tabs_in_order() {
+        // Three apps with the first hidden: ctrl+1 is the second app, ctrl+2
+        // the third, ctrl+3 nothing (only two visible tabs).
+        let (a, a_handles) = mock("a", false, false);
+        let (b, _b_handles) = mock("b", false, false);
+        let (c, _c_handles) = mock("c", false, false);
+        a_handles.configured.store(false, Ordering::SeqCst);
+        let mut shell = shell(vec![Box::new(a), Box::new(b), Box::new(c)]);
+        shell.refresh_visibility();
+        assert_eq!(shell.active, 1, "initial tab must skip the hidden app");
+
+        shell.on_key(ctrl(KeyCode::Char('2')));
+        assert_eq!(shell.active, 2, "ctrl+2 targets the second visible tab");
+        shell.on_key(ctrl(KeyCode::Char('1')));
+        assert_eq!(shell.active, 1, "ctrl+1 targets the first visible tab");
+        shell.on_key(ctrl(KeyCode::Char('3')));
+        assert_eq!(shell.active, 1, "a digit past the visible tabs is ignored");
+    }
+
+    #[test]
+    fn ctrl_arrows_cycle_visible_tabs_only() {
+        // The middle app is hidden: arrows hop straight between the outer two.
+        let (a, _a_handles) = mock("a", false, false);
+        let (b, b_handles) = mock("b", false, false);
+        let (c, _c_handles) = mock("c", false, false);
+        b_handles.configured.store(false, Ordering::SeqCst);
+        let mut shell = shell(vec![Box::new(a), Box::new(b), Box::new(c)]);
+        shell.refresh_visibility();
+
+        shell.on_key(ctrl(KeyCode::Right));
+        assert_eq!(shell.active, 2, "Right must skip the hidden middle tab");
+        shell.on_key(ctrl(KeyCode::Right));
+        assert_eq!(shell.active, 0, "Right wraps over visible tabs");
+        shell.on_key(ctrl(KeyCode::Left));
+        assert_eq!(shell.active, 2, "Left wraps over visible tabs");
+    }
+
+    #[test]
+    fn hidden_last_app_falls_back_to_first_visible() {
+        let (a, a_handles) = mock("a", false, false);
+        let (b, _b_handles) = mock("b", false, false);
+        a_handles.configured.store(false, Ordering::SeqCst);
+        let config = Config {
+            last_app: Some("a".into()),
+            ..Config::default()
+        };
+        let shell = shell_with_config(vec![Box::new(a), Box::new(b)], config);
+        assert_eq!(
+            shell.active, 1,
+            "a last_app pointing at a hidden tab must fall back to the first visible one"
+        );
+    }
+
+    #[test]
+    fn visibility_loss_fires_on_removed_once() {
+        let (a, _a_handles) = mock("a", false, false);
+        let (b, b_handles) = mock("b", false, false);
+        let mut shell = shell(vec![Box::new(a), Box::new(b)]);
+        shell.refresh_visibility();
+        assert_eq!(shell.visible_indices(), vec![0, 1]);
+
+        b_handles.configured.store(false, Ordering::SeqCst);
+        shell.refresh_visibility();
+        shell.refresh_visibility();
+        assert_eq!(
+            *b_handles.removed.lock().unwrap(),
+            1,
+            "on_removed fires exactly once per configured -> unconfigured flip"
+        );
+        assert_eq!(shell.visible_indices(), vec![0]);
+
+        // Re-configuring reveals the tab again without another reset.
+        b_handles.configured.store(true, Ordering::SeqCst);
+        shell.refresh_visibility();
+        assert_eq!(shell.visible_indices(), vec![0, 1]);
+        assert_eq!(*b_handles.removed.lock().unwrap(), 1);
     }
 }

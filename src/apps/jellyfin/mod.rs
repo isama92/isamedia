@@ -357,8 +357,33 @@ impl MediaApp for JellyfinApp {
         "Jellyfin"
     }
 
+    fn is_configured(&self) -> bool {
+        let config = self.config.lock().unwrap();
+        !config.jellyfin.host.is_empty() && !config.jellyfin.username.is_empty()
+    }
+
+    fn on_removed(&mut self) {
+        // The supervisor owns mpv: `stop()` quits it, cleans the IPC socket
+        // and flushes the final playback report on its own.
+        if let Some(player) = self.player.take() {
+            player.stop();
+        }
+        self.pending_play = None;
+        // Invalidate everything in flight: the auth attempt, the stopped
+        // player's trailing events, and (via the dropped Browse) its fetches.
+        self.auth_gen += 1;
+        self.player_gen += 1;
+        self.screen = Screen::Boot;
+        // Any pending reauth signal referred to the removed identity.
+        self.seen_reauth = self.reauth.load(Ordering::Relaxed);
+    }
+
     fn activate(&mut self) {
         if let Screen::Boot = self.screen {
+            // The save that (re-)configured this backend also bumped the
+            // reauth signal; consume it, or the next activate would reconnect
+            // a session that is already fresh.
+            self.seen_reauth = self.reauth.load(Ordering::Relaxed);
             let creds = self.credentials();
             if !creds.host.is_empty() && !creds.username.is_empty() {
                 self.screen = Screen::Connecting;
@@ -632,5 +657,38 @@ mod tests {
         jf.activate();
         assert!(matches!(jf.screen, Screen::Login(_)));
         assert_eq!(jf.seen_reauth, 1);
+    }
+
+    // The player-stop half of on_removed needs a real PlayerHandle (an mpv
+    // child), so it is exercised manually, like the Browse rescue above.
+    #[test]
+    fn on_removed_resets_to_boot_and_consumes_reauth() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let reauth = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut config = Config::default();
+        config.jellyfin.host = "https://jelly.example".into();
+        config.jellyfin.username = "alice".into();
+        let mut jf = JellyfinApp::new(
+            Arc::new(Mutex::new(config)),
+            PathBuf::from("jellyfin-test-config.toml"),
+            AppSender::new("jellyfin", tx),
+            reauth.clone(),
+        );
+        assert!(jf.is_configured());
+        jf.screen = Screen::Login(jf.login_form());
+        let auth_gen = jf.auth_gen;
+        let player_gen = jf.player_gen;
+
+        // Settings removed the backend and (on an earlier save) had bumped the
+        // reauth signal; the reset must swallow it and invalidate in-flight work.
+        jf.config.lock().unwrap().jellyfin.host.clear();
+        reauth.fetch_add(1, Ordering::Relaxed);
+        jf.on_removed();
+
+        assert!(!jf.is_configured());
+        assert!(matches!(jf.screen, Screen::Boot), "must return to Boot");
+        assert!(jf.auth_gen > auth_gen, "in-flight auth must land stale");
+        assert!(jf.player_gen > player_gen, "player events must land stale");
+        assert_eq!(jf.seen_reauth, 1, "a pending reauth signal is swallowed");
     }
 }

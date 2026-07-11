@@ -46,18 +46,44 @@ struct Editing {
 }
 
 /// The overlay currently open on top of the settings list. The variants are
-/// mutually exclusive; the Jellyfin row opens a submenu (credentials or
-/// language) while Radarr/Sonarr open their credentials form directly.
+/// mutually exclusive; every backend row opens a submenu (credentials,
+/// Jellyfin's language page, remove).
 #[allow(clippy::large_enum_variant)] // one instance per app; boxing buys nothing
 enum Editor {
     None,
     Choice(Editing),
     Backend(BackendEditor),
-    /// The Jellyfin submenu: 0 = Credentials, 1 = Language.
-    JellyfinMenu {
+    /// A backend's submenu; the entries come from [`menu_entries`].
+    BackendMenu {
+        backend: Setting,
         cursor: usize,
     },
+    /// The y/n prompt guarding [`SettingsApp::remove_backend`].
+    ConfirmRemove {
+        backend: Setting,
+    },
     Language(LanguageEditor),
+}
+
+/// One row of a backend's submenu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MenuEntry {
+    Credentials,
+    Language,
+    Remove,
+}
+
+/// The submenu rows for a backend: Language is Jellyfin-only, and Remove only
+/// exists once the backend is configured (there is nothing to remove before).
+fn menu_entries(backend: Setting, configured: bool) -> Vec<MenuEntry> {
+    let mut entries = vec![MenuEntry::Credentials];
+    if backend == Setting::Jellyfin {
+        entries.push(MenuEntry::Language);
+    }
+    if configured {
+        entries.push(MenuEntry::Remove);
+    }
+    entries
 }
 
 /// The Jellyfin language page: a row per track kind, each opening a
@@ -69,10 +95,16 @@ struct LanguageEditor {
     picker: Option<Picker>,
 }
 
-/// Result of a submitted backend form, reported back from the connect task.
+/// Results reported back from this app's spawned tasks: a submitted backend
+/// form's connect, or a removal's keyring cleanup.
 enum Msg {
     SaveDone {
         save_gen: u64,
+        result: Result<(), String>,
+    },
+    RemoveDone {
+        save_gen: u64,
+        backend: Setting,
         result: Result<(), String>,
     },
 }
@@ -96,6 +128,9 @@ pub struct SettingsApp {
     /// Bumped after a successful Jellyfin save so the running Jellyfin tab
     /// reconnects with the freshly stored token (see `apps::build_apps`).
     jellyfin_reauth: Arc<AtomicU64>,
+    /// Transient one-line feedback under the settings list (e.g. the outcome
+    /// of a removal); cleared on the next key press in list mode.
+    notice: Option<String>,
 }
 
 impl SettingsApp {
@@ -113,6 +148,7 @@ impl SettingsApp {
             editor: Editor::None,
             save_gen: 0,
             jellyfin_reauth,
+            notice: None,
         }
     }
 
@@ -135,8 +171,7 @@ impl SettingsApp {
     }
 
     /// Open the editor for the selected row: a choice list for Theme/Accent,
-    /// the submenu for Jellyfin (which has more than credentials to edit), a
-    /// credentials form for the other backends.
+    /// the submenu for a backend (credentials, and once configured, remove).
     fn open(&mut self, setting: Setting) {
         match setting {
             Setting::Theme | Setting::Accent => {
@@ -145,22 +180,32 @@ impl SettingsApp {
                     cursor: current_choice_index(setting),
                 });
             }
-            Setting::Jellyfin => self.editor = Editor::JellyfinMenu { cursor: 0 },
-            Setting::Radarr | Setting::Sonarr => {
-                let editor = BackendEditor::from_config(setting, &self.config.lock().unwrap());
-                self.editor = Editor::Backend(editor);
+            Setting::Jellyfin | Setting::Radarr | Setting::Sonarr => {
+                self.editor = Editor::BackendMenu {
+                    backend: setting,
+                    cursor: 0,
+                };
             }
         }
     }
 
-    /// Where closing a backend form lands: back in the submenu it was opened
-    /// from for Jellyfin, the settings list for the direct-entry backends.
+    /// Whether a backend has enough config to count as connected; gates the
+    /// Remove entry and must match the app's own `is_configured`.
+    fn backend_configured(&self, backend: Setting) -> bool {
+        let config = self.config.lock().unwrap();
+        match backend {
+            Setting::Jellyfin => {
+                !config.jellyfin.host.is_empty() && !config.jellyfin.username.is_empty()
+            }
+            Setting::Radarr => !config.radarr.host.is_empty(),
+            Setting::Sonarr => !config.sonarr.host.is_empty(),
+            Setting::Theme | Setting::Accent => false,
+        }
+    }
+
+    /// Closing a backend form lands back in the submenu it was opened from.
     fn close_backend(&mut self, backend: Setting) {
-        self.editor = if backend == Setting::Jellyfin {
-            Editor::JellyfinMenu { cursor: 0 }
-        } else {
-            Editor::None
-        };
+        self.editor = Editor::BackendMenu { backend, cursor: 0 };
         self.clamp_cursor();
     }
 
@@ -283,12 +328,46 @@ impl SettingsApp {
         });
     }
 
-    fn draw_jellyfin_menu(&self, cursor: usize, area: Rect, buf: &mut Buffer) {
+    /// Disconnect a backend: clear its config (which hides its tab on the
+    /// next frame and makes the shell reset the live app), then delete its
+    /// keyring secrets off the render thread. The config write is synchronous
+    /// like the theme/language saves; keyring calls are a blocking D-Bus round
+    /// trip and report back one `Msg::RemoveDone`.
+    fn remove_backend(&mut self, backend: Setting) {
+        let snapshot = {
+            let mut config = self.config.lock().unwrap();
+            clear_backend_config(backend, &mut config);
+            config.clone()
+        };
+        if let Err(err) = snapshot.save(&self.config_path) {
+            tracing::warn!(%err, "failed to persist backend removal");
+        }
+        self.editor = Editor::None;
+        self.clamp_cursor();
+        // Reuse save_gen: a save and a removal of the same backend are
+        // mutually superseding operations on the same resource.
+        self.save_gen += 1;
+        let save_gen = self.save_gen;
+        let sender = self.sender.clone();
+        tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || delete_backend_secrets(backend))
+                .await
+                .map_err(|err| err.to_string())
+                .and_then(|result| result);
+            sender.send(Msg::RemoveDone {
+                save_gen,
+                backend,
+                result,
+            });
+        });
+    }
+
+    fn draw_backend_menu(&self, backend: Setting, cursor: usize, area: Rect, buf: &mut Buffer) {
         let (host, audio, subtitles) = {
             let config = self.config.lock().unwrap();
             let jf = &config.jellyfin;
             (
-                jf.host.clone(),
+                backend_host(backend, &config).unwrap_or("").to_string(),
                 preference_label(jf.audio_language.as_ref()),
                 preference_label(jf.subtitle_language.as_ref()),
             )
@@ -298,17 +377,23 @@ impl SettingsApp {
         } else {
             host
         };
-        Line::styled("  Jellyfin", theme::selected())
+        Line::styled(format!("  {}", backend_label(backend)), theme::selected())
             .render(Rect::new(area.x, area.y, area.width, 1), buf);
-        let rows = [
-            menu_row(cursor == 0, "Credentials", &host_summary),
-            menu_row(
-                cursor == 1,
-                "Language",
-                &format!("audio: {audio}   subs: {subtitles}"),
-            ),
-        ];
-        for (i, row) in rows.into_iter().enumerate() {
+        let entries = menu_entries(backend, self.backend_configured(backend));
+        for (i, entry) in entries.into_iter().enumerate() {
+            let row = match entry {
+                MenuEntry::Credentials => menu_row(cursor == i, "Credentials", &host_summary),
+                MenuEntry::Language => menu_row(
+                    cursor == i,
+                    "Language",
+                    &format!("audio: {audio}   subs: {subtitles}"),
+                ),
+                MenuEntry::Remove => menu_row(
+                    cursor == i,
+                    "Remove",
+                    "delete the host and stored credentials",
+                ),
+            };
             let y = area.y + 2 + i as u16;
             if y < area.y + area.height {
                 row.render(Rect::new(area.x, y, area.width, 1), buf);
@@ -376,7 +461,11 @@ impl SettingsApp {
             }
         }
         if area.height as usize > rows.len() + 1 {
-            Line::styled("  enter: change   up/down: move   q: quit", theme::dim()).render(
+            let footer = match &self.notice {
+                Some(notice) => Line::styled(format!("  {notice}"), theme::dim()),
+                None => Line::styled("  enter: change   up/down: move   q: quit", theme::dim()),
+            };
+            footer.render(
                 Rect::new(area.x, area.y + area.height - 1, area.width, 1),
                 buf,
             );
@@ -410,6 +499,41 @@ fn backend_label(setting: Setting) -> &'static str {
         Setting::Sonarr => "Sonarr",
         Setting::Theme | Setting::Accent => "",
     }
+}
+
+/// Clear a backend's identity from the config, hiding its tab. Keeps the
+/// per-install fields (device identity, language preferences): they are not
+/// tied to the removed account and prefill a later re-configuration.
+fn clear_backend_config(backend: Setting, config: &mut Config) {
+    match backend {
+        Setting::Jellyfin => {
+            config.jellyfin.host.clear();
+            config.jellyfin.username.clear();
+            config.jellyfin.user_id.clear();
+        }
+        Setting::Radarr => config.radarr.host.clear(),
+        Setting::Sonarr => config.sonarr.host.clear(),
+        Setting::Theme | Setting::Accent => {}
+    }
+}
+
+/// Delete every keyring entry a backend owns. `secrets::delete` treats a
+/// missing entry as success, so removal is idempotent. Blocking (D-Bus);
+/// call through `spawn_blocking`.
+fn delete_backend_secrets(backend: Setting) -> Result<(), String> {
+    let keys: &[&str] = match backend {
+        Setting::Jellyfin => &[
+            crate::secrets::JELLYFIN_TOKEN,
+            crate::secrets::JELLYFIN_PASSWORD,
+        ],
+        Setting::Radarr => &[crate::secrets::RADARR_API_KEY],
+        Setting::Sonarr => &[crate::secrets::SONARR_API_KEY],
+        Setting::Theme | Setting::Accent => &[],
+    };
+    for &key in keys {
+        crate::secrets::delete(key).map_err(|err| err.to_string())?;
+    }
+    Ok(())
 }
 
 /// The keyring key holding a backend's stored secret.
@@ -864,27 +988,62 @@ impl MediaApp for SettingsApp {
             return None;
         }
 
-        // The Jellyfin submenu: two fixed entries, Credentials and Language.
-        if let Editor::JellyfinMenu { cursor } = self.editor {
+        // A backend's submenu. The entries are re-derived per key press, so a
+        // removal that just cleared the config also drops the Remove row.
+        if let Editor::BackendMenu { backend, cursor } = self.editor {
+            let entries = menu_entries(backend, self.backend_configured(backend));
+            let count = entries.len();
             match key.code {
-                // Two entries: Up and Down both land on the other one.
-                KeyCode::Up | KeyCode::Down => {
-                    self.editor = Editor::JellyfinMenu { cursor: cursor ^ 1 };
+                KeyCode::Up if count > 0 => {
+                    self.editor = Editor::BackendMenu {
+                        backend,
+                        cursor: (cursor + count - 1) % count,
+                    };
                 }
-                KeyCode::Enter if cursor == 0 => {
-                    let editor =
-                        BackendEditor::from_config(Setting::Jellyfin, &self.config.lock().unwrap());
-                    self.editor = Editor::Backend(editor);
+                KeyCode::Down if count > 0 => {
+                    self.editor = Editor::BackendMenu {
+                        backend,
+                        cursor: (cursor + 1) % count,
+                    };
                 }
-                KeyCode::Enter => {
-                    self.editor = Editor::Language(LanguageEditor {
-                        cursor: 0,
-                        picker: None,
-                    });
-                }
+                KeyCode::Enter => match entries.get(cursor) {
+                    Some(MenuEntry::Credentials) => {
+                        let editor =
+                            BackendEditor::from_config(backend, &self.config.lock().unwrap());
+                        self.editor = Editor::Backend(editor);
+                    }
+                    Some(MenuEntry::Language) => {
+                        self.editor = Editor::Language(LanguageEditor {
+                            cursor: 0,
+                            picker: None,
+                        });
+                    }
+                    Some(MenuEntry::Remove) => {
+                        self.editor = Editor::ConfirmRemove { backend };
+                    }
+                    None => {}
+                },
                 KeyCode::Esc | KeyCode::Backspace => self.editor = Editor::None,
                 KeyCode::Char('q') if key.modifiers.is_empty() => {
                     return Some(ShellRequest::Quit);
+                }
+                _ => {}
+            }
+            return None;
+        }
+
+        // The remove confirmation is modal; like the Jellyfin replace-playback
+        // prompt, `q` means "no" here, not quit.
+        if let Editor::ConfirmRemove { backend } = self.editor {
+            if crate::app::modified_char(&key) {
+                return None;
+            }
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    self.remove_backend(backend);
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
+                    self.editor = Editor::BackendMenu { backend, cursor: 0 };
                 }
                 _ => {}
             }
@@ -938,7 +1097,10 @@ impl MediaApp for SettingsApp {
                 self.apply_language(row, &choice);
             }
             if close {
-                self.editor = Editor::JellyfinMenu { cursor: 1 };
+                self.editor = Editor::BackendMenu {
+                    backend: Setting::Jellyfin,
+                    cursor: 1,
+                };
             }
             return None;
         }
@@ -996,6 +1158,8 @@ impl MediaApp for SettingsApp {
             return None;
         }
 
+        // Any key in list mode dismisses a lingering removal notice.
+        self.notice = None;
         let rows = self.rows();
         match key.code {
             KeyCode::Up if !rows.is_empty() => {
@@ -1019,29 +1183,54 @@ impl MediaApp for SettingsApp {
         let Ok(msg) = payload.downcast::<Msg>() else {
             return;
         };
-        let Msg::SaveDone { save_gen, result } = *msg;
-        if save_gen != self.save_gen {
-            return; // superseded or cancelled
-        }
-        match result {
-            Ok(()) => {
-                // A Jellyfin save minted a fresh token in the keyring; signal
-                // the running Jellyfin tab to adopt it instead of dropping to a
-                // re-login. (*arr keys are stateless, so they need no signal.)
-                let backend = match &self.editor {
-                    Editor::Backend(editor) => editor.backend,
-                    _ => return,
-                };
-                if backend == Setting::Jellyfin {
-                    self.jellyfin_reauth.fetch_add(1, Ordering::Relaxed);
+        match *msg {
+            Msg::SaveDone { save_gen, result } => {
+                if save_gen != self.save_gen {
+                    return; // superseded or cancelled
                 }
-                self.close_backend(backend);
+                match result {
+                    Ok(()) => {
+                        // A Jellyfin save minted a fresh token in the keyring;
+                        // signal the running Jellyfin tab to adopt it instead
+                        // of dropping to a re-login. (*arr keys are stateless,
+                        // so they need no signal.)
+                        let backend = match &self.editor {
+                            Editor::Backend(editor) => editor.backend,
+                            _ => return,
+                        };
+                        if backend == Setting::Jellyfin {
+                            self.jellyfin_reauth.fetch_add(1, Ordering::Relaxed);
+                        }
+                        self.close_backend(backend);
+                    }
+                    Err(message) => {
+                        if let Editor::Backend(editor) = &mut self.editor {
+                            editor.busy = false;
+                            editor.error = Some(message);
+                        }
+                    }
+                }
             }
-            Err(message) => {
-                if let Editor::Backend(editor) = &mut self.editor {
-                    editor.busy = false;
-                    editor.error = Some(message);
+            Msg::RemoveDone {
+                save_gen,
+                backend,
+                result,
+            } => {
+                if save_gen != self.save_gen {
+                    return; // superseded by a newer save/removal
                 }
+                self.notice = Some(match result {
+                    Ok(()) => format!("{} removed", backend_label(backend)),
+                    // The config is already cleared, so the tab is gone either
+                    // way; the leftover entry is overwritten on re-configure.
+                    Err(err) => {
+                        tracing::warn!(%err, "failed to delete keyring secrets on removal");
+                        format!(
+                            "{} removed, but its secrets may remain in the OS keyring",
+                            backend_label(backend)
+                        )
+                    }
+                });
             }
         }
     }
@@ -1052,7 +1241,10 @@ impl MediaApp for SettingsApp {
             Editor::Backend(editor) => !editor.form.action_row_focused(),
             // An open language picker always holds a focused filter input.
             Editor::Language(editor) => editor.picker.is_some(),
-            Editor::None | Editor::Choice(_) | Editor::JellyfinMenu { .. } => false,
+            Editor::None
+            | Editor::Choice(_)
+            | Editor::BackendMenu { .. }
+            | Editor::ConfirmRemove { .. } => false,
         }
     }
 
@@ -1071,8 +1263,24 @@ impl MediaApp for SettingsApp {
             Editor::None => self.draw_list(body, frame.buffer_mut()),
             Editor::Choice(editing) => draw_editor(editing, body, frame.buffer_mut()),
             Editor::Backend(editor) => editor.draw(frame, body),
-            Editor::JellyfinMenu { cursor } => {
-                self.draw_jellyfin_menu(*cursor, body, frame.buffer_mut())
+            Editor::BackendMenu { backend, cursor } => {
+                self.draw_backend_menu(*backend, *cursor, body, frame.buffer_mut())
+            }
+            Editor::ConfirmRemove { backend } => {
+                // The submenu stays visible underneath the modal prompt, with
+                // the Remove row (always last) still highlighted.
+                let cursor = menu_entries(*backend, self.backend_configured(*backend))
+                    .len()
+                    .saturating_sub(1);
+                self.draw_backend_menu(*backend, cursor, body, frame.buffer_mut());
+                crate::ui::prompt::draw_confirm(
+                    frame,
+                    body,
+                    &format!(
+                        "Remove {} and delete its stored credentials?",
+                        backend_label(*backend)
+                    ),
+                );
             }
             Editor::Language(editor) => self.draw_language(editor, frame, body),
         }
@@ -1126,9 +1334,14 @@ mod tests {
                     Editor::Backend(BackendEditor::from_config(backend, &Config::default()));
                 terminal.draw(|f| settings.draw(f, f.area())).unwrap();
             }
-            // The Jellyfin submenu and the language page, picker closed and open.
-            settings.editor = Editor::JellyfinMenu { cursor: 1 };
-            terminal.draw(|f| settings.draw(f, f.area())).unwrap();
+            // Every backend's submenu and its remove confirmation.
+            for backend in [Setting::Jellyfin, Setting::Radarr, Setting::Sonarr] {
+                settings.editor = Editor::BackendMenu { backend, cursor: 1 };
+                terminal.draw(|f| settings.draw(f, f.area())).unwrap();
+                settings.editor = Editor::ConfirmRemove { backend };
+                terminal.draw(|f| settings.draw(f, f.area())).unwrap();
+            }
+            // The language page, picker closed and open.
             settings.editor = Editor::Language(LanguageEditor {
                 cursor: 0,
                 picker: None,
@@ -1154,7 +1367,14 @@ mod tests {
             cursor: 0,
         });
         assert!(!settings.capturing_text());
-        settings.editor = Editor::JellyfinMenu { cursor: 0 };
+        settings.editor = Editor::BackendMenu {
+            backend: Setting::Jellyfin,
+            cursor: 0,
+        };
+        assert!(!settings.capturing_text());
+        settings.editor = Editor::ConfirmRemove {
+            backend: Setting::Radarr,
+        };
         assert!(!settings.capturing_text());
         // A language page with the picker closed is navigable; opening the
         // picker focuses its filter input.
@@ -1216,12 +1436,14 @@ mod tests {
     #[test]
     fn opening_a_backend_shows_the_form_and_esc_cancels() {
         let mut settings = app();
-        // Jellyfin opens the submenu, not the form; Enter on Credentials
-        // opens the form.
+        // Every backend opens its submenu; Enter on Credentials opens the form.
         settings.open(Setting::Jellyfin);
         assert!(matches!(
             settings.editor,
-            Editor::JellyfinMenu { cursor: 0 }
+            Editor::BackendMenu {
+                backend: Setting::Jellyfin,
+                cursor: 0
+            }
         ));
         let text = draw_to_text(&mut settings);
         for label in ["Credentials", "Language"] {
@@ -1239,13 +1461,19 @@ mod tests {
 
         // Esc backs out one level at a time: form -> submenu -> list.
         settings.on_key(KeyEvent::from(KeyCode::Esc));
-        assert!(matches!(settings.editor, Editor::JellyfinMenu { .. }));
+        assert!(matches!(settings.editor, Editor::BackendMenu { .. }));
         settings.on_key(KeyEvent::from(KeyCode::Esc));
         assert!(matches!(settings.editor, Editor::None));
 
-        // The *arr rows keep opening their form directly, without a username
-        // row, and Esc returns straight to the list.
+        // An *arr submenu has no Language row (and, unconfigured, no Remove);
+        // its form has no username row.
         settings.open(Setting::Radarr);
+        let text = draw_to_text(&mut settings);
+        assert!(
+            !text.contains("Language"),
+            "unexpected Language in:\n{text}"
+        );
+        settings.on_key(KeyEvent::from(KeyCode::Enter));
         assert!(matches!(settings.editor, Editor::Backend(_)));
         let text = draw_to_text(&mut settings);
         assert!(text.contains("API key"), "missing API key in:\n{text}");
@@ -1254,6 +1482,15 @@ mod tests {
             "unexpected Username in:\n{text}"
         );
 
+        // Esc: form -> submenu -> list, same as Jellyfin.
+        settings.on_key(KeyEvent::from(KeyCode::Esc));
+        assert!(matches!(
+            settings.editor,
+            Editor::BackendMenu {
+                backend: Setting::Radarr,
+                ..
+            }
+        ));
         settings.on_key(KeyEvent::from(KeyCode::Esc));
         assert!(matches!(settings.editor, Editor::None));
     }
@@ -1325,18 +1562,25 @@ mod tests {
             result: Ok(()),
         }));
         assert_eq!(reauth.load(Ordering::Relaxed), 1);
-        assert!(matches!(settings.editor, Editor::JellyfinMenu { .. }));
+        assert!(matches!(settings.editor, Editor::BackendMenu { .. }));
 
         // An *arr save must not signal it: API-key auth is stateless, so the
-        // running tab keeps working. Its form closes back to the list.
+        // running tab keeps working. Its form closes back to its submenu.
         settings.open(Setting::Radarr);
+        settings.on_key(KeyEvent::from(KeyCode::Enter));
         let save_gen = settings.save_gen;
         settings.on_event(Box::new(Msg::SaveDone {
             save_gen,
             result: Ok(()),
         }));
         assert_eq!(reauth.load(Ordering::Relaxed), 1);
-        assert!(matches!(settings.editor, Editor::None));
+        assert!(matches!(
+            settings.editor,
+            Editor::BackendMenu {
+                backend: Setting::Radarr,
+                ..
+            }
+        ));
     }
 
     /// An app whose config saves land in a scratch file that is cleaned up.
@@ -1398,7 +1642,10 @@ mod tests {
         settings.on_key(KeyEvent::from(KeyCode::Esc));
         assert!(matches!(
             settings.editor,
-            Editor::JellyfinMenu { cursor: 1 }
+            Editor::BackendMenu {
+                backend: Setting::Jellyfin,
+                cursor: 1
+            }
         ));
         settings.on_key(KeyEvent::from(KeyCode::Esc));
         assert!(matches!(settings.editor, Editor::None));
@@ -1415,7 +1662,7 @@ mod tests {
             Some(ShellRequest::Quit)
         ));
         // Quitting is the shell's business; the submenu stays as it was.
-        assert!(matches!(settings.editor, Editor::JellyfinMenu { .. }));
+        assert!(matches!(settings.editor, Editor::BackendMenu { .. }));
         settings.on_key(KeyEvent::from(KeyCode::Backspace));
         assert!(matches!(settings.editor, Editor::None));
     }
@@ -1454,7 +1701,10 @@ mod tests {
         settings.on_key(KeyEvent::from(KeyCode::Backspace));
         assert!(matches!(
             settings.editor,
-            Editor::JellyfinMenu { cursor: 1 }
+            Editor::BackendMenu {
+                backend: Setting::Jellyfin,
+                cursor: 1
+            }
         ));
     }
 
@@ -1462,6 +1712,7 @@ mod tests {
     fn credentials_form_backspace_and_q_on_the_buttons() {
         let mut settings = app();
         settings.open(Setting::Radarr);
+        settings.on_key(KeyEvent::from(KeyCode::Enter)); // Credentials -> form
         // On a field, q is input, not quit.
         assert!(
             settings
@@ -1472,7 +1723,8 @@ mod tests {
             Editor::Backend(editor) => assert_eq!(editor.form.text(field::HOST), "q"),
             _ => panic!("form should be open"),
         }
-        // Walk Host -> API key -> Save: there q quits and Backspace cancels.
+        // Walk Host -> API key -> Save: there q quits and Backspace cancels
+        // back into the submenu.
         settings.on_key(KeyEvent::from(KeyCode::Down));
         settings.on_key(KeyEvent::from(KeyCode::Down));
         assert!(matches!(
@@ -1480,16 +1732,29 @@ mod tests {
             Some(ShellRequest::Quit)
         ));
         settings.on_key(KeyEvent::from(KeyCode::Backspace));
-        assert!(matches!(settings.editor, Editor::None));
+        assert!(matches!(
+            settings.editor,
+            Editor::BackendMenu {
+                backend: Setting::Radarr,
+                ..
+            }
+        ));
+        settings.editor = Editor::None;
 
-        // The Jellyfin form cancels back into the submenu instead.
+        // The Jellyfin form cancels back into its submenu too.
         settings.open(Setting::Jellyfin);
         settings.on_key(KeyEvent::from(KeyCode::Enter));
         for _ in 0..3 {
             settings.on_key(KeyEvent::from(KeyCode::Down)); // -> Save
         }
         settings.on_key(KeyEvent::from(KeyCode::Backspace));
-        assert!(matches!(settings.editor, Editor::JellyfinMenu { .. }));
+        assert!(matches!(
+            settings.editor,
+            Editor::BackendMenu {
+                backend: Setting::Jellyfin,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1520,7 +1785,10 @@ mod tests {
             config.jellyfin.audio_language = Some(TrackPreference::Language("ita".into()));
             config.jellyfin.subtitle_language = Some(TrackPreference::Off);
         }
-        settings.editor = Editor::JellyfinMenu { cursor: 1 };
+        settings.editor = Editor::BackendMenu {
+            backend: Setting::Jellyfin,
+            cursor: 1,
+        };
         let text = draw_to_text(&mut settings);
         assert!(text.contains("audio: Italian (ita)"), "{text}");
         assert!(text.contains("subs: off"), "{text}");
@@ -1531,5 +1799,143 @@ mod tests {
         });
         let text = draw_to_text(&mut settings);
         assert!(text.contains("Italian (ita)"), "{text}");
+    }
+
+    #[test]
+    fn menu_entries_hide_remove_when_unconfigured() {
+        assert_eq!(
+            menu_entries(Setting::Jellyfin, false),
+            vec![MenuEntry::Credentials, MenuEntry::Language]
+        );
+        assert_eq!(
+            menu_entries(Setting::Jellyfin, true),
+            vec![
+                MenuEntry::Credentials,
+                MenuEntry::Language,
+                MenuEntry::Remove
+            ]
+        );
+        assert_eq!(
+            menu_entries(Setting::Radarr, false),
+            vec![MenuEntry::Credentials]
+        );
+        assert_eq!(
+            menu_entries(Setting::Sonarr, true),
+            vec![MenuEntry::Credentials, MenuEntry::Remove]
+        );
+    }
+
+    #[test]
+    fn clear_backend_config_clears_identity_but_keeps_device_and_language() {
+        let mut config = Config::default();
+        config.jellyfin.host = "https://jelly.example".into();
+        config.jellyfin.username = "alice".into();
+        config.jellyfin.user_id = "uid".into();
+        config.jellyfin.device = "laptop".into();
+        config.jellyfin.device_id = "device-id".into();
+        config.jellyfin.audio_language = Some(TrackPreference::Language("ita".into()));
+        config.radarr.host = "https://radarr.example".into();
+
+        clear_backend_config(Setting::Jellyfin, &mut config);
+        assert!(config.jellyfin.host.is_empty());
+        assert!(config.jellyfin.username.is_empty());
+        assert!(config.jellyfin.user_id.is_empty());
+        // Per-install fields survive: they are not tied to the account.
+        assert_eq!(config.jellyfin.device, "laptop");
+        assert_eq!(config.jellyfin.device_id, "device-id");
+        assert_eq!(
+            config.jellyfin.audio_language,
+            Some(TrackPreference::Language("ita".into()))
+        );
+        // Other backends are untouched.
+        assert_eq!(config.radarr.host, "https://radarr.example");
+
+        clear_backend_config(Setting::Radarr, &mut config);
+        assert!(config.radarr.host.is_empty());
+    }
+
+    #[test]
+    fn remove_needs_confirmation_and_esc_cancels() {
+        // NOTE: this test never presses `y` on the confirmation:
+        // `remove_backend` spawns onto the tokio runtime (absent in a plain
+        // #[test]) and its task would touch the developer's real keyring.
+        // The confirm/spawn boundary is the tested seam, like the no-spawn
+        // assertion in `save_with_empty_host_shows_error`.
+        let (mut settings, _path) = app_with_temp_config("remove-cancel");
+        settings.config.lock().unwrap().radarr.host = "https://radarr.example".into();
+
+        // A configured Radarr shows the Remove entry; Enter on it asks first.
+        settings.open(Setting::Radarr);
+        let text = draw_to_text(&mut settings);
+        assert!(text.contains("Remove"), "missing Remove in:\n{text}");
+        settings.on_key(KeyEvent::from(KeyCode::Down)); // Credentials -> Remove
+        settings.on_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(
+            settings.editor,
+            Editor::ConfirmRemove {
+                backend: Setting::Radarr
+            }
+        ));
+        let text = draw_to_text(&mut settings);
+        assert!(text.contains("Remove Radarr"), "{text}");
+
+        // n, Esc and q all decline; nothing was cleared.
+        settings.on_key(KeyEvent::from(KeyCode::Char('n')));
+        assert!(matches!(settings.editor, Editor::BackendMenu { .. }));
+        assert_eq!(
+            settings.config.lock().unwrap().radarr.host,
+            "https://radarr.example"
+        );
+        settings.editor = Editor::ConfirmRemove {
+            backend: Setting::Radarr,
+        };
+        assert!(
+            settings
+                .on_key(KeyEvent::from(KeyCode::Char('q')))
+                .is_none()
+        );
+        assert!(matches!(settings.editor, Editor::BackendMenu { .. }));
+    }
+
+    #[test]
+    fn remove_done_is_gen_guarded_and_reports_errors() {
+        let mut settings = app();
+        settings.save_gen = 3;
+
+        // A stale result (superseded by a newer save/removal) is dropped.
+        settings.on_event(Box::new(Msg::RemoveDone {
+            save_gen: 2,
+            backend: Setting::Radarr,
+            result: Ok(()),
+        }));
+        assert!(settings.notice.is_none());
+
+        // A current success reports plainly.
+        settings.on_event(Box::new(Msg::RemoveDone {
+            save_gen: 3,
+            backend: Setting::Radarr,
+            result: Ok(()),
+        }));
+        assert_eq!(settings.notice.as_deref(), Some("Radarr removed"));
+        let text = draw_to_text(&mut settings);
+        assert!(text.contains("Radarr removed"), "{text}");
+
+        // A keyring failure is surfaced without secret material, and the next
+        // key press in list mode dismisses it.
+        settings.on_event(Box::new(Msg::RemoveDone {
+            save_gen: 3,
+            backend: Setting::Jellyfin,
+            result: Err("keyring unavailable".into()),
+        }));
+        assert!(
+            settings
+                .notice
+                .as_deref()
+                .is_some_and(|n| n.contains("may remain in the OS keyring")),
+            "{:?}",
+            settings.notice
+        );
+        settings.on_key(KeyEvent::from(KeyCode::Down));
+        assert!(settings.notice.is_none());
     }
 }
