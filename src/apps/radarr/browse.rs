@@ -1606,7 +1606,7 @@ impl Browse {
                         self.apply_filter();
                     }
                 }
-                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('s') => self.sort_menu = None,
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('v') => self.sort_menu = None,
                 _ => {}
             }
             return None;
@@ -1755,7 +1755,7 @@ impl Browse {
             }
             KeyCode::Enter | KeyCode::Char(' ') => self.open_selected(),
 
-            KeyCode::Char('s') if matches!(self.level, Level::MovieList) => {
+            KeyCode::Char('v') if matches!(self.level, Level::MovieList) => {
                 self.sort_menu = Some(
                     MOVIE_SORTS
                         .iter()
@@ -2537,7 +2537,7 @@ impl Browse {
                 if self.filter_active {
                     entries.push(("esc", "clear"));
                 }
-                entries.push(("s", "sort"));
+                entries.push(("v", "sort"));
                 entries.push(("m", "monitor"));
                 entries.push(("o", "options"));
             }
