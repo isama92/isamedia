@@ -24,6 +24,7 @@ cp -r contrib/mpv/. ~/.config/mpv/
 Windows (PowerShell), where mpv reads `%APPDATA%\mpv\`:
 
 ```powershell
+New-Item -ItemType Directory -Force -Path $env:APPDATA\mpv | Out-Null
 Copy-Item -Recurse -Force contrib\mpv\* $env:APPDATA\mpv\
 ```
 
