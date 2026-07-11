@@ -1238,21 +1238,32 @@ impl MediaApp for SettingsApp {
             let mut close = false;
             let mut quit = false;
             match key.code {
+                // A grabbed app moves one step and clamps at the ends: a swap is
+                // the correct single-step move only between adjacent rows, so
+                // wrapping is not allowed (it would teleport the far-end tab to
+                // the near end and shove an unrelated app). The cursor still
+                // wraps when nothing is grabbed.
                 KeyCode::Up if len > 0 => {
-                    let to = (*cursor + len - 1) % len;
                     if *grabbed {
-                        order.swap(*cursor, to);
-                        moved = true;
+                        if *cursor > 0 {
+                            order.swap(*cursor, *cursor - 1);
+                            *cursor -= 1;
+                            moved = true;
+                        }
+                    } else {
+                        *cursor = (*cursor + len - 1) % len;
                     }
-                    *cursor = to;
                 }
                 KeyCode::Down if len > 0 => {
-                    let to = (*cursor + 1) % len;
                     if *grabbed {
-                        order.swap(*cursor, to);
-                        moved = true;
+                        if *cursor + 1 < len {
+                            order.swap(*cursor, *cursor + 1);
+                            *cursor += 1;
+                            moved = true;
+                        }
+                    } else {
+                        *cursor = (*cursor + 1) % len;
                     }
-                    *cursor = to;
                 }
                 KeyCode::Enter => *grabbed = !*grabbed,
                 KeyCode::Esc | KeyCode::Backspace => close = true,
@@ -2277,6 +2288,41 @@ mod tests {
             settings.config.lock().unwrap().tab_order,
             vec!["radarr", "jellyfin", "sonarr", "settings"]
         );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn tab_order_grabbed_move_clamps_at_edges() {
+        let (mut settings, path) = app_with_temp_config("tab-order-clamp");
+        settings.open(Setting::TabOrder);
+
+        // Grab the top row and push up past the edge: a grabbed app clamps, so
+        // nothing moves and nothing is persisted (no unrelated tab is shoved).
+        settings.on_key(KeyEvent::from(KeyCode::Enter)); // grab top
+        settings.on_key(KeyEvent::from(KeyCode::Up));
+        assert!(settings.config.lock().unwrap().tab_order.is_empty());
+        assert!(matches!(
+            settings.editor,
+            Editor::TabOrder {
+                cursor: 0,
+                grabbed: true,
+                ..
+            }
+        ));
+
+        // Drop, wrap the cursor to the bottom row (allowed when not grabbed),
+        // grab it, and push down past the edge: likewise a no-op.
+        settings.on_key(KeyEvent::from(KeyCode::Enter)); // drop
+        settings.on_key(KeyEvent::from(KeyCode::Up)); // cursor wraps to bottom
+        settings.on_key(KeyEvent::from(KeyCode::Enter)); // grab bottom
+        settings.on_key(KeyEvent::from(KeyCode::Down));
+        assert!(settings.config.lock().unwrap().tab_order.is_empty());
+        let last = crate::apps::TAB_CATALOG.len() - 1;
+        assert!(matches!(
+            settings.editor,
+            Editor::TabOrder { cursor, grabbed: true, .. } if cursor == last
+        ));
 
         let _ = std::fs::remove_file(path);
     }
