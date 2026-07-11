@@ -739,17 +739,25 @@ impl Browse {
     }
 
     /// Same contract as `on_items_loaded`: true means the session expired.
+    /// A toggle *failure* is surfaced even when superseded, so the user always
+    /// learns the watched state didn't change; a stale success just repaints on
+    /// the newer fetch.
     #[must_use]
     pub fn on_watched_toggled(
         &mut self,
         fetch_gen: u64,
         result: Result<(), crate::jellyfin::Error>,
     ) -> bool {
-        if fetch_gen != self.fetch_gen {
-            return false; // superseded: the user moved to another view meanwhile
-        }
         if matches!(result, Err(crate::jellyfin::Error::Unauthorized)) {
-            return true;
+            return true; // a revoked session must re-auth regardless of staleness
+        }
+        if fetch_gen != self.fetch_gen {
+            // Superseded: a newer fetch owns loading and will repaint the list,
+            // but a toggle failure is still worth surfacing.
+            if let Err(err) = result {
+                self.error = Some(err.to_string());
+            }
+            return false;
         }
         self.loading = false;
         self.refetch_in_place();
@@ -1050,11 +1058,9 @@ impl Browse {
                 }
             }
             KeyCode::Esc | KeyCode::Backspace => {
-                if self.current_series.is_some() && !self.filter_active {
-                    self.current_series = None;
-                    self.cursor = 0;
-                    self.fetch();
-                } else if self.filter_active && key.code == KeyCode::Esc {
+                // A drilled-in series is handled earlier by `on_series_key`, so
+                // `current_series` is always None here.
+                if self.filter_active && key.code == KeyCode::Esc {
                     self.filter.clear();
                     self.filter_active = false;
                     if self.uses_server_filter() {

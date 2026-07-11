@@ -473,15 +473,22 @@ async fn validate_and_persist(
             let client = crate::jellyfin::Client::connect(creds)
                 .await
                 .map_err(|err| err.to_string())?;
-            {
+            // Mutate under the lock, then snapshot and drop the guard before the
+            // blocking disk write: the render thread locks this same mutex every
+            // frame, so holding it across `save` could stall a frame. Two
+            // backend saves racing could lose one's host update, but the write
+            // is atomic (temp + rename) so it can't corrupt, and the race
+            // self-corrects on the next save.
+            let snapshot = {
                 let mut config = config.lock().unwrap();
                 config.jellyfin.host = host;
                 if let Some(username) = username {
                     config.jellyfin.username = username;
                 }
                 config.jellyfin.user_id = client.user_id.clone();
-                config.save(&config_path).map_err(|err| err.to_string())?;
-            }
+                config.clone()
+            };
+            snapshot.save(&config_path).map_err(|err| err.to_string())?;
             // Store the fresh token (so the next launch reuses the session), and
             // the password unless it was left blank (a passwordless account
             // re-auths on the token alone).
@@ -513,15 +520,18 @@ async fn validate_and_persist(
                     .host()
                     .to_string()
             };
-            {
+            // Snapshot under the lock, then save outside it (see the Jellyfin
+            // branch above): never hold the config mutex across the disk write.
+            let snapshot = {
                 let mut config = config.lock().unwrap();
                 match backend {
                     Setting::Radarr => config.radarr.host = normalized_host,
                     Setting::Sonarr => config.sonarr.host = normalized_host,
                     _ => {}
                 }
-                config.save(&config_path).map_err(|err| err.to_string())?;
-            }
+                config.clone()
+            };
+            snapshot.save(&config_path).map_err(|err| err.to_string())?;
             if !secret.is_empty() {
                 let key = secret_key(backend);
                 tokio::task::spawn_blocking(move || crate::secrets::set(key, &secret))

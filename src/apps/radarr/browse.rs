@@ -147,8 +147,10 @@ pub struct Browse {
     level: Level,
 
     all_movies: Vec<Movie>,
-    /// Currently visible movies (filter applied).
-    movies: Vec<Movie>,
+    /// Indices into `all_movies` for the currently visible rows (filter
+    /// applied). Holding indices rather than cloned `Movie` keeps filtering a
+    /// large library cheap on every keystroke.
+    filtered: Vec<usize>,
     movie_cursor: usize,
     releases: Vec<Release>,
     release_cursor: usize,
@@ -264,7 +266,7 @@ impl Browse {
             sender,
             level: Level::MovieList,
             all_movies: Vec::new(),
-            movies: Vec::new(),
+            filtered: Vec::new(),
             movie_cursor: 0,
             releases: Vec::new(),
             release_cursor: 0,
@@ -552,7 +554,10 @@ impl Browse {
         false
     }
 
-    /// Same contract as `on_movies_loaded`.
+    /// Unlike the list loaders, a command *failure* is surfaced even when
+    /// superseded: a delete/grab/toggle that didn't take is a discrete outcome
+    /// the user must learn about, not a stale snapshot to discard silently. A
+    /// stale *success* is still dropped (the newer fetch already reflects it).
     #[must_use]
     pub fn on_command_done(
         &mut self,
@@ -560,17 +565,22 @@ impl Browse {
         kind: CommandKind,
         result: Result<(), crate::radarr::Error>,
     ) -> bool {
-        if fetch_gen != self.fetch_gen {
-            return false; // superseded: the user moved on meanwhile
-        }
         if matches!(result, Err(crate::radarr::Error::Unauthorized)) {
-            return true;
+            return true; // a revoked key must re-auth regardless of staleness
         }
-        self.loading = false;
-        if let Err(err) = result {
+        if let Err(err) = &result {
             self.error = Some(err.to_string());
+            // A newer fetch owns `loading` on the stale path; only clear it
+            // when this command is still the current generation.
+            if fetch_gen == self.fetch_gen {
+                self.loading = false;
+            }
             return false;
         }
+        if fetch_gen != self.fetch_gen {
+            return false; // superseded success: the newer fetch already reflects it
+        }
+        self.loading = false;
         match kind {
             CommandKind::AutoSearch => {
                 self.notice = Some("search started; grabbed downloads appear in the queue".into());
@@ -946,13 +956,14 @@ impl Browse {
 
     fn apply_filter(&mut self) {
         if !self.filter_active || self.filter.value().is_empty() {
-            self.movies = self.all_movies.clone();
+            self.filtered = (0..self.all_movies.len()).collect();
         } else {
             let needle = self.filter.value().to_lowercase();
-            self.movies = self
+            self.filtered = self
                 .all_movies
                 .iter()
-                .filter(|movie| {
+                .enumerate()
+                .filter(|(_, movie)| {
                     movie
                         .title
                         .as_deref()
@@ -960,16 +971,18 @@ impl Browse {
                         .to_lowercase()
                         .contains(&needle)
                 })
-                .cloned()
+                .map(|(index, _)| index)
                 .collect();
         }
-        if self.movie_cursor >= self.movies.len() {
+        if self.movie_cursor >= self.filtered.len() {
             self.movie_cursor = 0;
         }
     }
 
     fn selected_movie(&self) -> Option<&Movie> {
-        self.movies.get(self.movie_cursor)
+        self.filtered
+            .get(self.movie_cursor)
+            .and_then(|&index| self.all_movies.get(index))
     }
 
     fn selected_release(&self) -> Option<&Release> {
@@ -980,7 +993,7 @@ impl Browse {
     /// on the (list-less) movie detail.
     fn cursor_and_len(&mut self) -> Option<(&mut usize, usize)> {
         match &self.level {
-            Level::MovieList => Some((&mut self.movie_cursor, self.movies.len())),
+            Level::MovieList => Some((&mut self.movie_cursor, self.filtered.len())),
             Level::MovieDetail { .. } => None,
             Level::Search { .. } => Some((&mut self.release_cursor, self.releases.len())),
             Level::Add => Some((&mut self.add_cursor, self.add_results.len())),
@@ -2065,7 +2078,7 @@ impl Browse {
 
     fn draw_movie_list(&self, frame: &mut Frame, area: Rect) {
         let buf = frame.buffer_mut();
-        if self.movies.is_empty() {
+        if self.filtered.is_empty() {
             let message = if self.loading {
                 "  Loading..."
             } else {
@@ -2076,14 +2089,21 @@ impl Browse {
         }
         let avail_height = area.height as usize;
         let items_per_page = (avail_height / 3).max(1);
-        let first = list::window_start(self.movie_cursor, self.movies.len(), items_per_page);
-        let last = (first + items_per_page).min(self.movies.len());
+        let first = list::window_start(self.movie_cursor, self.filtered.len(), items_per_page);
+        let last = (first + items_per_page).min(self.filtered.len());
         let now = display::now_utc_iso();
         let text_width = area.width.saturating_sub(6) as usize;
         let title_width = area.width.saturating_sub(MOVIE_META_WIDTH + 6).max(4) as usize;
 
         let mut y = area.y;
-        for (i, movie) in self.movies.iter().enumerate().take(last).skip(first) {
+        for (i, movie) in self
+            .filtered
+            .iter()
+            .filter_map(|&index| self.all_movies.get(index))
+            .enumerate()
+            .take(last)
+            .skip(first)
+        {
             let queue_entry = display::movie_queue_entry(&self.queue, movie.id);
             let status = display::movie_status(movie, queue_entry, &now);
             let unreleased = matches!(status, MovieStatus::Unreleased(_));
@@ -2156,8 +2176,8 @@ impl Browse {
             }
             y += 3;
         }
-        if self.movies.len() > items_per_page {
-            list::draw_scrollbar(buf, area, self.movie_cursor, self.movies.len());
+        if self.filtered.len() > items_per_page {
+            list::draw_scrollbar(buf, area, self.movie_cursor, self.filtered.len());
         }
     }
 

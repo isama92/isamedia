@@ -16,8 +16,7 @@ use crate::config::Config;
 use crate::event::{AppSender, Event};
 
 /// All apps shown in the top tab bar, in tab order. Adding a new app means
-/// writing its module and registering it here (a placeholder can implement
-/// `status() -> AppStatus::ComingSoon`); the shell needs no changes.
+/// writing its module and registering it here; the shell needs no changes.
 pub fn build_apps(
     config: Arc<Mutex<Config>>,
     config_path: PathBuf,
