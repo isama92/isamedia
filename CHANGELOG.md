@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6](https://github.com/isama92/isamedia/compare/v0.1.5...v0.1.6) - 2026-07-11
+
+### Fixed
+
+- player and rendering edge cases; move sort keybinding to v ([#11](https://github.com/isama92/isamedia/pull/11))
+
 ## [0.1.5](https://github.com/isama92/isamedia/compare/v0.1.4...v0.1.5) - 2026-07-10
 
 ### Fixed
