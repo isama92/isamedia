@@ -32,8 +32,8 @@ pub enum Error {
 pub const RELEASE_SEARCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// The queue endpoint is paginated; one page this size covers any sane queue,
-/// and the loop below is capped so a server misreporting `totalRecords` can
-/// never chain-fetch forever.
+/// and `paginate` caps the page count so a server misreporting `totalRecords`
+/// can never chain-fetch forever.
 const QUEUE_PAGE_SIZE: usize = 1000;
 const QUEUE_MAX_PAGES: usize = 5;
 
@@ -149,31 +149,49 @@ impl Transport {
             .await
     }
 
-    /// The whole download queue; callers filter client-side, which sidesteps
-    /// version differences in the server-side filters. `extra_query` carries
-    /// backend-specific params (e.g. Sonarr's includeEpisode).
-    pub async fn get_queue(&self, extra_query: &[(&str, &str)]) -> Result<Vec<QueueItem>, Error> {
-        let page_size = QUEUE_PAGE_SIZE.to_string();
+    /// Follow a paginated `/api/v3` list to completion: adds `page`/`pageSize`
+    /// on top of `extra_query` and accumulates records until the server has
+    /// returned them all. Capped at `max_pages` so a server misreporting
+    /// `totalRecords` can never chain-fetch forever.
+    pub(crate) async fn paginate<T: DeserializeOwned + Default>(
+        &self,
+        path: &str,
+        extra_query: &[(&str, &str)],
+        page_size: usize,
+        max_pages: usize,
+    ) -> Result<Vec<T>, Error> {
+        let page_size_str = page_size.to_string();
         let mut records = Vec::new();
-        for page_number in 1..=QUEUE_MAX_PAGES {
+        for page_number in 1..=max_pages {
             let page_number_str = page_number.to_string();
             let mut query: Vec<(&str, &str)> = vec![
                 ("page", page_number_str.as_str()),
-                ("pageSize", page_size.as_str()),
+                ("pageSize", page_size_str.as_str()),
             ];
             query.extend_from_slice(extra_query);
-            let page: Page<QueueItem> = self
-                .request(Method::GET, "/api/v3/queue", &query, None)
-                .await?;
+            let page: Page<T> = self.request(Method::GET, path, &query, None).await?;
             let page_len = page.records.len();
             records.extend(page.records);
-            // The empty-page guard stops the chain if the server misreports
-            // the total.
-            if records.len() >= page.total_records.max(0) as usize || page_len == 0 {
+            // Stop once every record is in hand, or on a short (hence last)
+            // page; the short-page guard also breaks a misreported total.
+            if records.len() >= page.total_records.max(0) as usize || page_len < page_size {
                 break;
             }
         }
         Ok(records)
+    }
+
+    /// The whole download queue; callers filter client-side, which sidesteps
+    /// version differences in the server-side filters. `extra_query` carries
+    /// backend-specific params (e.g. Sonarr's includeEpisode).
+    pub async fn get_queue(&self, extra_query: &[(&str, &str)]) -> Result<Vec<QueueItem>, Error> {
+        self.paginate(
+            "/api/v3/queue",
+            extra_query,
+            QUEUE_PAGE_SIZE,
+            QUEUE_MAX_PAGES,
+        )
+        .await
     }
 
     /// Poll one command's status by id. Used to track a background

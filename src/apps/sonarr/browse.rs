@@ -1836,16 +1836,16 @@ impl Browse {
             }
             return None;
         }
-        if let Some(cursor) = self.search_menu.as_ref().map(|menu| menu.cursor) {
+        if self.search_menu.is_some() {
             match key.code {
                 KeyCode::Up => {
                     if let Some(menu) = self.search_menu.as_mut() {
-                        menu.cursor = cursor.saturating_sub(1);
+                        menu.cursor = menu.cursor.saturating_sub(1);
                     }
                 }
                 KeyCode::Down => {
                     if let Some(menu) = self.search_menu.as_mut() {
-                        menu.cursor = (cursor + 1).min(SEARCH_MENU_OPTIONS.len() - 1);
+                        menu.cursor = (menu.cursor + 1).min(SEARCH_MENU_OPTIONS.len() - 1);
                     }
                 }
                 KeyCode::Enter => {

@@ -475,7 +475,10 @@ async fn validate_and_persist(
                 .map_err(|err| err.to_string())?;
             // Mutate under the lock, then snapshot and drop the guard before the
             // blocking disk write: the render thread locks this same mutex every
-            // frame, so holding it across `save` could stall a frame.
+            // frame, so holding it across `save` could stall a frame. Two
+            // backend saves racing could lose one's host update, but the write
+            // is atomic (temp + rename) so it can't corrupt, and the race
+            // self-corrects on the next save.
             let snapshot = {
                 let mut config = config.lock().unwrap();
                 config.jellyfin.host = host;
