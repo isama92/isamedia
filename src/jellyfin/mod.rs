@@ -27,6 +27,8 @@ pub enum Error {
     Status(StatusCode),
     #[error("cannot reach server: {0}")]
     Http(#[from] reqwest::Error),
+    #[error("unexpected response from server (not valid JSON)")]
+    Decode(#[from] serde_json::Error),
 }
 
 /// What opening a library lists, as (includeItemTypes, recursive): movie and
@@ -152,7 +154,11 @@ impl Client {
                 status if !status.is_success() => return Err(Error::Status(status)),
                 _ => {}
             }
-            let auth: AuthResponse = response.json().await?;
+            // Read the body then deserialize separately so a proxy answering
+            // HTML with 200 surfaces as `Decode`, not `Http` ("cannot reach
+            // server"). A transport failure on `bytes()` is still `Http`.
+            let bytes = response.bytes().await?;
+            let auth: AuthResponse = serde_json::from_slice(&bytes)?;
             (auth.access_token, auth.user.id)
         } else {
             (creds.token, creds.user_id)
@@ -173,8 +179,12 @@ impl Client {
         })
     }
 
-    /// Send a request and map error statuses; 401 becomes `Error::Unauthorized`
-    /// so the UI can drop back to the login screen.
+    /// Send a request and map error statuses; 401 or 403 becomes
+    /// `Error::Unauthorized` so the UI can drop back to the login screen. A
+    /// 403 on an authenticated request means the session token was revoked,
+    /// which must re-prompt like a 401 rather than surface as a dead-end
+    /// "server returned 403" (the `connect` path maps 403 to `AuthFailed`,
+    /// the correct "wrong credentials" outcome for a fresh login).
     async fn send(
         &self,
         method: Method,
@@ -192,7 +202,7 @@ impl Client {
         }
         let response = request.send().await?;
         match response.status() {
-            StatusCode::UNAUTHORIZED => Err(Error::Unauthorized),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(Error::Unauthorized),
             status if !status.is_success() => Err(Error::Status(status)),
             _ => Ok(response),
         }
@@ -205,7 +215,12 @@ impl Client {
         query: &[(&str, &str)],
     ) -> Result<T, Error> {
         let response = self.send(method, path, query, None).await?;
-        Ok(response.json().await?)
+        // Read the body then deserialize separately: a decode failure (e.g. a
+        // reverse proxy returning HTML with 200) becomes `Decode`, not `Http`,
+        // so it does not masquerade as a network failure. A transport error on
+        // `bytes()` is still `Http`.
+        let bytes = response.bytes().await?;
+        Ok(serde_json::from_slice(&bytes)?)
     }
 
     async fn get_items(&self, path: &str, query: &[(&str, &str)]) -> Result<Vec<MediaItem>, Error> {
@@ -374,7 +389,13 @@ impl Client {
         .await
     }
 
-    async fn report(&self, path: &str, item_id: &str, ticks: i64) -> Result<(), Error> {
+    async fn report(
+        &self,
+        path: &str,
+        item_id: &str,
+        ticks: i64,
+        is_paused: bool,
+    ) -> Result<(), Error> {
         self.send(
             Method::POST,
             path,
@@ -382,6 +403,7 @@ impl Client {
             Some(&PlaybackInfo {
                 item_id,
                 position_ticks: ticks,
+                is_paused,
             }),
         )
         .await?;
@@ -389,16 +411,22 @@ impl Client {
     }
 
     pub async fn report_playback_start(&self, item_id: &str, ticks: i64) -> Result<(), Error> {
-        self.report("/Sessions/Playing", item_id, ticks).await
+        self.report("/Sessions/Playing", item_id, ticks, false)
+            .await
     }
 
-    pub async fn report_playback_progress(&self, item_id: &str, ticks: i64) -> Result<(), Error> {
-        self.report("/Sessions/Playing/Progress", item_id, ticks)
+    pub async fn report_playback_progress(
+        &self,
+        item_id: &str,
+        ticks: i64,
+        is_paused: bool,
+    ) -> Result<(), Error> {
+        self.report("/Sessions/Playing/Progress", item_id, ticks, is_paused)
             .await
     }
 
     pub async fn report_playback_stopped(&self, item_id: &str, ticks: i64) -> Result<(), Error> {
-        self.report("/Sessions/Playing/Stopped", item_id, ticks)
+        self.report("/Sessions/Playing/Stopped", item_id, ticks, false)
             .await
     }
 
