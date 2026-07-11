@@ -363,6 +363,14 @@ impl MediaApp for SonarrApp {
         }
     }
 
+    fn capturing_text(&self) -> bool {
+        match &self.screen {
+            Screen::Setup(form) => !form.action_row_focused(),
+            Screen::Browse(browse) => browse.input_focused(),
+            Screen::Boot | Screen::Connecting => false,
+        }
+    }
+
     fn draw(&mut self, frame: &mut Frame, area: Rect) {
         match &mut self.screen {
             Screen::Boot => {}

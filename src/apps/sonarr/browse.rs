@@ -454,6 +454,12 @@ impl Browse {
         }
     }
 
+    /// True while the add-search box has focus, so the shell knows a keystroke
+    /// is text input and not a global shortcut.
+    pub fn input_focused(&self) -> bool {
+        self.add_search_focused
+    }
+
     /// Mark a list fetch as started and allocate its generation; any result
     /// carrying an older generation is stale and dropped on arrival.
     fn begin_fetch(&mut self) -> u64 {

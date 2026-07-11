@@ -70,5 +70,21 @@ pub trait MediaApp {
         None
     }
 
+    /// Stop this app's active playback, returning true if there was any to
+    /// stop. The now-playing bar is a cross-tab element, so the shell drives
+    /// its `s: stop` control by broadcasting this to every app (like
+    /// `on_quit`) rather than knowing which app owns the player.
+    fn stop_player(&mut self) -> bool {
+        false
+    }
+
+    /// True while a text input has focus. The shell checks this on the active
+    /// app before treating a bare character (e.g. `s` for stop) as a global
+    /// shortcut, so a shortcut can never swallow a keystroke meant for a search
+    /// box or credential field.
+    fn capturing_text(&self) -> bool {
+        false
+    }
+
     fn draw(&mut self, frame: &mut Frame, area: Rect);
 }

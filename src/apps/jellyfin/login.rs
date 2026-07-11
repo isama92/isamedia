@@ -65,6 +65,12 @@ impl LoginForm {
         self.form.text(field::PASSWORD)
     }
 
+    /// True while a field (not the action row) has focus, so the shell knows a
+    /// keystroke is text input and not a global shortcut.
+    pub fn action_row_focused(&self) -> bool {
+        self.form.action_row_focused()
+    }
+
     fn host_error(&self) -> Option<String> {
         let host = self.host();
         if host.is_empty() {

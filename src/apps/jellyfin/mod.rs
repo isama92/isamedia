@@ -171,6 +171,13 @@ impl JellyfinApp {
             PlayerEvent::SessionExpired => self.on_session_expired(),
             PlayerEvent::Exited => {
                 self.player = None;
+                // Playback ended on its own (track finished or mpv was closed),
+                // so a pending replace prompt no longer has anything to replace.
+                // Drop it: left set it strands the "Replace current playback?"
+                // modal over stopped playback, and with the now-playing bar gone
+                // `s` can no longer reach here to dismiss it. Only ever set while
+                // a player existed, and stale exits are dropped before this runs.
+                self.pending_play = None;
                 if let Screen::Browse(browse) = &mut self.screen {
                     browse.on_playback_finished();
                 }
@@ -400,18 +407,6 @@ impl MediaApp for JellyfinApp {
             return None;
         }
 
-        // Global stop key, active whenever no text input has focus.
-        if key.code == KeyCode::Char('s')
-            && key.modifiers.is_empty()
-            && self.player.is_some()
-            && matches!(&self.screen, Screen::Browse(browse) if !browse.input_focused())
-        {
-            if let Some(player) = &self.player {
-                player.stop();
-            }
-            return None;
-        }
-
         match &mut self.screen {
             Screen::Boot => None,
             Screen::Connecting => match key.code {
@@ -559,6 +554,28 @@ impl MediaApp for JellyfinApp {
             ),
             ratatui::text::Span::styled("  s: stop", theme::dim()),
         ]))
+    }
+
+    fn stop_player(&mut self) -> bool {
+        if let Some(player) = &self.player {
+            player.stop();
+            // The replace prompt (only set while a player exists) asked whether
+            // to replace this playback; stopping makes it meaningless, so
+            // dismiss it too rather than leave a dangling modal over a stopped
+            // player now that `s` reaches here without going through on_key.
+            self.pending_play = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn capturing_text(&self) -> bool {
+        match &self.screen {
+            Screen::Login(form) => !form.action_row_focused(),
+            Screen::Browse(browse) => browse.input_focused(),
+            Screen::Boot | Screen::Connecting => false,
+        }
     }
 
     fn draw(&mut self, frame: &mut Frame, area: Rect) {
