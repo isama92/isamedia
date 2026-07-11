@@ -105,7 +105,12 @@ enum Msg {
     RemoveDone {
         save_gen: u64,
         backend: Setting,
-        result: Result<(), String>,
+        /// Failure persisting the cleared config, if any: the tab is hidden
+        /// for this session but may reappear on the next launch.
+        save_error: Option<String>,
+        /// Failure deleting the keyring entries, if any: the secrets may
+        /// still be stored.
+        keyring_error: Option<String>,
     },
 }
 
@@ -339,7 +344,11 @@ impl SettingsApp {
             clear_backend_config(backend, &mut config);
             config.clone()
         };
-        if let Err(err) = snapshot.save(&self.config_path) {
+        let save_error = snapshot
+            .save(&self.config_path)
+            .err()
+            .map(|err| err.to_string());
+        if let Some(err) = &save_error {
             tracing::warn!(%err, "failed to persist backend removal");
         }
         self.editor = Editor::None;
@@ -350,14 +359,22 @@ impl SettingsApp {
         let save_gen = self.save_gen;
         let sender = self.sender.clone();
         tokio::spawn(async move {
-            let result = tokio::task::spawn_blocking(move || delete_backend_secrets(backend))
-                .await
-                .map_err(|err| err.to_string())
-                .and_then(|result| result);
+            let keyring_error =
+                tokio::task::spawn_blocking(move || delete_backend_secrets(backend))
+                    .await
+                    .map_err(|err| err.to_string())
+                    .and_then(|result| result)
+                    .err();
+            // Logged here, not in on_event: a superseding save must not be
+            // able to suppress the record of a secret left behind.
+            if let Some(err) = &keyring_error {
+                tracing::warn!(%err, "failed to delete keyring secrets on removal");
+            }
             sender.send(Msg::RemoveDone {
                 save_gen,
                 backend,
-                result,
+                save_error,
+                keyring_error,
             });
         });
     }
@@ -518,8 +535,11 @@ fn clear_backend_config(backend: Setting, config: &mut Config) {
 }
 
 /// Delete every keyring entry a backend owns. `secrets::delete` treats a
-/// missing entry as success, so removal is idempotent. Blocking (D-Bus);
-/// call through `spawn_blocking`.
+/// missing entry as success, so removal is idempotent. The entries are
+/// independent, so every key is attempted even after a failure (a transient
+/// hiccup on one must not leave the others behind unmentioned); failures are
+/// collected into one message. Blocking (D-Bus); call through
+/// `spawn_blocking`.
 fn delete_backend_secrets(backend: Setting) -> Result<(), String> {
     let keys: &[&str] = match backend {
         Setting::Jellyfin => &[
@@ -530,10 +550,19 @@ fn delete_backend_secrets(backend: Setting) -> Result<(), String> {
         Setting::Sonarr => &[crate::secrets::SONARR_API_KEY],
         Setting::Theme | Setting::Accent => &[],
     };
-    for &key in keys {
-        crate::secrets::delete(key).map_err(|err| err.to_string())?;
+    let failures: Vec<String> = keys
+        .iter()
+        .filter_map(|&key| {
+            crate::secrets::delete(key)
+                .err()
+                .map(|err| format!("{key}: {err}"))
+        })
+        .collect();
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
     }
-    Ok(())
 }
 
 /// The keyring key holding a backend's stored secret.
@@ -1214,22 +1243,30 @@ impl MediaApp for SettingsApp {
             Msg::RemoveDone {
                 save_gen,
                 backend,
-                result,
+                save_error,
+                keyring_error,
             } => {
+                // Both failure kinds were already logged where they occurred
+                // (remove_backend and its spawned task), so a superseding
+                // save only suppresses the UI notice, never the record.
                 if save_gen != self.save_gen {
                     return; // superseded by a newer save/removal
                 }
-                self.notice = Some(match result {
-                    Ok(()) => format!("{} removed", backend_label(backend)),
-                    // The config is already cleared, so the tab is gone either
-                    // way; the leftover entry is overwritten on re-configure.
-                    Err(err) => {
-                        tracing::warn!(%err, "failed to delete keyring secrets on removal");
-                        format!(
-                            "{} removed, but its secrets may remain in the OS keyring",
-                            backend_label(backend)
-                        )
+                // The in-memory config is cleared either way, so the tab is
+                // gone for this session; a leftover keyring entry is
+                // overwritten on re-configure.
+                let label = backend_label(backend);
+                self.notice = Some(match (&save_error, &keyring_error) {
+                    (None, None) => format!("{label} removed"),
+                    (Some(_), None) => format!(
+                        "{label} removed, but saving the config failed; it may reappear on restart"
+                    ),
+                    (None, Some(_)) => {
+                        format!("{label} removed, but its secrets may remain in the OS keyring")
                     }
+                    (Some(_), Some(_)) => format!(
+                        "{label} removed, but the config save failed and its secrets may remain in the OS keyring"
+                    ),
                 });
             }
         }
@@ -1906,7 +1943,8 @@ mod tests {
         settings.on_event(Box::new(Msg::RemoveDone {
             save_gen: 2,
             backend: Setting::Radarr,
-            result: Ok(()),
+            save_error: None,
+            keyring_error: None,
         }));
         assert!(settings.notice.is_none());
 
@@ -1914,24 +1952,59 @@ mod tests {
         settings.on_event(Box::new(Msg::RemoveDone {
             save_gen: 3,
             backend: Setting::Radarr,
-            result: Ok(()),
+            save_error: None,
+            keyring_error: None,
         }));
         assert_eq!(settings.notice.as_deref(), Some("Radarr removed"));
         let text = draw_to_text(&mut settings);
         assert!(text.contains("Radarr removed"), "{text}");
 
-        // A keyring failure is surfaced without secret material, and the next
-        // key press in list mode dismisses it.
+        // A keyring failure is surfaced without secret material.
         settings.on_event(Box::new(Msg::RemoveDone {
             save_gen: 3,
             backend: Setting::Jellyfin,
-            result: Err("keyring unavailable".into()),
+            save_error: None,
+            keyring_error: Some("keyring unavailable".into()),
         }));
         assert!(
             settings
                 .notice
                 .as_deref()
                 .is_some_and(|n| n.contains("may remain in the OS keyring")),
+            "{:?}",
+            settings.notice
+        );
+
+        // A config-save failure warns that the removal may not stick.
+        settings.on_event(Box::new(Msg::RemoveDone {
+            save_gen: 3,
+            backend: Setting::Sonarr,
+            save_error: Some("disk full".into()),
+            keyring_error: None,
+        }));
+        assert!(
+            settings
+                .notice
+                .as_deref()
+                .is_some_and(|n| n.contains("may reappear on restart")),
+            "{:?}",
+            settings.notice
+        );
+
+        // Both at once are folded into one line, and the next key press in
+        // list mode dismisses it.
+        settings.on_event(Box::new(Msg::RemoveDone {
+            save_gen: 3,
+            backend: Setting::Sonarr,
+            save_error: Some("disk full".into()),
+            keyring_error: Some("keyring unavailable".into()),
+        }));
+        assert!(
+            settings
+                .notice
+                .as_deref()
+                .is_some_and(|n| n.contains("config save failed")
+                    && n.contains("may remain in the OS keyring")),
             "{:?}",
             settings.notice
         );
