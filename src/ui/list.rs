@@ -16,9 +16,11 @@ pub fn window_start(cursor: usize, len: usize, per_page: usize) -> usize {
 }
 
 /// Draw a one-column scrollbar down the right edge of `area`, its thumb at the
-/// cursor's relative position. A no-op for lists too short to scroll.
+/// cursor's relative position. A no-op for lists too short to scroll or a
+/// zero-width/zero-height area (which would otherwise underflow the edge and
+/// thumb arithmetic below).
 pub fn draw_scrollbar(buf: &mut ratatui::buffer::Buffer, area: Rect, cursor: usize, len: usize) {
-    if len < 2 {
+    if len < 2 || area.height == 0 || area.width == 0 {
         return;
     }
     let height = area.height as usize;
@@ -33,5 +35,38 @@ pub fn draw_scrollbar(buf: &mut ratatui::buffer::Buffer, area: Rect, cursor: usi
         buf[(x, area.y + i as u16)]
             .set_symbol(symbol)
             .set_style(style);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::buffer::Buffer;
+
+    #[test]
+    fn scrollbar_is_a_no_op_on_degenerate_areas() {
+        // A populated list (len >= 2) drawn into a zero-width or zero-height
+        // area must not underflow the edge/thumb arithmetic (panic in debug),
+        // and must leave the buffer untouched.
+        let backing = Rect::new(0, 0, 5, 5);
+        for area in [
+            Rect::new(0, 0, 0, 0),
+            Rect::new(0, 0, 0, 5),
+            Rect::new(0, 0, 5, 0),
+        ] {
+            let mut buf = Buffer::empty(backing);
+            draw_scrollbar(&mut buf, area, 3, 10);
+            assert_eq!(buf, Buffer::empty(backing));
+        }
+    }
+
+    #[test]
+    fn scrollbar_draws_the_right_edge_column() {
+        let area = Rect::new(0, 0, 4, 5);
+        let mut buf = Buffer::empty(area);
+        draw_scrollbar(&mut buf, area, 0, 10);
+        // Thumb at the top for cursor 0; the rightmost column is populated.
+        assert_eq!(buf[(3, 0)].symbol(), "█");
+        assert_eq!(buf[(3, 4)].symbol(), "│");
     }
 }

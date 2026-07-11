@@ -114,7 +114,8 @@ below cover the common cases.
 | `enter` / `space` | play, or open a series / season |
 | `w` | toggle watched |
 | `i` | info panel |
-| `s` | stop playback if something is playing, otherwise open the sort menu |
+| `v` | open the sort menu (in a collection) |
+| `s` | stop playback |
 | `y` / `n` | confirm / cancel the replace-playback prompt |
 
 **Radarr and Sonarr**
@@ -125,7 +126,7 @@ below cover the common cases.
 | `enter` | open; on a movie or episode, open the search menu (auto or interactive) |
 | `m` | toggle monitored |
 | `o` | edit options |
-| `s` | sort menu |
+| `v` | sort menu |
 | `i` | expand overview / episode info |
 | `d` | open the downloads queue |
 | `x` | delete file, remove from the queue, or show release rejections |
