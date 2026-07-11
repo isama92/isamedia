@@ -162,6 +162,7 @@ impl Transport {
     ) -> Result<Vec<T>, Error> {
         let page_size_str = page_size.to_string();
         let mut records = Vec::new();
+        let mut complete = false;
         for page_number in 1..=max_pages {
             let page_number_str = page_number.to_string();
             let mut query: Vec<(&str, &str)> = vec![
@@ -175,8 +176,20 @@ impl Transport {
             // Stop once every record is in hand, or on a short (hence last)
             // page; the short-page guard also breaks a misreported total.
             if records.len() >= page.total_records.max(0) as usize || page_len < page_size {
+                complete = true;
                 break;
             }
+        }
+        // Exhausting the loop without the stop condition means the cap clipped
+        // the results, unlike a clean finish; log it so a silent truncation
+        // (e.g. a >max_pages history) is at least visible in debug output.
+        if !complete {
+            tracing::debug!(
+                path,
+                max_pages,
+                fetched = records.len(),
+                "paginate hit its page cap; results may be truncated"
+            );
         }
         Ok(records)
     }
