@@ -200,9 +200,19 @@ fn inside_skippable_segment(segments: &[(f64, f64)], pos: f64) -> Option<f64> {
 /// (30s request timeout) can never stall position updates, segment skips,
 /// or quit handling.
 enum Report {
-    Start { item_id: String, ticks: i64 },
-    Progress { item_id: String, ticks: i64 },
-    Stopped { item_id: String, ticks: i64 },
+    Start {
+        item_id: String,
+        ticks: i64,
+    },
+    Progress {
+        item_id: String,
+        ticks: i64,
+        is_paused: bool,
+    },
+    Stopped {
+        item_id: String,
+        ticks: i64,
+    },
 }
 
 /// Reporter task: runs reports sequentially, preserving order. A backlog of
@@ -252,10 +262,16 @@ async fn send_report(client: &Client, report: Report) -> bool {
             item_id,
             client.report_playback_start(item_id, *ticks).await,
         ),
-        Report::Progress { item_id, ticks } => (
+        Report::Progress {
+            item_id,
+            ticks,
+            is_paused,
+        } => (
             "progress",
             item_id,
-            client.report_playback_progress(item_id, *ticks).await,
+            client
+                .report_playback_progress(item_id, *ticks, *is_paused)
+                .await,
         ),
         Report::Stopped { item_id, ticks } => (
             "stopped",
@@ -375,6 +391,9 @@ pub(super) async fn run(
     let _ = ipc.send(&ipc::observe_property_cmd(3, "aid")).await;
     let _ = ipc.send(&ipc::observe_property_cmd(4, "sid")).await;
     let _ = ipc.send(&ipc::observe_property_cmd(5, "track-list")).await;
+    // Pause drives the keepalive: while paused, mpv stops emitting time-pos,
+    // so the time-pos-driven progress reporting goes silent.
+    let _ = ipc.send(&ipc::observe_property_cmd(6, "pause")).await;
 
     for command in language_setup_cmds(&prefs) {
         if let Err(err) = ipc.send(&command).await {
@@ -425,6 +444,10 @@ pub(super) async fn run(
     let mut pos = ticks_to_seconds(display::resume_position_ticks(&current));
     let mut skippable: Vec<(f64, f64)> = Vec::new();
     let mut last_report = Instant::now();
+    // Whether mpv is currently paused, tracked from the `pause` property so a
+    // long pause keeps sending keepalive progress reports (see the keepalive
+    // arm below) instead of letting Jellyfin expire the play session.
+    let mut paused = false;
     // Set on seek: send a progress report on the next time-pos even if the
     // debounce interval has not elapsed.
     let mut report_due = false;
@@ -450,6 +473,13 @@ pub(super) async fn run(
     // arriving after an auto-advance is dropped instead of applied.
     let (seg_tx, mut seg_rx) =
         mpsc::unbounded_channel::<(String, Vec<crate::jellyfin::MediaSegment>)>();
+
+    // Keepalive tick: fires on the same cadence as the time-pos debounce, but
+    // only sends a report while paused (playing is already covered by the
+    // time-pos handler). Skip missed ticks so a slow iteration cannot burst a
+    // backlog of reports.
+    let mut keepalive = tokio::time::interval(PROGRESS_REPORT_INTERVAL);
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
@@ -501,6 +531,7 @@ pub(super) async fn run(
                                 let _ = report_tx.send(Report::Progress {
                                     item_id: current.id.clone(),
                                     ticks: seconds_to_ticks(pos),
+                                    is_paused: paused,
                                 });
                                 report_due = false;
                                 last_report = Instant::now();
@@ -554,6 +585,23 @@ pub(super) async fn run(
                                 kind,
                                 selection,
                             });
+                        }
+                        Some("pause") => {
+                            // Report the pause/resume immediately so the server
+                            // reflects it without waiting for the next keepalive
+                            // tick. mpv can repeat the property, so only a
+                            // genuine change reports.
+                            if let Some(is_paused) = msg.data.as_ref().and_then(Value::as_bool)
+                                && is_paused != paused
+                            {
+                                paused = is_paused;
+                                let _ = report_tx.send(Report::Progress {
+                                    item_id: current.id.clone(),
+                                    ticks: seconds_to_ticks(pos),
+                                    is_paused: paused,
+                                });
+                                last_report = Instant::now();
+                            }
                         }
                         _ => {}
                     },
@@ -673,6 +721,19 @@ pub(super) async fn run(
                     }
 
                     _ => {}
+                }
+            }
+
+            _ = keepalive.tick() => {
+                // While paused, time-pos is frozen and the reporting above goes
+                // silent; send a keepalive on the report cadence so the session
+                // stays alive and the dashboard reflects the paused state.
+                if paused {
+                    let _ = report_tx.send(Report::Progress {
+                        item_id: current.id.clone(),
+                        ticks: seconds_to_ticks(pos),
+                        is_paused: true,
+                    });
                 }
             }
 
