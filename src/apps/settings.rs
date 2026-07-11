@@ -1046,6 +1046,16 @@ impl MediaApp for SettingsApp {
         }
     }
 
+    fn capturing_text(&self) -> bool {
+        match &self.editor {
+            // A field (not the action row) has focus in the credentials form.
+            Editor::Backend(editor) => !editor.form.action_row_focused(),
+            // An open language picker always holds a focused filter input.
+            Editor::Language(editor) => editor.picker.is_some(),
+            Editor::None | Editor::Choice(_) | Editor::JellyfinMenu { .. } => false,
+        }
+    }
+
     fn draw(&mut self, frame: &mut Frame, area: Rect) {
         let [_, title_row, _, body] = Layout::vertical([
             Constraint::Length(1),
@@ -1131,6 +1141,40 @@ mod tests {
             terminal.draw(|f| settings.draw(f, f.area())).unwrap();
             settings.editor = Editor::None;
         }
+    }
+
+    #[test]
+    fn capturing_text_tracks_the_open_text_editor() {
+        let mut settings = app();
+        // The list and the navigable overlays are not text entry, so `s` is
+        // free to act as the global stop shortcut over them.
+        assert!(!settings.capturing_text());
+        settings.editor = Editor::Choice(Editing {
+            setting: Setting::Theme,
+            cursor: 0,
+        });
+        assert!(!settings.capturing_text());
+        settings.editor = Editor::JellyfinMenu { cursor: 0 };
+        assert!(!settings.capturing_text());
+        // A language page with the picker closed is navigable; opening the
+        // picker focuses its filter input.
+        settings.editor = Editor::Language(LanguageEditor {
+            cursor: 0,
+            picker: None,
+        });
+        assert!(!settings.capturing_text());
+        settings.editor = Editor::Language(LanguageEditor {
+            cursor: 0,
+            picker: Some(language_picker(0)),
+        });
+        assert!(settings.capturing_text());
+        // A freshly opened credentials form has a field (not the action row)
+        // focused, so a keystroke is text and must not stop playback.
+        settings.editor = Editor::Backend(BackendEditor::from_config(
+            Setting::Jellyfin,
+            &Config::default(),
+        ));
+        assert!(settings.capturing_text());
     }
 
     #[test]

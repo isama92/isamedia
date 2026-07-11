@@ -400,18 +400,6 @@ impl MediaApp for JellyfinApp {
             return None;
         }
 
-        // Global stop key, active whenever no text input has focus.
-        if key.code == KeyCode::Char('s')
-            && key.modifiers.is_empty()
-            && self.player.is_some()
-            && matches!(&self.screen, Screen::Browse(browse) if !browse.input_focused())
-        {
-            if let Some(player) = &self.player {
-                player.stop();
-            }
-            return None;
-        }
-
         match &mut self.screen {
             Screen::Boot => None,
             Screen::Connecting => match key.code {
@@ -559,6 +547,23 @@ impl MediaApp for JellyfinApp {
             ),
             ratatui::text::Span::styled("  s: stop", theme::dim()),
         ]))
+    }
+
+    fn stop_player(&mut self) -> bool {
+        if let Some(player) = &self.player {
+            player.stop();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn capturing_text(&self) -> bool {
+        match &self.screen {
+            Screen::Login(form) => !form.action_row_focused(),
+            Screen::Browse(browse) => browse.input_focused(),
+            Screen::Boot | Screen::Connecting => false,
+        }
     }
 
     fn draw(&mut self, frame: &mut Frame, area: Rect) {

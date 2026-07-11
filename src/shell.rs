@@ -142,6 +142,23 @@ impl Shell {
                 _ => {}
             }
         }
+        // Global stop: the now-playing bar (and its `s: stop` hint) shows from
+        // every tab, so `s` must stop playback from every tab too. Skip it when
+        // the active app is capturing text, so it never eats a keystroke meant
+        // for a search or credential field, and fall through otherwise so a
+        // real `s` binding still reaches the active app.
+        if key.code == KeyCode::Char('s')
+            && key.modifiers.is_empty()
+            && !self.apps[self.active].capturing_text()
+        {
+            let mut stopped = false;
+            for app in &mut self.apps {
+                stopped |= app.stop_player();
+            }
+            if stopped {
+                return;
+            }
+        }
         if let Some(request) = self.apps[self.active].on_key(key) {
             match request {
                 ShellRequest::Quit => self.should_quit = true,
@@ -232,5 +249,136 @@ fn render_status_bar(frame: &mut Frame, area: Rect, lines: Vec<Line<'static>>, a
     let rows = Layout::vertical(vec![Constraint::Length(1); lines.len()]).split(area);
     for (line, row) in lines.into_iter().zip(rows.iter()) {
         line.render(*row, frame.buffer_mut());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::any::Any;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use crate::app::AppId;
+
+    /// A stand-in app that records whether its player was asked to stop and any
+    /// key routed to its `on_key`, so the shell's global-`s` handling can be
+    /// exercised without real apps.
+    struct MockApp {
+        id: AppId,
+        capturing: bool,
+        has_player: bool,
+        stopped: Arc<AtomicBool>,
+        keys: Arc<Mutex<Vec<KeyEvent>>>,
+    }
+
+    impl MediaApp for MockApp {
+        fn id(&self) -> AppId {
+            self.id
+        }
+        fn title(&self) -> &'static str {
+            self.id
+        }
+        fn on_key(&mut self, key: KeyEvent) -> Option<ShellRequest> {
+            self.keys.lock().unwrap().push(key);
+            None
+        }
+        fn on_event(&mut self, _payload: Box<dyn Any + Send>) {}
+        fn stop_player(&mut self) -> bool {
+            if self.has_player {
+                self.stopped.store(true, Ordering::SeqCst);
+                true
+            } else {
+                false
+            }
+        }
+        fn capturing_text(&self) -> bool {
+            self.capturing
+        }
+        fn draw(&mut self, _frame: &mut Frame, _area: Rect) {}
+    }
+
+    fn mock(
+        id: AppId,
+        capturing: bool,
+        has_player: bool,
+    ) -> (MockApp, Arc<AtomicBool>, Arc<Mutex<Vec<KeyEvent>>>) {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        let app = MockApp {
+            id,
+            capturing,
+            has_player,
+            stopped: stopped.clone(),
+            keys: keys.clone(),
+        };
+        (app, stopped, keys)
+    }
+
+    fn shell(apps: Vec<Box<dyn MediaApp>>) -> Shell {
+        // A default config has no `last_app`, so the first app is active.
+        let (_tx, rx) = mpsc::unbounded_channel();
+        Shell::new(
+            apps,
+            Arc::new(Mutex::new(Config::default())),
+            PathBuf::from("shell-test-config.toml"),
+            rx,
+        )
+    }
+
+    fn press_s() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn s_stops_a_background_player_from_another_tab() {
+        // Active tab owns no player and is not capturing text; the player lives
+        // on a background tab, exactly the case the feature fixes.
+        let (active, _active_stopped, active_keys) = mock("active", false, false);
+        let (player, player_stopped, _player_keys) = mock("player", false, true);
+        let mut shell = shell(vec![Box::new(active), Box::new(player)]);
+
+        shell.on_key(press_s());
+
+        assert!(
+            player_stopped.load(Ordering::SeqCst),
+            "the background player should have been stopped"
+        );
+        assert!(
+            active_keys.lock().unwrap().is_empty(),
+            "a consumed `s` must not also reach the active app"
+        );
+    }
+
+    #[test]
+    fn s_is_left_for_typing_when_active_app_captures_text() {
+        let (active, _active_stopped, active_keys) = mock("active", true, false);
+        let (player, player_stopped, _player_keys) = mock("player", false, true);
+        let mut shell = shell(vec![Box::new(active), Box::new(player)]);
+
+        shell.on_key(press_s());
+
+        assert!(
+            !player_stopped.load(Ordering::SeqCst),
+            "playback must not stop while the active app is capturing text"
+        );
+        assert_eq!(
+            active_keys.lock().unwrap().len(),
+            1,
+            "`s` should fall through to the active app as text"
+        );
+    }
+
+    #[test]
+    fn s_falls_through_when_nothing_is_playing() {
+        let (active, _stopped, active_keys) = mock("active", false, false);
+        let mut shell = shell(vec![Box::new(active)]);
+
+        shell.on_key(press_s());
+
+        assert_eq!(
+            active_keys.lock().unwrap().len(),
+            1,
+            "with no player to stop, `s` reaches the active app"
+        );
     }
 }
