@@ -17,10 +17,13 @@ pub enum Msg {
     },
     /// One page of a Libraries-tab listing. `start_index == 0` replaces the
     /// list, anything else appends; `fetch_gen` drops pages superseded by a
-    /// sort, filter, or navigation change.
+    /// sort, filter, or navigation change. `limit` is the page size that was
+    /// requested, so a failed page can be retried with the same size (a
+    /// position-preserving refresh uses a larger limit than `PAGE_SIZE`).
     LibraryItemsLoaded {
         fetch_gen: u64,
         start_index: usize,
+        limit: usize,
         result: Result<ItemsResponse, Error>,
     },
     /// Result of a watched/unwatched toggle; `fetch_gen` is the view
