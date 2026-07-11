@@ -17,6 +17,12 @@ pub struct Config {
     // Only applied for themes that offer accents (Catppuccin Latte); persisted
     // regardless so switching back to such a theme restores the choice.
     pub accent: Accent,
+    // The user's tab order, as app ids (see `apps::TAB_CATALOG`); empty means
+    // the built-in order. A bare key like the ones above, so it must stay before
+    // the `jellyfin` table (see the note on `theme`). Omitted from a fresh
+    // config until the user reorders, so untouched files stay byte-identical.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tab_order: Vec<String>,
     pub jellyfin: JellyfinConfig,
     pub sonarr: SonarrConfig,
     pub radarr: RadarrConfig,
@@ -272,6 +278,7 @@ mod tests {
             last_app: Some("jellyfin".into()),
             theme: Theme::SolarizedLight,
             accent: Accent::Mauve,
+            tab_order: vec!["settings".into(), "jellyfin".into()],
             jellyfin: JellyfinConfig {
                 host: "https://demo.jellyfin.org".into(),
                 skip_segments: vec!["Intro".into(), "Outro".into()],
@@ -293,6 +300,43 @@ mod tests {
         assert_eq!(parsed.jellyfin.skip_segments, config.jellyfin.skip_segments);
         assert_eq!(parsed.sonarr.host, config.sonarr.host);
         assert_eq!(parsed.radarr.host, config.radarr.host);
+        assert_eq!(parsed.tab_order, config.tab_order);
+    }
+
+    #[test]
+    fn tab_order_serialises_as_array_before_tables() {
+        let config = Config {
+            tab_order: vec!["settings".into(), "jellyfin".into()],
+            jellyfin: JellyfinConfig {
+                host: "http://x".into(),
+                ..JellyfinConfig::default()
+            },
+            ..Config::default()
+        };
+        let raw = toml::to_string_pretty(&config).unwrap();
+        // The ids serialise into a `tab_order` array (toml may wrap it across
+        // lines); order round-trips, checked separately in `roundtrip`.
+        assert!(raw.contains("tab_order = ["), "{raw}");
+        assert!(
+            raw.contains("\"settings\"") && raw.contains("\"jellyfin\""),
+            "{raw}"
+        );
+        // The bare key must precede the [jellyfin] table, or it would serialise
+        // into the wrong section.
+        assert!(
+            raw.find("tab_order").unwrap() < raw.find("[jellyfin]").unwrap(),
+            "{raw}"
+        );
+    }
+
+    #[test]
+    fn default_config_omits_tab_order() {
+        // An untouched config stays byte-identical: no tab_order key until a
+        // reorder, and an old file without one parses to the built-in order.
+        let raw = toml::to_string_pretty(&Config::default()).unwrap();
+        assert!(!raw.contains("tab_order"), "{raw}");
+        let parsed: Config = toml::from_str("[jellyfin]\nhost = \"http://x\"\n").unwrap();
+        assert!(parsed.tab_order.is_empty());
     }
 
     #[test]

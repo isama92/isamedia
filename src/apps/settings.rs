@@ -33,6 +33,7 @@ mod field {
 enum Setting {
     Theme,
     Accent,
+    TabOrder,
     Jellyfin,
     Radarr,
     Sonarr,
@@ -63,6 +64,14 @@ enum Editor {
         backend: Setting,
     },
     Language(LanguageEditor),
+    /// The tab-reorder screen. `order` is the current tab order as indices into
+    /// [`crate::apps::TAB_CATALOG`]; `cursor` is the highlighted row; `grabbed`
+    /// means Up/Down now move that app rather than the cursor.
+    TabOrder {
+        order: Vec<usize>,
+        cursor: usize,
+        grabbed: bool,
+    },
 }
 
 /// One row of a backend's submenu.
@@ -164,6 +173,7 @@ impl SettingsApp {
         if !theme::active_theme().accents().is_empty() {
             rows.push(Setting::Accent);
         }
+        rows.push(Setting::TabOrder);
         rows.extend([Setting::Jellyfin, Setting::Radarr, Setting::Sonarr]);
         rows
     }
@@ -185,6 +195,16 @@ impl SettingsApp {
                     cursor: current_choice_index(setting),
                 });
             }
+            Setting::TabOrder => {
+                // Open on the current order (persisted, or the built-in order),
+                // resolved the same tolerant way the shell resolves it.
+                let saved = self.config.lock().unwrap().tab_order.clone();
+                self.editor = Editor::TabOrder {
+                    order: crate::apps::order_indices(&catalog_ids(), &saved),
+                    cursor: 0,
+                    grabbed: false,
+                };
+            }
             Setting::Jellyfin | Setting::Radarr | Setting::Sonarr => {
                 self.editor = Editor::BackendMenu {
                     backend: setting,
@@ -204,7 +224,7 @@ impl SettingsApp {
             }
             Setting::Radarr => !config.radarr.host.is_empty(),
             Setting::Sonarr => !config.sonarr.host.is_empty(),
-            Setting::Theme | Setting::Accent => false,
+            Setting::Theme | Setting::Accent | Setting::TabOrder => false,
         }
     }
 
@@ -256,7 +276,7 @@ impl SettingsApp {
                     tracing::warn!(%err, "failed to persist accent");
                 }
             }
-            Setting::Jellyfin | Setting::Radarr | Setting::Sonarr => {}
+            Setting::TabOrder | Setting::Jellyfin | Setting::Radarr | Setting::Sonarr => {}
         }
     }
 
@@ -488,6 +508,68 @@ impl SettingsApp {
             );
         }
     }
+
+    /// Write the reorder screen's current order to the config and save it, so
+    /// the shell (which shares the config mutex) reflows the tab bar on its next
+    /// frame. Synchronous on the render thread, like the Theme/Accent apply.
+    fn persist_tab_order(&self) {
+        let Editor::TabOrder { order, .. } = &self.editor else {
+            return;
+        };
+        let tab_order: Vec<String> = order
+            .iter()
+            .map(|&i| crate::apps::TAB_CATALOG[i].0.to_string())
+            .collect();
+        let mut config = self.config.lock().unwrap();
+        config.tab_order = tab_order;
+        if let Err(err) = config.save(&self.config_path) {
+            tracing::warn!(%err, "failed to persist tab order");
+        }
+    }
+
+    /// The tab-reorder screen: every app tab in the current order, with hidden
+    /// (unconfigured) tabs dimmed and marked, and the grabbed row flagged so it
+    /// is clear which app the arrows now move.
+    fn draw_tab_order(
+        &self,
+        order: &[usize],
+        cursor: usize,
+        grabbed: bool,
+        area: Rect,
+        buf: &mut Buffer,
+    ) {
+        Line::styled("  Tab order", theme::selected())
+            .render(Rect::new(area.x, area.y, area.width, 1), buf);
+        {
+            let config = self.config.lock().unwrap();
+            for (row, &cat) in order.iter().enumerate() {
+                let y = area.y + 2 + row as u16;
+                if y >= area.y + area.height {
+                    break;
+                }
+                let (id, title) = crate::apps::TAB_CATALOG[cat];
+                let selected = row == cursor;
+                tab_order_row(
+                    selected,
+                    grabbed && selected,
+                    app_configured(id, &config),
+                    title,
+                )
+                .render(Rect::new(area.x, y, area.width, 1), buf);
+            }
+        }
+        if area.height > 2 {
+            let hint = if grabbed {
+                "  up/down: move item   enter: drop   esc: done"
+            } else {
+                "  enter: grab   up/down: move   esc: done"
+            };
+            Line::styled(hint, theme::dim()).render(
+                Rect::new(area.x, area.y + area.height - 1, area.width, 1),
+                buf,
+            );
+        }
+    }
 }
 
 /// What a submitted backend form should do, decided before the borrow on the
@@ -504,7 +586,7 @@ fn backend_host(setting: Setting, config: &Config) -> Option<&str> {
         Setting::Jellyfin => Some(&config.jellyfin.host),
         Setting::Radarr => Some(&config.radarr.host),
         Setting::Sonarr => Some(&config.sonarr.host),
-        Setting::Theme | Setting::Accent => None,
+        Setting::Theme | Setting::Accent | Setting::TabOrder => None,
     }
 }
 
@@ -514,8 +596,58 @@ fn backend_label(setting: Setting) -> &'static str {
         Setting::Jellyfin => "Jellyfin",
         Setting::Radarr => "Radarr",
         Setting::Sonarr => "Sonarr",
-        Setting::Theme | Setting::Accent => "",
+        Setting::Theme | Setting::Accent | Setting::TabOrder => "",
     }
+}
+
+/// The app ids from [`crate::apps::TAB_CATALOG`], for resolving a saved order.
+fn catalog_ids() -> Vec<&'static str> {
+    crate::apps::TAB_CATALOG.iter().map(|&(id, _)| id).collect()
+}
+
+/// Whether an app's tab is currently shown, i.e. its backend is configured.
+/// Settings has no backend and is always shown. Mirrors each backend app's
+/// `is_configured` (and this app's [`SettingsApp::backend_configured`]), read
+/// from an already-held config lock so the reorder screen can dim hidden tabs.
+fn app_configured(id: &str, config: &Config) -> bool {
+    match id {
+        "jellyfin" => !config.jellyfin.host.is_empty() && !config.jellyfin.username.is_empty(),
+        "radarr" => !config.radarr.host.is_empty(),
+        "sonarr" => !config.sonarr.host.is_empty(),
+        _ => true,
+    }
+}
+
+/// A tab-reorder row: `> Jellyfin`. The grabbed row shows a distinct marker; an
+/// unconfigured (hidden) tab is dimmed and annotated `(not set up)`.
+fn tab_order_row(selected: bool, grabbed: bool, configured: bool, title: &str) -> Line<'static> {
+    let marker_style = if selected {
+        theme::selected()
+    } else {
+        Style::new().fg(theme::fg())
+    };
+    let title_style = if selected {
+        theme::selected()
+    } else if configured {
+        Style::new().fg(theme::fg())
+    } else {
+        theme::dim()
+    };
+    let marker = if grabbed {
+        "^ "
+    } else if selected {
+        "> "
+    } else {
+        "  "
+    };
+    let mut spans = vec![
+        Span::styled(format!("  {marker}"), marker_style),
+        Span::styled(format!("{title:<12}"), title_style),
+    ];
+    if !configured {
+        spans.push(Span::styled("(not set up)", theme::dim()));
+    }
+    Line::from(spans)
 }
 
 /// Clear a backend's identity from the config, hiding its tab. Keeps the
@@ -530,7 +662,7 @@ fn clear_backend_config(backend: Setting, config: &mut Config) {
         }
         Setting::Radarr => config.radarr.host.clear(),
         Setting::Sonarr => config.sonarr.host.clear(),
-        Setting::Theme | Setting::Accent => {}
+        Setting::Theme | Setting::Accent | Setting::TabOrder => {}
     }
 }
 
@@ -548,7 +680,7 @@ fn delete_backend_secrets(backend: Setting) -> Result<(), String> {
         ],
         Setting::Radarr => &[crate::secrets::RADARR_API_KEY],
         Setting::Sonarr => &[crate::secrets::SONARR_API_KEY],
-        Setting::Theme | Setting::Accent => &[],
+        Setting::Theme | Setting::Accent | Setting::TabOrder => &[],
     };
     let failures: Vec<String> = keys
         .iter()
@@ -571,7 +703,7 @@ fn secret_key(backend: Setting) -> &'static str {
         Setting::Jellyfin => crate::secrets::JELLYFIN_PASSWORD,
         Setting::Radarr => crate::secrets::RADARR_API_KEY,
         Setting::Sonarr => crate::secrets::SONARR_API_KEY,
-        Setting::Theme | Setting::Accent => "",
+        Setting::Theme | Setting::Accent | Setting::TabOrder => "",
     }
 }
 
@@ -693,7 +825,9 @@ async fn validate_and_persist(
                     .map_err(|err| err.to_string())?;
             }
         }
-        Setting::Theme | Setting::Accent => return Err("not a backend".into()),
+        Setting::Theme | Setting::Accent | Setting::TabOrder => {
+            return Err("not a backend".into());
+        }
     }
     Ok(())
 }
@@ -721,6 +855,10 @@ fn setting_row(setting: Setting, selected: bool, host: Option<&str>) -> Line<'st
                 Style::new().fg(theme::accent_colors(accent).accent),
             ));
             spans.push(Span::styled(accent.title(), theme::dim()));
+        }
+        Setting::TabOrder => {
+            spans.push(Span::styled("Tab order", label_style));
+            spans.push(Span::styled("  reorder the app tabs", theme::dim()));
         }
         Setting::Jellyfin | Setting::Radarr | Setting::Sonarr => {
             spans.push(Span::styled(
@@ -780,8 +918,10 @@ fn draw_editor(editing: &Editing, area: Rect, buf: &mut Buffer) {
                 })
                 .collect(),
         ),
-        // Backends never open a choice list.
-        Setting::Jellyfin | Setting::Radarr | Setting::Sonarr => ("", Vec::new()),
+        // Only Theme/Accent open a choice list.
+        Setting::TabOrder | Setting::Jellyfin | Setting::Radarr | Setting::Sonarr => {
+            ("", Vec::new())
+        }
     };
     Line::styled(format!("  {header}"), theme::selected())
         .render(Rect::new(area.x, area.y, area.width, 1), buf);
@@ -804,7 +944,7 @@ fn choice_count(setting: Setting) -> usize {
     match setting {
         Setting::Theme => Theme::ALL.len(),
         Setting::Accent => theme::active_theme().accents().len(),
-        Setting::Jellyfin | Setting::Radarr | Setting::Sonarr => 0,
+        Setting::TabOrder | Setting::Jellyfin | Setting::Radarr | Setting::Sonarr => 0,
     }
 }
 
@@ -820,7 +960,7 @@ fn current_choice_index(setting: Setting) -> usize {
             .iter()
             .position(|&a| a == theme::active_accent())
             .unwrap_or(0),
-        Setting::Jellyfin | Setting::Radarr | Setting::Sonarr => 0,
+        Setting::TabOrder | Setting::Jellyfin | Setting::Radarr | Setting::Sonarr => 0,
     }
 }
 
@@ -911,7 +1051,7 @@ impl BackendEditor {
             ),
             Setting::Radarr => (config.radarr.host.clone(), None),
             Setting::Sonarr => (config.sonarr.host.clone(), None),
-            Setting::Theme | Setting::Accent => (String::new(), None),
+            Setting::Theme | Setting::Accent | Setting::TabOrder => (String::new(), None),
         };
         let mut fields = vec![Field::text(field::HOST, "Host", host)];
         if let Some(username) = username {
@@ -1078,6 +1218,55 @@ impl MediaApp for SettingsApp {
                     self.editor = Editor::BackendMenu { backend, cursor: 0 };
                 }
                 _ => {}
+            }
+            return None;
+        }
+
+        // The tab-reorder screen. Up/Down move the cursor, or the grabbed app
+        // itself; Enter grabs/drops. The mutation happens while the editor is
+        // borrowed, then persist/close run once that borrow has ended (the same
+        // dance as the language page below). Persisting on every move lets the
+        // shell (sharing the config mutex) reflow the tab bar on its next frame.
+        if let Editor::TabOrder {
+            order,
+            cursor,
+            grabbed,
+        } = &mut self.editor
+        {
+            let len = order.len();
+            let mut moved = false;
+            let mut close = false;
+            let mut quit = false;
+            match key.code {
+                KeyCode::Up if len > 0 => {
+                    let to = (*cursor + len - 1) % len;
+                    if *grabbed {
+                        order.swap(*cursor, to);
+                        moved = true;
+                    }
+                    *cursor = to;
+                }
+                KeyCode::Down if len > 0 => {
+                    let to = (*cursor + 1) % len;
+                    if *grabbed {
+                        order.swap(*cursor, to);
+                        moved = true;
+                    }
+                    *cursor = to;
+                }
+                KeyCode::Enter => *grabbed = !*grabbed,
+                KeyCode::Esc | KeyCode::Backspace => close = true,
+                KeyCode::Char('q') if key.modifiers.is_empty() => quit = true,
+                _ => {}
+            }
+            if moved {
+                self.persist_tab_order();
+            }
+            if close {
+                self.editor = Editor::None;
+            }
+            if quit {
+                return Some(ShellRequest::Quit);
             }
             return None;
         }
@@ -1284,7 +1473,8 @@ impl MediaApp for SettingsApp {
             Editor::None
             | Editor::Choice(_)
             | Editor::BackendMenu { .. }
-            | Editor::ConfirmRemove { .. } => false,
+            | Editor::ConfirmRemove { .. }
+            | Editor::TabOrder { .. } => false,
         }
     }
 
@@ -1323,6 +1513,11 @@ impl MediaApp for SettingsApp {
                 );
             }
             Editor::Language(editor) => self.draw_language(editor, frame, body),
+            Editor::TabOrder {
+                order,
+                cursor,
+                grabbed,
+            } => self.draw_tab_order(order, *cursor, *grabbed, body, frame.buffer_mut()),
         }
     }
 }
@@ -1392,6 +1587,20 @@ mod tests {
                 picker: Some(language_picker(1)),
             });
             terminal.draw(|f| settings.draw(f, f.area())).unwrap();
+            // The tab-reorder screen, cursor mid-list and a grabbed row.
+            let order: Vec<usize> = (0..crate::apps::TAB_CATALOG.len()).collect();
+            settings.editor = Editor::TabOrder {
+                order: order.clone(),
+                cursor: 1,
+                grabbed: false,
+            };
+            terminal.draw(|f| settings.draw(f, f.area())).unwrap();
+            settings.editor = Editor::TabOrder {
+                order,
+                cursor: 0,
+                grabbed: true,
+            };
+            terminal.draw(|f| settings.draw(f, f.area())).unwrap();
             settings.editor = Editor::None;
         }
     }
@@ -1414,6 +1623,12 @@ mod tests {
         assert!(!settings.capturing_text());
         settings.editor = Editor::ConfirmRemove {
             backend: Setting::Radarr,
+        };
+        assert!(!settings.capturing_text());
+        settings.editor = Editor::TabOrder {
+            order: vec![0, 1, 2, 3],
+            cursor: 0,
+            grabbed: false,
         };
         assert!(!settings.capturing_text());
         // A language page with the picker closed is navigable; opening the
@@ -2024,5 +2239,45 @@ mod tests {
         );
         settings.on_key(KeyEvent::from(KeyCode::Down));
         assert!(settings.notice.is_none());
+    }
+
+    #[test]
+    fn tab_order_screen_lists_all_apps_and_marks_unconfigured() {
+        // A default config configures no backend, so every backend tab is
+        // hidden; the reorder screen still lists all apps (Settings included)
+        // and marks the hidden ones so they can be placed for later.
+        let mut settings = app();
+        settings.open(Setting::TabOrder);
+        let text = draw_to_text(&mut settings);
+        for label in ["Jellyfin", "Radarr", "Sonarr", "Settings"] {
+            assert!(text.contains(label), "missing {label} in:\n{text}");
+        }
+        assert!(text.contains("(not set up)"), "{text}");
+    }
+
+    #[test]
+    fn tab_order_grab_and_move_persists_live() {
+        let (mut settings, path) = app_with_temp_config("tab-order");
+        settings.open(Setting::TabOrder);
+        assert!(matches!(
+            settings.editor,
+            Editor::TabOrder { grabbed: false, .. }
+        ));
+
+        // Moving the cursor without grabbing changes (and persists) nothing.
+        settings.on_key(KeyEvent::from(KeyCode::Down));
+        assert!(settings.config.lock().unwrap().tab_order.is_empty());
+
+        // Grab the row under the cursor (Radarr) and move it to the top; the
+        // order is persisted on the move, so the shell can reflow immediately.
+        settings.on_key(KeyEvent::from(KeyCode::Enter)); // grab
+        settings.on_key(KeyEvent::from(KeyCode::Up));
+        settings.on_key(KeyEvent::from(KeyCode::Enter)); // drop
+        assert_eq!(
+            settings.config.lock().unwrap().tab_order,
+            vec!["radarr", "jellyfin", "sonarr", "settings"]
+        );
+
+        let _ = std::fs::remove_file(path);
     }
 }
