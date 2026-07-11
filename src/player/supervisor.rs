@@ -18,6 +18,10 @@ use super::ticks::{seconds_to_ticks, ticks_to_seconds};
 use super::{PlayerCommand, PlayerEvent, TrackKind, override_key};
 
 const PROGRESS_REPORT_INTERVAL: Duration = Duration::from_secs(3);
+/// How long to wait for `mpv --version` to answer. A wedged mpv wrapper script
+/// must not block playback from ever starting, so the probe is bounded like
+/// every other external-process interaction (see the IPC connect poll).
+const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long to wait for mpv to exit after we ask it to quit.
 const QUIT_GRACE: Duration = Duration::from_secs(5);
 /// How long to wait for queued playback reports (typically the final stopped)
@@ -39,14 +43,19 @@ pub(crate) const SHUTDOWN_BUDGET: Duration = QUIT_GRACE
 static OLD_MPV: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
 
 async fn is_old_mpv() -> bool {
-    *OLD_MPV
-        .get_or_init(|| async {
-            match tokio::process::Command::new("mpv")
+    // `get_or_try_init` caches an `Ok` for the whole session but leaves the cell
+    // unset on `Err`, so a definitive answer (or a persistent spawn failure) is
+    // memoised while a transient timeout is retried on the next playback. That
+    // stops a single 5s hang from locking in "modern mpv" against a genuinely
+    // old binary for the rest of the session.
+    OLD_MPV
+        .get_or_try_init(|| async {
+            let probe = tokio::process::Command::new("mpv")
                 .arg("--version")
-                .output()
-                .await
-            {
-                Ok(output) => {
+                .kill_on_drop(true)
+                .output();
+            match tokio::time::timeout(VERSION_PROBE_TIMEOUT, probe).await {
+                Ok(Ok(output)) => {
                     let old = ipc::is_old_mpv_version(&String::from_utf8_lossy(&output.stdout));
                     if old {
                         tracing::warn!(
@@ -54,15 +63,26 @@ async fn is_old_mpv() -> bool {
                              prepended to the playlist"
                         );
                     }
-                    old
+                    Ok(old)
                 }
-                Err(err) => {
+                // A spawn failure (e.g. mpv missing) is persistent, so cache it.
+                Ok(Err(err)) => {
                     tracing::debug!(%err, "failed to run mpv --version");
-                    false
+                    Ok(false)
+                }
+                // Timing out (dropping the future) kills the child via
+                // `kill_on_drop`. Assume a modern mpv for this playback, but
+                // return `Err` so the transient result is not memoised.
+                Err(_) => {
+                    tracing::warn!("mpv --version timed out; assuming a modern mpv");
+                    Err(())
                 }
             }
         })
         .await
+        .ok()
+        .copied()
+        .unwrap_or(false)
 }
 
 /// The order items get loaded into mpv, which is also the order mpv assigns
@@ -396,8 +416,13 @@ pub(super) async fn run(
         }
     }
 
-    let mut pos = 0.0_f64;
     let mut current = items[index].clone();
+    // Seed `pos` with the selected item's resume position so a stop that lands
+    // before the first `start-file` (mpv boot / a stream that never loads)
+    // reports the resume ticks back, not 0, which would clobber the server-side
+    // resume point. The `start-file` handler re-sets `pos` the same way once
+    // playback actually begins.
+    let mut pos = ticks_to_seconds(display::resume_position_ticks(&current));
     let mut skippable: Vec<(f64, f64)> = Vec::new();
     let mut last_report = Instant::now();
     // Set on seek: send a progress report on the next time-pos even if the

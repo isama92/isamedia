@@ -910,7 +910,7 @@ impl Browse {
                         self.fetch_library_page(0, PAGE_SIZE);
                     }
                 }
-                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('s') => self.sort_menu = None,
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('v') => self.sort_menu = None,
                 _ => {}
             }
             return None;
@@ -1085,7 +1085,7 @@ impl Browse {
                 }
             }
 
-            KeyCode::Char('s') if self.sort_key_available() => {
+            KeyCode::Char('v') if self.sort_key_available() => {
                 self.sort_menu = Some(
                     SORT_OPTIONS
                         .iter()
@@ -1390,22 +1390,10 @@ impl Browse {
             y += 3;
         }
 
-        // Hand-drawn scrollbar in the rightmost column, like jfsh.
+        // Scrollbar in the rightmost column, like jfsh. Shares the guarded
+        // helper so a degenerate area can't underflow the edge arithmetic.
         if self.items.len() > items_per_page {
-            let x = area.x + area.width - 1;
-            let thumb = ((self.cursor as f64 / (self.items.len() - 1) as f64)
-                * (avail_height - 1) as f64)
-                .round() as usize;
-            for i in 0..avail_height {
-                let (symbol, style) = if i == thumb {
-                    ("█", Style::new().fg(theme::accent_color()))
-                } else {
-                    ("│", theme::dim())
-                };
-                buf[(x, area.y + i as u16)]
-                    .set_symbol(symbol)
-                    .set_style(style);
-            }
+            list::draw_scrollbar(buf, area, self.cursor, self.items.len());
         }
     }
 
@@ -1836,7 +1824,7 @@ impl Browse {
             }
         }
         if self.sort_key_available() {
-            entries.push(("s", "sort"));
+            entries.push(("v", "sort"));
         }
         entries.push((
             "?",
