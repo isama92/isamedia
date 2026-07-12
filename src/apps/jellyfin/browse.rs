@@ -889,7 +889,13 @@ impl Browse {
                 KeyCode::Esc => self.search_focused = false,
                 KeyCode::Enter | KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => {
                     self.search_focused = false;
-                    self.clear_list();
+                    // An empty query short-circuits in `fetch` without touching
+                    // the network; keep the (empty) list as is rather than
+                    // flashing `Loading...` for it.
+                    if !self.search.value().is_empty() {
+                        self.clear_list();
+                    }
+                    self.cursor = 0;
                     self.fetch();
                 }
                 _ => {
@@ -1107,8 +1113,10 @@ impl Browse {
                     && key.code == KeyCode::Esc
                     && !self.search.value().is_empty()
                 {
+                    // The now-empty query short-circuits in `fetch`, replacing
+                    // the list with an empty one immediately; no clear needed.
                     self.search.clear();
-                    self.clear_list();
+                    self.cursor = 0;
                     self.fetch();
                 }
             }
