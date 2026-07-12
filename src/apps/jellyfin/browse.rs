@@ -454,6 +454,15 @@ impl Browse {
         self.fetch_gen
     }
 
+    /// Drop the displayed list ahead of a fresh navigation so the body shows
+    /// `Loading...` instead of the previous view's items. Only navigation
+    /// call sites use this: position-preserving refreshes and page appends
+    /// keep the visible list until the result lands.
+    fn clear_list(&mut self) {
+        self.all_items.clear();
+        self.items.clear();
+    }
+
     pub fn fetch(&mut self) {
         // Libraries lists are paginated and go through their own path; the
         // episodes drill inside a shows library is the exception and loads
@@ -611,8 +620,9 @@ impl Browse {
 
     /// Reset per-level list state after moving between library levels, then
     /// load the first page of the level just entered. The previous level's
-    /// items stay visible until it arrives, like every other fetch.
+    /// items are dropped so the body shows `Loading...` until it arrives.
     fn enter_new_level(&mut self) {
+        self.clear_list();
         self.cursor = 0;
         self.lib_total = 0;
         self.filter.clear();
@@ -879,6 +889,7 @@ impl Browse {
                 KeyCode::Esc => self.search_focused = false,
                 KeyCode::Enter | KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => {
                     self.search_focused = false;
+                    self.clear_list();
                     self.fetch();
                 }
                 _ => {
@@ -901,6 +912,7 @@ impl Browse {
                         self.filter_focused = false;
                         self.filter.clear();
                         self.filter_active = false;
+                        self.clear_list();
                         self.cursor = 0;
                         self.fetch_library_page(0, PAGE_SIZE);
                     }
@@ -913,6 +925,7 @@ impl Browse {
                         if self.filter.value().is_empty() {
                             self.filter_active = false;
                         }
+                        self.clear_list();
                         self.cursor = 0;
                         self.fetch_library_page(0, PAGE_SIZE);
                     }
@@ -967,6 +980,7 @@ impl Browse {
                     let sort = SORT_OPTIONS.get(selected).copied().unwrap_or(Sort::DEFAULT);
                     if sort != self.collection_sort {
                         self.collection_sort = sort;
+                        self.clear_list();
                         self.cursor = 0;
                         self.fetch_library_page(0, PAGE_SIZE);
                     }
@@ -1027,6 +1041,7 @@ impl Browse {
 
             KeyCode::Tab if !self.drilled_in() => {
                 self.tab = self.tab.next();
+                self.clear_list();
                 self.cursor = 0;
                 self.lib_level = LibraryLevel::Root;
                 self.lib_total = 0;
@@ -1034,6 +1049,7 @@ impl Browse {
             }
             KeyCode::BackTab if !self.drilled_in() => {
                 self.tab = self.tab.prev();
+                self.clear_list();
                 self.cursor = 0;
                 self.lib_level = LibraryLevel::Root;
                 self.lib_total = 0;
@@ -1064,6 +1080,7 @@ impl Browse {
                     self.filter.clear();
                     self.filter_active = false;
                     if self.uses_server_filter() {
+                        self.clear_list();
                         self.cursor = 0;
                         self.fetch_library_page(0, PAGE_SIZE);
                     } else {
@@ -1091,6 +1108,7 @@ impl Browse {
                     && !self.search.value().is_empty()
                 {
                     self.search.clear();
+                    self.clear_list();
                     self.fetch();
                 }
             }
@@ -1404,7 +1422,12 @@ impl Browse {
     fn draw_list(&self, frame: &mut Frame, area: Rect) {
         let buf = frame.buffer_mut();
         if self.items.is_empty() {
-            Line::styled("  No items.", theme::dim()).render(area, buf);
+            let message = if self.loading {
+                "  Loading..."
+            } else {
+                "  No items."
+            };
+            Line::styled(message, theme::dim()).render(area, buf);
             return;
         }
 
