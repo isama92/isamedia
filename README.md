@@ -9,6 +9,8 @@ isamedia is a Rust rewrite and extension of
 multi-app shell and non-blocking playback (the UI stays interactive while mpv
 runs).
 
+![isamedia demo](assets/demo.gif)
+
 ## Features
 
 ### Jellyfin
