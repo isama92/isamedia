@@ -681,6 +681,34 @@ impl Browse {
         false
     }
 
+    /// The series item behind an `o` press on a hub episode has landed: drill
+    /// into it exactly as Enter does over a Series, then fetch its episodes.
+    /// Same staleness/expiry contract as `on_items_loaded`.
+    #[must_use]
+    pub fn on_series_loaded(
+        &mut self,
+        fetch_gen: u64,
+        result: Result<Box<MediaItem>, crate::jellyfin::Error>,
+    ) -> bool {
+        if fetch_gen != self.fetch_gen {
+            return false; // stale response from a superseded fetch
+        }
+        self.loading = false;
+        match result {
+            Ok(series) => {
+                self.current_series = Some(*series);
+                self.series_view = SeriesView::Seasons;
+                self.season_cursor = 0;
+                self.seasons.clear();
+                self.cursor = 0;
+                self.fetch(); // loads the series' episodes -> build_seasons
+            }
+            Err(crate::jellyfin::Error::Unauthorized) => return true,
+            Err(err) => self.error = Some(err.to_string()),
+        }
+        false
+    }
+
     /// Same contract as `on_items_loaded`, for Libraries-tab pages. Unlike
     /// `on_items_loaded` this must NOT clear the filter: either the request
     /// was issued with it (server-side filtering) or the client-side filter
@@ -1183,6 +1211,24 @@ impl Browse {
                 self.info_open = true;
                 self.info_scroll = 0;
             }
+            KeyCode::Char('o') => {
+                // From a hub episode (Resume/Next Up), open its show's page.
+                // The episode carries only the series id, so the series item is
+                // fetched first and the drill-in happens on `SeriesLoaded`.
+                if let Some(series_id) = self
+                    .current_item()
+                    .filter(|item| item.kind == ItemKind::Episode)
+                    .and_then(|item| item.series_id.clone())
+                {
+                    let fetch_gen = self.begin_fetch();
+                    let client = self.client.clone();
+                    let sender = self.sender.clone();
+                    tokio::spawn(async move {
+                        let result = client.get_item(&series_id).await.map(Box::new);
+                        sender.send(Msg::SeriesLoaded { fetch_gen, result });
+                    });
+                }
+            }
             KeyCode::Char('r') => self.fetch(),
             KeyCode::Char('?') => self.show_full_help = !self.show_full_help,
             KeyCode::Char('q') => return Some(BrowseAction::Quit),
@@ -1494,43 +1540,56 @@ impl Browse {
         }
     }
 
+    /// Shared detail-header body: title, the `item_description` line, an
+    /// optional genres line, a blank, then the wrapped overview. Kept in one
+    /// place so the `i` info panel and the pinned series header stay identical;
+    /// each caller owns its own layout (the info panel scrolls the full body,
+    /// the series header clamps its height and pre-clamps the overview).
+    fn detail_header_lines(
+        item: &MediaItem,
+        overview: &str,
+        text_width: usize,
+    ) -> Vec<Line<'static>> {
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        lines.push(Line::from(Span::styled(
+            format!("  {}", display::item_title(item)),
+            Style::new()
+                .fg(theme::accent_bright())
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(Span::styled(
+            format!("  {}", display::item_description(item)),
+            theme::dim(),
+        )));
+        if !item.genres.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!("  Genres: {}", item.genres.join(", ")),
+                theme::dim(),
+            )));
+        }
+        lines.push(Line::from(""));
+        for line in wrap_text(overview, text_width) {
+            lines.push(Line::from(Span::styled(
+                format!("  {line}"),
+                Style::new().fg(theme::fg()),
+            )));
+        }
+        lines
+    }
+
     /// The selected item's info: a title, the shared metadata line, genres, and
     /// the wrapped overview. Scrolls with the info-panel modal keys.
     fn draw_info(&mut self, frame: &mut Frame, area: Rect) {
         let text_width = area.width.saturating_sub(4) as usize;
         // Build the owned lines first so the borrow of `self.items` is released
         // before we mutate `self.info_scroll` below.
-        let lines: Vec<Line> = {
+        let lines = {
             let Some(item) = self.items.get(self.cursor) else {
                 self.info_open = false;
                 return;
             };
-            let mut lines: Vec<Line> = Vec::new();
-            lines.push(Line::from(Span::styled(
-                format!("  {}", display::item_title(item)),
-                Style::new()
-                    .fg(theme::accent_bright())
-                    .add_modifier(Modifier::BOLD),
-            )));
-            lines.push(Line::from(Span::styled(
-                format!("  {}", display::item_description(item)),
-                theme::dim(),
-            )));
-            if !item.genres.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    format!("  Genres: {}", item.genres.join(", ")),
-                    theme::dim(),
-                )));
-            }
-            lines.push(Line::from(""));
             let overview = item.overview.as_deref().unwrap_or("No overview available.");
-            for line in wrap_text(overview, text_width) {
-                lines.push(Line::from(Span::styled(
-                    format!("  {line}"),
-                    Style::new().fg(theme::fg()),
-                )));
-            }
-            lines
+            Self::detail_header_lines(item, overview, text_width)
         };
 
         let buf = frame.buffer_mut();
@@ -1559,17 +1618,17 @@ impl Browse {
         }
     }
 
-    /// The pinned show-info header shown across all three series sub-views:
-    /// title, a "year · rating" meta line, and the show overview (clamped so a
-    /// very long synopsis can't push the bottom list off screen). Returns the
-    /// leftover `Rect` below it for the sub-view's list.
+    /// The pinned show-info header shown across all three series sub-views. It
+    /// mirrors the `i` info panel (title, the `item_description` line, genres,
+    /// overview) so a show reads the same however it is opened, but clamps the
+    /// overview so a very long synopsis can't push the bottom list off screen.
+    /// Returns the leftover `Rect` below it for the sub-view's list.
     fn draw_series_header(&self, frame: &mut Frame, area: Rect, series: &MediaItem) -> Rect {
         // Clamp the overview by characters (bounds the header on any terminal),
         // and always keep at least a few rows for the bottom list.
         const OVERVIEW_MAX_CHARS: usize = 600;
         const MIN_LIST_ROWS: u16 = 4;
 
-        let buf = frame.buffer_mut();
         let text_width = area.width.saturating_sub(4) as usize;
 
         let overview_raw = series
@@ -1583,37 +1642,11 @@ impl Browse {
             overview_raw.to_string()
         };
 
-        let mut lines: Vec<Line> = Vec::new();
-        lines.push(Line::from(Span::styled(
-            format!("  {}", display::item_title(series)),
-            Style::new()
-                .fg(theme::accent_bright())
-                .add_modifier(Modifier::BOLD),
-        )));
-        let mut meta: Vec<String> = Vec::new();
-        if let Some(year) = series.production_year {
-            meta.push(year.to_string());
-        }
-        if let Some(rating) = series.community_rating
-            && rating > 0.0
-        {
-            meta.push(format!("{rating:.1}"));
-        }
-        if !meta.is_empty() {
-            lines.push(Line::from(Span::styled(
-                format!("  {}", meta.join(" · ")),
-                theme::dim(),
-            )));
-        }
-        lines.push(Line::from(""));
-        for line in wrap_text(&overview, text_width) {
-            lines.push(Line::from(Span::styled(
-                format!("  {line}"),
-                Style::new().fg(theme::fg()),
-            )));
-        }
+        let mut lines = Self::detail_header_lines(series, &overview, text_width);
+        // Trailing blank separates the header from the bottom list.
         lines.push(Line::from(""));
 
+        let buf = frame.buffer_mut();
         let max_header = area.height.saturating_sub(MIN_LIST_ROWS).max(1) as usize;
         let header_h = lines.len().min(max_header);
         for (row, line) in lines.into_iter().take(header_h).enumerate() {
@@ -1904,6 +1937,13 @@ impl Browse {
         if self.current_item().is_some_and(info_available) {
             entries.push(("i", "info"));
         }
+        if !self.drilled_in()
+            && self
+                .current_item()
+                .is_some_and(|item| item.kind == ItemKind::Episode)
+        {
+            entries.push(("o", "open show"));
+        }
         if self.tab == Tab::Search && self.current_series.is_none() {
             entries.push(("/", "search"));
             if !self.search.value().is_empty() {
@@ -2051,6 +2091,56 @@ mod tests {
         assert_eq!(seasons[2].number, None);
         assert_eq!((seasons[2].episode_count, seasons[2].watched_count), (1, 1));
         assert!(group_seasons(&[]).is_empty());
+    }
+
+    fn series(genres: &[&str]) -> MediaItem {
+        MediaItem {
+            id: "s".into(),
+            name: Some("The Expanse".into()),
+            kind: ItemKind::Series,
+            production_year: Some(2015),
+            community_rating: Some(8.4),
+            genres: genres.iter().map(|g| g.to_string()).collect(),
+            overview: Some("Survival.".into()),
+            ..Default::default()
+        }
+    }
+
+    /// The line texts of a header, each stripped of its leading indent.
+    fn header_text(item: &MediaItem, overview: &str) -> Vec<String> {
+        Browse::detail_header_lines(item, overview, 40)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+                    .trim()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn detail_header_lines_match_the_info_layout() {
+        // Title, the shared "Series | Rating" line, genres, a blank, overview:
+        // the same block the info panel and the series header now share.
+        let text = header_text(&series(&["Sci-Fi", "Drama"]), "Survival.");
+        assert_eq!(text[0], "The Expanse (2015)");
+        assert_eq!(text[1], "Series | Rating: 8.4");
+        assert_eq!(text[2], "Genres: Sci-Fi, Drama");
+        assert_eq!(text[3], "");
+        assert!(text[4].contains("Survival."));
+    }
+
+    #[test]
+    fn detail_header_lines_omit_genres_when_absent() {
+        let text = header_text(&series(&[]), "Survival.");
+        assert_eq!(text[0], "The Expanse (2015)");
+        assert_eq!(text[1], "Series | Rating: 8.4");
+        // No genres line: the blank separator follows the description directly.
+        assert_eq!(text[2], "");
+        assert!(text[3].contains("Survival."));
     }
 
     #[test]

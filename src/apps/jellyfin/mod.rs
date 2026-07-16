@@ -517,6 +517,13 @@ impl MediaApp for JellyfinApp {
                     self.on_session_expired();
                 }
             }
+            Msg::SeriesLoaded { fetch_gen, result } => {
+                if let Screen::Browse(browse) = &mut self.screen
+                    && browse.on_series_loaded(fetch_gen, result)
+                {
+                    self.on_session_expired();
+                }
+            }
             Msg::LibraryItemsLoaded {
                 fetch_gen,
                 start_index,
