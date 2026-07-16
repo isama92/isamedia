@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.14](https://github.com/isama92/isamedia/compare/v0.1.13...v0.1.14) - 2026-07-16
+
+### Added
+
+- *(jellyfin)* open a show from a hub episode and align the seasons header ([#32](https://github.com/isama92/isamedia/pull/32))
+
+### Other
+
+- add demo gif to README ([#30](https://github.com/isama92/isamedia/pull/30))
+
 ## [0.1.13](https://github.com/isama92/isamedia/compare/v0.1.12...v0.1.13) - 2026-07-12
 
 ### Fixed
