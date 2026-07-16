@@ -268,6 +268,19 @@ impl Client {
         .await
     }
 
+    /// A single item by id, with the fields the show header needs. Opening a
+    /// show from a hub episode starts with only the series id, not the series
+    /// item itself, so it is fetched here. Unlike the list endpoints this
+    /// returns a bare item, not an `ItemsResponse`.
+    pub async fn get_item(&self, id: &str) -> Result<MediaItem, Error> {
+        self.request(
+            Method::GET,
+            &format!("/Users/{}/Items/{id}", self.user_id),
+            &[("fields", "Overview,Genres")],
+        )
+        .await
+    }
+
     pub async fn search(&self, query: &str) -> Result<Vec<MediaItem>, Error> {
         self.get_items(
             "/Items",

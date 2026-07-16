@@ -26,6 +26,15 @@ pub enum Msg {
         limit: usize,
         result: Result<ItemsResponse, Error>,
     },
+    /// Result of loading a single series item, to open a show from a hub
+    /// episode (which carries only the series id, not the series item).
+    /// `fetch_gen` drops a result superseded by a newer navigation. The item is
+    /// boxed so this variant doesn't inflate `Msg`'s size (an unboxed
+    /// `MediaItem` is far larger than the other variants' payloads).
+    SeriesLoaded {
+        fetch_gen: u64,
+        result: Result<Box<MediaItem>, Error>,
+    },
     /// Result of a watched/unwatched toggle; `fetch_gen` is the view
     /// generation the toggle was issued from, so a result landing after the
     /// user moved to another tab or series is dropped.
