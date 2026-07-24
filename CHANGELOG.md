@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.15](https://github.com/isama92/isamedia/compare/v0.1.14...v0.1.15) - 2026-07-24
+
+### Other
+
+- bump tokio from 1.52.3 to 1.53.1 ([#42](https://github.com/isama92/isamedia/pull/42))
+- bump clap from 4.6.1 to 4.6.4 ([#41](https://github.com/isama92/isamedia/pull/41))
+- bump thiserror from 2.0.18 to 2.0.19 ([#40](https://github.com/isama92/isamedia/pull/40))
+- bump actions/checkout from 7.0.0 to 7.0.1 ([#39](https://github.com/isama92/isamedia/pull/39))
+- bump uuid from 1.23.4 to 1.24.0 ([#37](https://github.com/isama92/isamedia/pull/37))
+- bump toml from 1.1.2+spec-1.1.0 to 1.1.3+spec-1.1.0 ([#35](https://github.com/isama92/isamedia/pull/35))
+- bump release-plz/action from 0.5.130 to 0.5.131 ([#34](https://github.com/isama92/isamedia/pull/34))
+- updated license
+
 ## [0.1.14](https://github.com/isama92/isamedia/compare/v0.1.13...v0.1.14) - 2026-07-16
 
 ### Added
