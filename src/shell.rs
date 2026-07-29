@@ -12,9 +12,9 @@ use ratatui::widgets::Widget;
 use ratatui::{DefaultTerminal, Frame};
 use tokio::sync::mpsc;
 
-use crate::app::{MediaApp, ShellRequest};
+use crate::app::{AppId, MediaApp, ShellRequest};
 use crate::config::Config;
-use crate::event::Event;
+use crate::event::{AppEvent, Event};
 use crate::ui::theme;
 
 pub struct Shell {
@@ -148,11 +148,7 @@ impl Shell {
                         app.on_tick();
                     }
                 }
-                Event::App(app_event) => {
-                    if let Some(app) = self.apps.iter_mut().find(|app| app.id() == app_event.app) {
-                        app.on_event(app_event.payload);
-                    }
-                }
+                Event::App(app_event) => self.on_app_event(app_event),
             }
             if self.should_quit {
                 let mut needs_grace = false;
@@ -183,7 +179,9 @@ impl Shell {
             match tokio::time::timeout_at(deadline, self.rx.recv()).await {
                 Ok(Some(Event::App(app_event))) => {
                     if let Some(app) = self.apps.iter_mut().find(|app| app.id() == app_event.app) {
-                        app.on_event(app_event.payload);
+                        // Any request is dropped: the UI is already finished, so
+                        // switching tabs now would only redraw a dying frame.
+                        let _ = app.on_event(app_event.payload);
                     }
                 }
                 // Ignore keys and ticks; the UI is already done.
@@ -243,9 +241,38 @@ impl Shell {
             }
         }
         if let Some(request) = self.apps[self.active].on_key(key) {
-            match request {
-                ShellRequest::Quit => self.should_quit = true,
-            }
+            self.handle_request(request);
+        }
+    }
+
+    /// Route a message to the app it names. Unlike a key, this can reach an app
+    /// that is not the active tab, which is how an app being jumped to gets to
+    /// ask for focus once it has found what it was sent looking for.
+    fn on_app_event(&mut self, app_event: AppEvent) {
+        let Some(app) = self.apps.iter_mut().find(|app| app.id() == app_event.app) else {
+            return;
+        };
+        if let Some(request) = app.on_event(app_event.payload) {
+            self.handle_request(request);
+        }
+    }
+
+    fn handle_request(&mut self, request: ShellRequest) {
+        match request {
+            ShellRequest::Quit => self.should_quit = true,
+            ShellRequest::Focus(id) => self.focus(id),
+        }
+    }
+
+    /// Make `id` the active tab, ignoring an app with no visible tab: an
+    /// unconfigured app is deliberately unreachable by the switching shortcuts,
+    /// and focusing it would strand the user on a tab they cannot see in the
+    /// tab bar.
+    fn focus(&mut self, id: AppId) {
+        if let Some(target) = self.apps.iter().position(|app| app.id() == id)
+            && self.visible_indices().contains(&target)
+        {
+            self.switch_to(target);
         }
     }
 
@@ -385,6 +412,9 @@ mod tests {
         removed: Arc<Mutex<usize>>,
         stopped: Arc<AtomicBool>,
         keys: Arc<Mutex<Vec<KeyEvent>>>,
+        /// Returned from `on_event`, so a test can stand in for an app that
+        /// asks for focus once an async result lands.
+        event_request: Option<ShellRequest>,
     }
 
     impl MediaApp for MockApp {
@@ -404,7 +434,9 @@ mod tests {
             self.keys.lock().unwrap().push(key);
             None
         }
-        fn on_event(&mut self, _payload: Box<dyn Any + Send>) {}
+        fn on_event(&mut self, _payload: Box<dyn Any + Send>) -> Option<ShellRequest> {
+            self.event_request
+        }
         fn stop_player(&mut self) -> bool {
             if self.has_player {
                 self.stopped.store(true, Ordering::SeqCst);
@@ -441,6 +473,7 @@ mod tests {
             removed: handles.removed.clone(),
             stopped: handles.stopped.clone(),
             keys: handles.keys.clone(),
+            event_request: None,
         };
         (app, handles)
     }
@@ -464,6 +497,46 @@ mod tests {
 
     fn press_s() -> KeyEvent {
         KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)
+    }
+
+    /// The mock ignores the payload; its `on_event` return value is the point.
+    fn app_event(app: AppId) -> AppEvent {
+        AppEvent {
+            app,
+            payload: Box::new(()),
+        }
+    }
+
+    #[test]
+    fn a_focus_request_from_on_event_switches_tab() {
+        // The reveal path: Jellyfin is active, Radarr resolves the item in the
+        // background and asks for focus itself, since only it knows it found it.
+        let (jellyfin, _) = mock("jellyfin", false, false);
+        let (mut radarr, _) = mock("radarr", false, false);
+        radarr.event_request = Some(ShellRequest::Focus("radarr"));
+        let mut shell = shell(vec![Box::new(jellyfin), Box::new(radarr)]);
+        assert_eq!(shell.active, 0);
+
+        shell.on_app_event(app_event("radarr"));
+
+        assert_eq!(
+            shell.active, 1,
+            "the app that asked for focus should be active"
+        );
+    }
+
+    #[test]
+    fn a_focus_request_for_a_hidden_tab_is_ignored() {
+        let (jellyfin, _) = mock("jellyfin", false, false);
+        let (mut radarr, radarr_handles) = mock("radarr", false, false);
+        radarr.event_request = Some(ShellRequest::Focus("radarr"));
+        // Unconfigured before the shell is built, so it never gets a tab.
+        radarr_handles.configured.store(false, Ordering::SeqCst);
+        let mut shell = shell(vec![Box::new(jellyfin), Box::new(radarr)]);
+
+        shell.on_app_event(app_event("radarr"));
+
+        assert_eq!(shell.active, 0, "an unconfigured app has no tab to focus");
     }
 
     #[test]

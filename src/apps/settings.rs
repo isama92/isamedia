@@ -1411,14 +1411,14 @@ impl MediaApp for SettingsApp {
         None
     }
 
-    fn on_event(&mut self, payload: Box<dyn Any + Send>) {
+    fn on_event(&mut self, payload: Box<dyn Any + Send>) -> Option<ShellRequest> {
         let Ok(msg) = payload.downcast::<Msg>() else {
-            return;
+            return None;
         };
         match *msg {
             Msg::SaveDone { save_gen, result } => {
                 if save_gen != self.save_gen {
-                    return; // superseded or cancelled
+                    return None; // superseded or cancelled
                 }
                 match result {
                     Ok(()) => {
@@ -1428,7 +1428,7 @@ impl MediaApp for SettingsApp {
                         // so they need no signal.)
                         let backend = match &self.editor {
                             Editor::Backend(editor) => editor.backend,
-                            _ => return,
+                            _ => return None,
                         };
                         if backend == Setting::Jellyfin {
                             self.jellyfin_reauth.fetch_add(1, Ordering::Relaxed);
@@ -1453,7 +1453,7 @@ impl MediaApp for SettingsApp {
                 // (remove_backend and its spawned task), so a superseding
                 // save only suppresses the UI notice, never the record.
                 if save_gen != self.save_gen {
-                    return; // superseded by a newer save/removal
+                    return None; // superseded by a newer save/removal
                 }
                 // The in-memory config is cleared either way, so the tab is
                 // gone for this session; a leftover keyring entry is
@@ -1473,6 +1473,8 @@ impl MediaApp for SettingsApp {
                 });
             }
         }
+        // Settings never needs the shell to act on an async result.
+        None
     }
 
     fn capturing_text(&self) -> bool {

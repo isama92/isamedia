@@ -3,6 +3,7 @@ pub mod delete_prompt;
 pub mod downloads;
 pub mod jellyfin;
 pub mod radarr;
+pub mod reveal;
 pub mod settings;
 pub mod sonarr;
 

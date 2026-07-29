@@ -17,6 +17,7 @@ use ratatui::text::Line;
 use ratatui::widgets::Widget;
 
 use crate::app::{AppId, MediaApp, ShellRequest};
+use crate::apps::reveal::{RevealFailed, RevealMiss, RevealOutcome, RevealRequest};
 use crate::config::Config;
 use crate::event::AppSender;
 use crate::radarr::{Client, Error};
@@ -51,6 +52,10 @@ pub struct RadarrApp {
     /// poll while hidden. Tracked on the app (not just the browse) so a browse
     /// created while the tab is in the background starts paused too.
     active: bool,
+    /// A reveal from another tab waiting on this app's library. Held on the app
+    /// rather than the browse because a reveal can arrive before the browse
+    /// exists — triggering the connect that creates it is the point.
+    pending_reveal: Option<RevealRequest>,
 }
 
 impl RadarrApp {
@@ -63,6 +68,57 @@ impl RadarrApp {
             auth_gen: 0,
             browse_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             active: false,
+            pending_reveal: None,
+        }
+    }
+
+    /// Get this app connecting without claiming to be the active tab, so a
+    /// reveal can load the library while the user is still on the tab they
+    /// pressed `u` on. Leaves the screen alone when no host is stored: a reveal
+    /// must not conjure a setup form onto a tab nobody is looking at.
+    fn ensure_started(&mut self) {
+        if !matches!(self.screen, Screen::Boot) {
+            return;
+        }
+        let host = self.config.lock().unwrap().radarr.host.clone();
+        if host.is_empty() {
+            return;
+        }
+        self.screen = Screen::Connecting;
+        self.spawn_connect(host, None);
+    }
+
+    /// Resolve a waiting reveal now that something may have changed. Called
+    /// after every connect and every movie list, so a request that arrived
+    /// before the library did still gets its answer.
+    fn try_pending_reveal(&mut self) -> Option<ShellRequest> {
+        let request = self.pending_reveal.take()?;
+        let outcome = match &mut self.screen {
+            Screen::Browse(browse) => browse.reveal(&request),
+            // The connect in flight will retry this when it lands.
+            Screen::Connecting => RevealOutcome::Waiting,
+            // Never connected, or the key was rejected and we are back on the
+            // form: no library is coming.
+            Screen::Boot | Screen::Setup(_) => RevealOutcome::Missed(RevealMiss::Unavailable),
+        };
+        match outcome {
+            // Focus only now, with the detail page already open, so the user
+            // never sees the list flash by first.
+            RevealOutcome::Opened => Some(ShellRequest::Focus(self.id())),
+            RevealOutcome::Waiting => {
+                self.pending_reveal = Some(request);
+                None
+            }
+            RevealOutcome::Missed(miss) => {
+                self.sender.send_to(
+                    request.origin,
+                    RevealFailed {
+                        reveal_gen: request.reveal_gen,
+                        reason: miss.reason(request.kind.app_title()),
+                    },
+                );
+                None
+            }
         }
     }
 
@@ -195,13 +251,11 @@ impl MediaApp for RadarrApp {
 
     fn activate(&mut self) {
         self.active = true;
-        if let Screen::Boot = self.screen {
-            let host = self.config.lock().unwrap().radarr.host.clone();
-            if host.is_empty() {
+        if matches!(self.screen, Screen::Boot) {
+            self.ensure_started();
+            if matches!(self.screen, Screen::Boot) {
+                // Still Boot: no host stored, so ask the user for one.
                 self.screen = Screen::Setup(self.setup_form());
-            } else {
-                self.screen = Screen::Connecting;
-                self.spawn_connect(host, None);
             }
         } else if let Screen::Browse(browse) = &mut self.screen {
             browse.set_active(true);
@@ -250,16 +304,32 @@ impl MediaApp for RadarrApp {
         }
     }
 
-    fn on_event(&mut self, payload: Box<dyn Any + Send>) {
-        let Ok(msg) = payload.downcast::<Msg>() else {
-            return;
+    fn on_event(&mut self, payload: Box<dyn Any + Send>) -> Option<ShellRequest> {
+        let msg = match payload.downcast::<Msg>() {
+            Ok(msg) => msg,
+            // Not one of this app's own messages. The only other payload it
+            // accepts is another tab asking it to open an item; anything else is
+            // a foreign type and ignored.
+            Err(payload) => {
+                if let Ok(request) = payload.downcast::<RevealRequest>() {
+                    // A single slot, so pressing `u` again supersedes the
+                    // request in flight rather than queueing behind it.
+                    self.pending_reveal = Some(*request);
+                    self.ensure_started();
+                    return self.try_pending_reveal();
+                }
+                return None;
+            }
         };
         match *msg {
             Msg::ConnectDone { auth_gen, result } => {
                 if auth_gen != self.auth_gen {
-                    return;
+                    return None;
                 }
                 self.on_connect_done(result);
+                // Either a browse now exists to resolve a waiting reveal
+                // against, or the attempt failed and it has to be told.
+                return self.try_pending_reveal();
             }
             // For every result kind, the browse checks staleness first and
             // only reports a key rejection for a CURRENT-generation 401; a
@@ -272,6 +342,8 @@ impl MediaApp for RadarrApp {
                 {
                     self.on_session_expired();
                 }
+                // The library a waiting reveal needs may have just landed.
+                return self.try_pending_reveal();
             }
             Msg::QueueLoaded { queue_gen, result } => {
                 if let Screen::Browse(browse) = &mut self.screen
@@ -356,6 +428,7 @@ impl MediaApp for RadarrApp {
                 }
             }
         }
+        None
     }
 
     /// Surface the background auto-search status in the shell status bar, so

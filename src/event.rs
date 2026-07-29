@@ -34,9 +34,24 @@ impl AppSender {
         Self { app, tx }
     }
 
+    /// The app this sender belongs to, for a message that has to name its own
+    /// sender so the receiver can answer it.
+    pub fn app(&self) -> AppId {
+        self.app
+    }
+
     pub fn send<M: Any + Send>(&self, msg: M) {
+        self.send_to(self.app, msg);
+    }
+
+    /// Address another app, for the rare message that crosses tabs (the
+    /// Jellyfin `u` binding asking Radarr/Sonarr to open an item, and the
+    /// answer coming back). The receiver downcasts as usual and ignores
+    /// payloads it does not recognise, so this cannot confuse an app that
+    /// knows nothing about the sender.
+    pub fn send_to<M: Any + Send>(&self, app: AppId, msg: M) {
         let _ = self.tx.send(Event::App(AppEvent {
-            app: self.app,
+            app,
             payload: Box::new(msg),
         }));
     }

@@ -1,6 +1,8 @@
 //! Hand-rolled DTOs for the handful of Jellyfin API shapes isamedia uses.
 //! Jellyfin serializes JSON in PascalCase.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -51,6 +53,35 @@ pub struct MediaItem {
     pub overview: Option<String>,
     /// Genre names; only returned when `fields=Genres` is requested.
     pub genres: Vec<String>,
+    /// External database ids (`{"Tmdb": "603", "Imdb": "tt0133093"}`); only
+    /// returned when `fields=ProviderIds` is requested. Left untyped because
+    /// Jellyfin's key set grows with its metadata plugins; read it through
+    /// `tmdb_id`/`tvdb_id` rather than indexing, since the key casing has
+    /// varied across server versions.
+    pub provider_ids: Option<HashMap<String, String>>,
+}
+
+impl MediaItem {
+    /// Look up an external id by provider name, ignoring key casing.
+    fn provider_id(&self, provider: &str) -> Option<&str> {
+        self.provider_ids
+            .as_ref()?
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(provider))
+            .map(|(_, value)| value.as_str())
+    }
+
+    /// TMDB id, as Radarr keys its movies. `None` when the field was not
+    /// requested, the server has no id for the item, or the id is unparseable
+    /// (Jellyfin sends these as strings, and a plugin can leave junk behind).
+    pub fn tmdb_id(&self) -> Option<i64> {
+        self.provider_id("Tmdb")?.parse().ok()
+    }
+
+    /// TVDB id, as Sonarr keys its series. Same caveats as `tmdb_id`.
+    pub fn tvdb_id(&self) -> Option<i64> {
+        self.provider_id("Tvdb")?.parse().ok()
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -272,5 +303,31 @@ mod tests {
         assert_eq!(item.parent_index_number, Some(1));
         assert_eq!(item.media_streams.len(), 2);
         assert_eq!(item.media_streams[1].is_external, Some(true));
+    }
+
+    #[test]
+    fn reads_provider_ids_whatever_the_key_casing() {
+        let raw = r#"{
+            "Id": "m1",
+            "Type": "Movie",
+            "ProviderIds": {"TMDB": "603", "tvdb": "1234", "Imdb": "tt0133093"}
+        }"#;
+        let item: MediaItem = serde_json::from_str(raw).unwrap();
+        assert_eq!(item.tmdb_id(), Some(603));
+        assert_eq!(item.tvdb_id(), Some(1234));
+    }
+
+    #[test]
+    fn provider_ids_absent_or_unparseable() {
+        // The field is only returned when asked for, so every caller has to
+        // cope with it missing entirely.
+        let bare: MediaItem = serde_json::from_str(r#"{"Id": "m2", "Type": "Movie"}"#).unwrap();
+        assert_eq!(bare.tmdb_id(), None);
+        assert_eq!(bare.tvdb_id(), None);
+        // Present but not a number: a metadata plugin left junk behind.
+        let junk: MediaItem =
+            serde_json::from_str(r#"{"Id": "m3", "Type": "Movie", "ProviderIds": {"Tmdb": ""}}"#)
+                .unwrap();
+        assert_eq!(junk.tmdb_id(), None);
     }
 }

@@ -16,6 +16,7 @@ use ratatui::widgets::Widget;
 use crate::apps::auto_search::{self, Monitor, TickAction};
 use crate::apps::delete_prompt::{self, DeletePrompt};
 use crate::apps::downloads;
+use crate::apps::reveal::{self, RevealMiss, RevealOutcome, RevealRequest};
 use crate::event::AppSender;
 use crate::sonarr::display::{self, EpStatus, SERIES_SORTS, SeriesSort};
 use crate::sonarr::models::{EpisodeFile, Season};
@@ -343,6 +344,10 @@ pub struct Browse {
     /// Whether this is the visible tab; the periodic poll pauses while hidden.
     active: bool,
     has_fetched: bool,
+    /// Whether a series list has actually landed. Distinct from `has_fetched`,
+    /// which flips when a fetch *starts*: a reveal has to know the library is
+    /// really in memory before it can say a show is not there.
+    list_loaded: bool,
     tick_count: u32,
     spinner_frame: usize,
     /// Terminal height from the last draw, for page jumps and scroll clamps.
@@ -403,6 +408,7 @@ impl Browse {
             last_poll_tick: 0,
             active: true,
             has_fetched: false,
+            list_loaded: false,
             tick_count: 0,
             spinner_frame: 0,
             last_height: 24,
@@ -592,6 +598,7 @@ impl Browse {
                     *series = updated.clone();
                 }
                 self.all_series = list;
+                self.list_loaded = true;
                 self.apply_filter();
             }
             Err(crate::sonarr::Error::Unauthorized) => return true,
@@ -1131,6 +1138,49 @@ impl Browse {
         if self.series_cursor >= self.filtered.len() {
             self.series_cursor = 0;
         }
+    }
+
+    /// Open the show page for a series the Jellyfin tab asked to reveal.
+    ///
+    /// The whole decision lives here because this app owns the library: the
+    /// caller only needs to know whether to ask for focus, keep waiting, or
+    /// report back.
+    pub fn reveal(&mut self, request: &RevealRequest) -> RevealOutcome {
+        if !self.list_loaded {
+            // Every landing list retries the request, so waiting costs nothing
+            // while a fetch is still in flight. One that has stopped without
+            // landing is not coming, and waiting on it would strand the other
+            // tab on "looking up...".
+            return if self.loading {
+                RevealOutcome::Waiting
+            } else {
+                RevealOutcome::Missed(RevealMiss::Unavailable)
+            };
+        }
+        let candidates = self.all_series.iter().map(|series| reveal::Candidate {
+            external_id: series.tvdb_id,
+            title: series.title.as_deref(),
+            year: series.year,
+        });
+        let index = match reveal::match_index(candidates, request) {
+            Ok(index) => index,
+            Err(miss) => return RevealOutcome::Missed(miss),
+        };
+        // Drop any title filter, so the row Esc pops back to is the revealed
+        // one rather than whatever the filter happened to be showing.
+        self.filter_active = false;
+        self.filter.clear();
+        self.apply_filter();
+        // Placed after `apply_filter`, which resets an out-of-range cursor.
+        self.series_cursor = self.filtered.iter().position(|&i| i == index).unwrap_or(0);
+        let series = self.all_series[index].clone();
+        // Mirrors `open_selected`'s SeriesList arm, queue poll included: the
+        // show page draws download markers for its episodes.
+        self.season_cursor = 0;
+        self.info_scroll = 0;
+        self.level = Level::Show { series };
+        self.fetch_queue();
+        RevealOutcome::Opened
     }
 
     fn selected_series(&self) -> Option<&Series> {

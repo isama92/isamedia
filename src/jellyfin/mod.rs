@@ -233,7 +233,10 @@ impl Client {
             "/UserItems/Resume",
             &[
                 ("userId", self.user_id.as_str()),
-                ("fields", "MediaStreams,DateCreated,Overview,Genres"),
+                (
+                    "fields",
+                    "MediaStreams,DateCreated,Overview,Genres,ProviderIds",
+                ),
             ],
         )
         .await
@@ -243,7 +246,7 @@ impl Client {
         self.get_items(
             "/Shows/NextUp",
             &[
-                ("fields", "MediaStreams,Overview,Genres"),
+                ("fields", "MediaStreams,Overview,Genres,ProviderIds"),
                 ("enableTotalRecordCount", "false"),
                 ("disableFirstEpisode", "false"),
                 ("enableResumable", "false"),
@@ -259,7 +262,10 @@ impl Client {
             &[
                 ("recursive", "true"),
                 ("includeItemTypes", "Movie,Series"),
-                ("fields", "MediaStreams,DateCreated,Overview,Genres"),
+                (
+                    "fields",
+                    "MediaStreams,DateCreated,Overview,Genres,ProviderIds",
+                ),
                 ("limit", "100"),
                 ("sortBy", "DateCreated"),
                 ("sortOrder", "Descending"),
@@ -276,7 +282,7 @@ impl Client {
         self.request(
             Method::GET,
             &format!("/Users/{}/Items/{id}", self.user_id),
-            &[("fields", "Overview,Genres")],
+            &[("fields", "Overview,Genres,ProviderIds")],
         )
         .await
     }
@@ -288,7 +294,10 @@ impl Client {
                 ("searchTerm", query),
                 ("recursive", "true"),
                 ("includeItemTypes", "Movie,Series"),
-                ("fields", "MediaStreams,DateCreated,Overview,Genres"),
+                (
+                    "fields",
+                    "MediaStreams,DateCreated,Overview,Genres,ProviderIds",
+                ),
                 ("limit", "100"),
             ],
         )
@@ -376,7 +385,7 @@ impl Client {
             ("sortOrder", query.sort_order),
             (
                 "fields",
-                "MediaStreams,DateCreated,ChildCount,Overview,Genres",
+                "MediaStreams,DateCreated,ChildCount,Overview,Genres,ProviderIds",
             ),
         ];
         if let Some(types) = query.include_item_types {
