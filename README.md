@@ -41,7 +41,11 @@ runs).
   tab only appears once it is configured in Settings, so on a fresh install
   Settings is the only tab. Each app owns its own keymap; press `?` in any
   tab for the always-accurate contextual help.
-- The Settings tab covers the theme and accent, backend credentials
+- Posters are shown where there is room for them: the Jellyfin `i` info panel,
+  a Jellyfin show's seasons/episodes pages, the Radarr movie detail page, and a
+  Sonarr series' pages. Artwork is fetched only from your own servers, never from
+  a metadata site.
+- The Settings tab covers the theme and accent, poster rendering, backend credentials
   (Jellyfin, Radarr and Sonarr), and the Jellyfin language preferences. Each
   backend row also offers Remove, which clears the host from the config,
   deletes the stored credentials from the keyring, and hides the tab again.
@@ -166,6 +170,7 @@ appears; after that the stored token is used on every launch.
 last_app = "jellyfin"
 theme = "latte"            # "latte" or "solarized-light"
 accent = "rosewater"       # latte accents: rosewater, mauve, green, sky, lavender
+images = "auto"            # "auto", "halfblocks", or "off"
 
 [jellyfin]
 host = "https://jellyfin.example.com"   # http(s), base paths supported
@@ -228,6 +233,41 @@ colours (rosewater, mauve, green, sky, lavender); Solarized Light has none.
 Selections are saved to `theme` and `accent` in the config. Both are light
 themes that only set foreground colours and leave your terminal's own background
 alone, so they look best on a light terminal.
+
+### Posters
+
+Artwork appears in the Jellyfin `i` info panel, across a Jellyfin show's
+seasons/episodes/episode pages, on the Radarr movie detail page, and across a
+Sonarr series' season/episode pages. Lists stay text-only: at a three-row item
+height a poster is only about three columns wide, which reads as a smudge, and
+taller rows would cost more entries per screen than the pictures are worth.
+
+At startup isamedia asks the terminal what it can do and uses the best of kitty
+graphics, iTerm2 inline images or Sixel, falling back to unicode half-blocks,
+which work everywhere. The Settings tab's Images row names what was detected
+(`Auto  (kitty)`) and lets you override it:
+
+- `auto` — use the detected protocol.
+- `halfblocks` — force the fallback. Worth trying if a protocol misbehaves, or
+  if Sixel encoding feels slow: it is the heaviest path by a wide margin.
+- `off` — draw no artwork and reserve no space for it, so every view lays out
+  exactly as it did before posters existed.
+
+Half-blocks paint a background colour, unlike the rest of the app, so they show
+their own edges; both shipped themes are light, and the terminal's background
+colour is queried at startup so transparent artwork composites against it rather
+than coming out black.
+
+Downloaded images are cached under `~/.cache/isamedia/posters` (owner-only,
+trimmed to 128 MiB and 30 days once per run), so a restart repaints from disk
+instead of refetching. Deleting that directory is always safe. Changing the mode
+does not delete it.
+
+Two known limits. A poster is sized for the terminal's cell size, which is read
+once at startup: changing the font size while running (`ctrl+plus`) leaves images
+mis-sized until you restart. And artwork for a movie or show you have not added
+yet — the Radarr/Sonarr `a` search — is not shown, because both servers serve
+those images from a route that only accepts a browser session, not an API key.
 
 ## Development
 

@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::images::ImageMode;
 use crate::ui::theme::{Accent, Theme};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -23,6 +24,12 @@ pub struct Config {
     // config until the user reorders, so untouched files stay byte-identical.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tab_order: Vec<String>,
+    // Poster rendering: detect the terminal's graphics protocol, force the
+    // halfblock fallback, or draw no artwork at all. Another bare key, so it must
+    // stay before the `jellyfin` table (see the note on `theme`). Written even at
+    // its default, like `theme` and `accent`, so the file names every display
+    // setting the user might want to change.
+    pub images: ImageMode,
     pub jellyfin: JellyfinConfig,
     pub sonarr: SonarrConfig,
     pub radarr: RadarrConfig,
@@ -278,6 +285,7 @@ mod tests {
             last_app: Some("jellyfin".into()),
             theme: Theme::SolarizedLight,
             accent: Accent::Mauve,
+            images: ImageMode::Halfblocks,
             tab_order: vec!["settings".into(), "jellyfin".into()],
             jellyfin: JellyfinConfig {
                 host: "https://demo.jellyfin.org".into(),
@@ -296,11 +304,43 @@ mod tests {
         assert_eq!(parsed.last_app.as_deref(), Some("jellyfin"));
         assert_eq!(parsed.theme, Theme::SolarizedLight);
         assert_eq!(parsed.accent, Accent::Mauve);
+        assert_eq!(parsed.images, ImageMode::Halfblocks);
         assert_eq!(parsed.jellyfin.host, config.jellyfin.host);
         assert_eq!(parsed.jellyfin.skip_segments, config.jellyfin.skip_segments);
         assert_eq!(parsed.sonarr.host, config.sonarr.host);
         assert_eq!(parsed.radarr.host, config.radarr.host);
         assert_eq!(parsed.tab_order, config.tab_order);
+    }
+
+    #[test]
+    fn images_serialises_as_a_bare_key_before_the_tables() {
+        // The trap this guards: TOML emits bare keys before tables, so an
+        // `images` field declared after `jellyfin` would silently serialise as
+        // `[jellyfin] images = ...` and be read back as a Jellyfin setting.
+        let config = Config {
+            images: ImageMode::Off,
+            jellyfin: JellyfinConfig {
+                host: "http://x".into(),
+                ..JellyfinConfig::default()
+            },
+            ..Config::default()
+        };
+        let raw = toml::to_string_pretty(&config).unwrap();
+        let images_at = raw.find("images = ").expect("images key is written");
+        let jellyfin_at = raw.find("[jellyfin]").expect("jellyfin table is written");
+        assert!(images_at < jellyfin_at, "{raw}");
+        assert!(raw.contains("images = \"off\""), "{raw}");
+        assert_eq!(
+            toml::from_str::<Config>(&raw).unwrap().images,
+            ImageMode::Off
+        );
+    }
+
+    #[test]
+    fn unknown_image_mode_is_rejected() {
+        // Deliberately strict, like `theme`: a typo in a hand-edited config is
+        // reported rather than silently becoming a mode nobody chose.
+        assert!(toml::from_str::<Config>("images = \"halfblock\"").is_err());
     }
 
     #[test]

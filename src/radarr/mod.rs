@@ -27,6 +27,12 @@ impl Client {
         &self.transport.host
     }
 
+    /// The API key, so `crate::images` can authorise its own poster requests
+    /// without this module growing an artwork concern.
+    pub(crate) fn api_key(&self) -> &str {
+        self.transport.api_key()
+    }
+
     /// Every movie in the library; files are embedded when present, so the
     /// detail view needs no second fetch.
     pub async fn get_movies(&self) -> Result<Vec<Movie>, Error> {

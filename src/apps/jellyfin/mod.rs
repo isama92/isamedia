@@ -17,6 +17,7 @@ use crate::app::{AppId, MediaApp, ShellRequest};
 use crate::apps::reveal::{ArrTargets, RevealFailed, RevealRequest};
 use crate::config::{Config, LanguageOverrides};
 use crate::event::AppSender;
+use crate::images::{Images, Source, SourceAuth};
 use crate::jellyfin::{Client, Credentials, MediaItem};
 use crate::player::{self, PlayerEvent, PlayerHandle};
 use crate::ui::{prompt, theme};
@@ -76,6 +77,9 @@ pub struct JellyfinApp {
     /// (`language_overrides.json`) rather than in the shared config.
     overrides: LanguageOverrides,
     overrides_path: PathBuf,
+    /// The shared poster cache. Held on the app so every Browse it creates draws
+    /// from the same cache and artwork survives a re-login.
+    images: Arc<Images>,
 }
 
 impl JellyfinApp {
@@ -84,7 +88,13 @@ impl JellyfinApp {
         config_path: PathBuf,
         sender: AppSender,
         reauth: Arc<std::sync::atomic::AtomicU64>,
+        images: Arc<Images>,
     ) -> Self {
+        // Wake the event loop when a poster lands: the shell only redraws in
+        // response to an event, so otherwise artwork would wait for the next tick.
+        // Registered here rather than on the Browse so it survives a re-login.
+        let wake = sender.clone();
+        images.set_waker(sender.app(), Arc::new(move || wake.send(Msg::PosterReady)));
         let seen_reauth = reauth.load(Ordering::Relaxed);
         let overrides_path = LanguageOverrides::path_for(&config_path);
         let overrides = LanguageOverrides::load(&overrides_path);
@@ -102,6 +112,7 @@ impl JellyfinApp {
             seen_reauth,
             overrides,
             overrides_path,
+            images,
         }
     }
 
@@ -350,8 +361,24 @@ impl JellyfinApp {
                 );
                 let plain_http = crate::jellyfin::url::is_plain_http(&client.host);
                 let arr = self.arr_targets();
-                let mut browse =
-                    Browse::new(client, self.sender.clone(), self.browse_gen.clone(), arr);
+                // Publish where artwork comes from now there is a live session to
+                // authorise it. A re-login replaces this with the fresh token
+                // without disturbing the cached posters, whose keys do not
+                // mention the credential.
+                self.images.set_source(
+                    Source::Jellyfin,
+                    Some(SourceAuth::jellyfin(
+                        client.host.clone(),
+                        client.auth_header().to_string(),
+                    )),
+                );
+                let mut browse = Browse::new(
+                    client,
+                    self.sender.clone(),
+                    self.browse_gen.clone(),
+                    arr,
+                    self.images.clone(),
+                );
                 if plain_http {
                     // The login form warns about this too, but auto-login
                     // (stored host + token) never shows the form.
@@ -399,6 +426,9 @@ impl MediaApp for JellyfinApp {
         // player's trailing events, and (via the dropped Browse) its fetches.
         self.auth_gen += 1;
         self.player_gen += 1;
+        // Withdraw the credential too, so no poster can be fetched for an account
+        // the user has just removed.
+        self.images.set_source(Source::Jellyfin, None);
         self.screen = Screen::Boot;
         // Any pending reauth signal referred to the removed identity.
         self.seen_reauth = self.reauth.load(Ordering::Relaxed);
@@ -622,6 +652,9 @@ impl MediaApp for JellyfinApp {
                 }
                 self.on_player_event(event);
             }
+            // Nothing to do: arriving here is the point, because the shell
+            // redraws after every event and the cache already has the poster.
+            Msg::PosterReady => {}
             Msg::KeyringError(message) => {
                 tracing::warn!(message, "keyring problem");
                 if let Screen::Browse(browse) = &mut self.screen {
@@ -723,6 +756,7 @@ mod tests {
             PathBuf::from("jellyfin-test-config.toml"),
             AppSender::new("jellyfin", tx),
             reauth.clone(),
+            Images::for_tests(),
         );
         // Sit on the login screen, as after a prior session-expiry.
         let form = jf.login_form();
@@ -758,6 +792,7 @@ mod tests {
             PathBuf::from("jellyfin-test-config.toml"),
             AppSender::new("jellyfin", tx),
             reauth.clone(),
+            Images::for_tests(),
         );
         assert!(jf.is_configured());
         jf.screen = Screen::Login(jf.login_form());

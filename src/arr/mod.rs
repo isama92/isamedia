@@ -58,6 +58,16 @@ impl std::fmt::Debug for Transport {
 }
 
 impl Transport {
+    /// The API key, for the poster cache to set as a header on its own client.
+    ///
+    /// Exposed narrowly rather than made `pub`: artwork is fetched by
+    /// `crate::images`, which needs the credential but must not gain a reason to
+    /// live in here. The key still only ever travels as a header — never in a URL,
+    /// per the note at the top of this module.
+    pub(crate) fn api_key(&self) -> &str {
+        &self.api_key
+    }
+
     /// Build a transport and validate the key with a status call; a 401/403
     /// comes back as `Error::Unauthorized` so the UI can re-prompt for it.
     pub async fn connect(host: &str, api_key: String) -> Result<Self, Error> {

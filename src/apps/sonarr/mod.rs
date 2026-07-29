@@ -20,6 +20,7 @@ use crate::app::{AppId, MediaApp, ShellRequest};
 use crate::apps::reveal::{RevealFailed, RevealMiss, RevealOutcome, RevealRequest};
 use crate::config::Config;
 use crate::event::AppSender;
+use crate::images::{Images, Source, SourceAuth};
 use crate::sonarr::{Client, Error};
 use crate::ui::theme;
 
@@ -56,10 +57,23 @@ pub struct SonarrApp {
     /// rather than the browse because a reveal can arrive before the browse
     /// exists — triggering the connect that creates it is the point.
     pending_reveal: Option<RevealRequest>,
+    /// The shared poster cache. Held on the app so every Browse it creates draws
+    /// from the same cache, and artwork survives a reconnect.
+    images: Arc<Images>,
 }
 
 impl SonarrApp {
-    pub fn new(config: Arc<Mutex<Config>>, config_path: PathBuf, sender: AppSender) -> Self {
+    pub fn new(
+        config: Arc<Mutex<Config>>,
+        config_path: PathBuf,
+        sender: AppSender,
+        images: Arc<Images>,
+    ) -> Self {
+        // Wake the event loop when a poster lands: the shell only redraws in
+        // response to an event, so otherwise artwork would wait for the next tick.
+        // Registered here rather than on the Browse so it survives a reconnect.
+        let wake = sender.clone();
+        images.set_waker(sender.app(), Arc::new(move || wake.send(Msg::PosterReady)));
         Self {
             config,
             config_path,
@@ -69,6 +83,7 @@ impl SonarrApp {
             browse_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             active: false,
             pending_reveal: None,
+            images,
         }
     }
 
@@ -200,7 +215,21 @@ impl SonarrApp {
                 };
                 self.persist_auth(&client, form_key);
                 let plain_http = crate::net::is_plain_http(client.host());
-                let mut browse = Browse::new(client, self.sender.clone(), self.browse_gen.clone());
+                // Publish where artwork comes from, now there is a validated key
+                // to authorise it with.
+                self.images.set_source(
+                    Source::Sonarr,
+                    Some(SourceAuth::arr(
+                        client.host().to_string(),
+                        client.api_key().to_string(),
+                    )),
+                );
+                let mut browse = Browse::new(
+                    client,
+                    self.sender.clone(),
+                    self.browse_gen.clone(),
+                    self.images.clone(),
+                );
                 if plain_http {
                     // The setup form warns about this too, but auto-connect
                     // (stored host + key) never shows the form.
@@ -249,6 +278,9 @@ impl MediaApp for SonarrApp {
         // Dropping the Browse discards its client and stops its polling; the
         // bumped generation makes any in-flight connect result land stale.
         self.auth_gen += 1;
+        // Withdraw the credential too, so no poster can be fetched for a backend
+        // the user has just removed.
+        self.images.set_source(Source::Sonarr, None);
         self.screen = Screen::Boot;
     }
 
@@ -431,6 +463,9 @@ impl MediaApp for SonarrApp {
                     self.on_session_expired();
                 }
             }
+            // Nothing to do: arriving here is the point, because the shell
+            // redraws after every event and the cache already has the poster.
+            Msg::PosterReady => {}
             Msg::KeyringError(message) => {
                 tracing::warn!(message, "keyring problem");
                 if let Screen::Browse(browse) = &mut self.screen {

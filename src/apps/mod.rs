@@ -15,6 +15,7 @@ use tokio::sync::mpsc;
 use crate::app::MediaApp;
 use crate::config::Config;
 use crate::event::{AppSender, Event};
+use crate::images::Images;
 
 /// Every app tab's id and label, in the built-in order. The single source of
 /// tab identity for the Settings reorder screen and the persisted
@@ -57,10 +58,17 @@ pub fn order_indices(known_ids: &[&str], saved: &[String]) -> Vec<usize> {
 /// All apps shown in the top tab bar, in tab order. Adding a new app means
 /// writing its module and registering it here (and in `TAB_CATALOG`); the shell
 /// needs no changes.
+/// `images` is the shared poster cache, handed to every backend app so switching
+/// tabs reuses artwork instead of refetching it. Injected rather than reached for
+/// through a global because it is real state — a cache, semaphores, a job queue —
+/// and a global would leak between tests; the same reasoning as `config`. Only
+/// the tiny `ImageMode` enum lives in a global, which is why the Settings tab
+/// does not need a handle.
 pub fn build_apps(
     config: Arc<Mutex<Config>>,
     config_path: PathBuf,
     tx: mpsc::UnboundedSender<Event>,
+    images: Arc<Images>,
 ) -> Vec<Box<dyn MediaApp>> {
     // Bumped by the Settings tab whenever it re-authenticates Jellyfin, so the
     // running Jellyfin tab reconnects with the freshly stored token instead of
@@ -73,16 +81,19 @@ pub fn build_apps(
             config_path.clone(),
             AppSender::new("jellyfin", tx.clone()),
             jellyfin_reauth.clone(),
+            images.clone(),
         )),
         Box::new(radarr::RadarrApp::new(
             config.clone(),
             config_path.clone(),
             AppSender::new("radarr", tx.clone()),
+            images.clone(),
         )),
         Box::new(sonarr::SonarrApp::new(
             config.clone(),
             config_path.clone(),
             AppSender::new("sonarr", tx.clone()),
+            images,
         )),
         // Owns the config to read/write settings; the backend credential forms
         // connect to a server and write the keyring, so it needs a sender to
@@ -115,6 +126,7 @@ mod tests {
             config,
             PathBuf::from("/nonexistent/isamedia/config.toml"),
             tx,
+            Images::for_tests(),
         );
         let built: Vec<(&str, &str)> = apps.iter().map(|app| (app.id(), app.title())).collect();
         assert_eq!(built, TAB_CATALOG.to_vec());

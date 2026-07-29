@@ -125,6 +125,16 @@ fn auth_header(device: &str, device_id: &str, version: &str, token: Option<&str>
 }
 
 impl Client {
+    /// The `MediaBrowser` authorisation header, so `crate::images` can authorise
+    /// poster requests on its own HTTP client.
+    ///
+    /// Exposed rather than letting a caller rebuild it from `token`: the header
+    /// format is a wire contract with Jellyfin and belongs in exactly one place.
+    /// It stays `<redacted>` in `Debug`.
+    pub fn auth_header(&self) -> &str {
+        &self.auth_header
+    }
+
     /// Build a client, authenticating with username/password only when no
     /// token is stored yet (same short-circuit jfsh does).
     pub async fn connect(creds: Credentials) -> Result<Self, Error> {

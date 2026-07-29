@@ -6,8 +6,8 @@
 use serde::Deserialize;
 
 pub use crate::arr::models::{
-    Command, HistoryRecord, Language, MediaInfo, QualityProfile, QualityWrapper, QueueItem,
-    Release, RootFolder,
+    Command, HistoryRecord, Language, MediaCover, MediaInfo, QualityProfile, QualityWrapper,
+    QueueItem, Release, RootFolder,
 };
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -35,6 +35,9 @@ pub struct Series {
     /// "standard" | "daily" | "anime".
     pub series_type: Option<String>,
     pub season_folder: bool,
+    /// Artwork references, on library series and lookup hits alike. Read through
+    /// `poster_path`; resolve with `crate::net::resolve_local`.
+    pub images: Vec<MediaCover>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -100,6 +103,7 @@ pub struct EpisodeFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arr::models::poster_path;
 
     #[test]
     fn deserializes_series_with_seasons() {
@@ -117,6 +121,10 @@ mod tests {
             "rootFolderPath": "/tv",
             "seriesType": "anime",
             "seasonFolder": true,
+            "images": [
+                { "coverType": "banner", "url": "/MediaCover/5/banner.jpg?lastWrite=637" },
+                { "coverType": "poster", "url": "/MediaCover/5/poster.jpg?lastWrite=637" }
+            ],
             "seasons": [
                 { "seasonNumber": 0, "monitored": false },
                 {
@@ -142,6 +150,12 @@ mod tests {
         assert_eq!(series.root_folder_path.as_deref(), Some("/tv"));
         assert_eq!(series.series_type.as_deref(), Some("anime"));
         assert!(series.season_folder);
+        // A library series' artwork is a path on Sonarr itself, resized and
+        // cached server-side.
+        assert_eq!(
+            poster_path(&series.images),
+            Some("/MediaCover/5/poster.jpg?lastWrite=637")
+        );
         assert_eq!(series.seasons.len(), 2);
         assert!(series.seasons[0].statistics.is_none());
         let stats = series.seasons[1].statistics.as_ref().unwrap();
