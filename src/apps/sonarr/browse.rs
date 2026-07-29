@@ -1150,8 +1150,11 @@ impl Browse {
             // Every landing list retries the request, so waiting costs nothing
             // while a fetch is still in flight. One that has stopped without
             // landing is not coming, and waiting on it would strand the other
-            // tab on "looking up...".
-            return if self.loading {
+            // tab on "looking up...". A list landing under the add screen is
+            // discarded there (its lookup owns the loading/error/list state), so
+            // waiting on one while `Add` is open would never end either.
+            let list_still_coming = self.loading && !matches!(self.level, Level::Add);
+            return if list_still_coming {
                 RevealOutcome::Waiting
             } else {
                 RevealOutcome::Missed(RevealMiss::Unavailable)
@@ -1178,9 +1181,31 @@ impl Browse {
         // show page draws download markers for its episodes.
         self.season_cursor = 0;
         self.info_scroll = 0;
+        self.dismiss_overlays();
         self.level = Level::Show { series };
         self.fetch_queue();
         RevealOutcome::Opened
+    }
+
+    /// Close everything `on_key` gives priority over `Level`: the two focused
+    /// text inputs and every modal overlay. A reveal that only replaced `Level`
+    /// would leave one of these standing over the page it opened — a delete
+    /// confirmation still holding the *previous* show's id, which the next Enter
+    /// would commit, or a focused filter box quietly eating every keystroke
+    /// (including the shell's global `s`, via `input_focused`). Every other
+    /// `Level` mutation is unreachable while one of these is up; this one arrives
+    /// as a message and has to clear them itself.
+    fn dismiss_overlays(&mut self) {
+        self.filter_focused = false;
+        self.add_search_focused = false;
+        self.form = None;
+        self.pending_edit = None;
+        self.confirm = None;
+        self.delete_prompt = None;
+        self.sort_menu = None;
+        self.search_menu = None;
+        self.rejections_popup = None;
+        self.downloads.reset();
     }
 
     fn selected_series(&self) -> Option<&Series> {

@@ -175,7 +175,14 @@ where
             (Some(wanted), Some(found)) => wanted == found,
             _ => true,
         };
-        if title_agrees && year_agrees {
+        // Two sides that both claim an id and disagree is evidence *against* a
+        // match, so a title coincidence must not override it. Symmetric with the
+        // year rule: only a disagreement counts, never a missing value.
+        let ids_conflict = matches!(
+            (request.external_id, candidate.external_id),
+            (Some(wanted), Some(found)) if wanted != found
+        );
+        if title_agrees && year_agrees && !ids_conflict {
             title_hits.push(index);
         }
     }
@@ -246,6 +253,27 @@ mod tests {
         assert_eq!(
             match_index(library, &request(None, "dune!", Some(1984))),
             Ok(0)
+        );
+    }
+
+    #[test]
+    fn conflicting_ids_veto_a_title_match() {
+        // Same title and year, but the ids disagree: not the same film, whatever
+        // the title says.
+        let library = [candidate(Some(999), "Dune", Some(2021))];
+        assert_eq!(
+            match_index(library, &request(Some(603), "Dune", Some(2021))),
+            Err(RevealMiss::NotFound)
+        );
+        // With the conflicting entry vetoed, an id-less twin is unambiguous
+        // rather than one of two candidates.
+        let mixed = [
+            candidate(Some(999), "Dune", Some(2021)),
+            candidate(None, "Dune", Some(2021)),
+        ];
+        assert_eq!(
+            match_index(mixed, &request(Some(603), "Dune", Some(2021))),
+            Ok(1)
         );
     }
 

@@ -93,6 +93,9 @@ impl RadarrApp {
     /// before the library did still gets its answer.
     fn try_pending_reveal(&mut self) -> Option<ShellRequest> {
         let request = self.pending_reveal.take()?;
+        // Routing is by `kind.app_id()`, so a Series request can only reach here
+        // via a bug; it would search movies and then report "Sonarr" at that.
+        debug_assert_eq!(request.kind.app_id(), self.id(), "reveal routed wrongly");
         let outcome = match &mut self.screen {
             Screen::Browse(browse) => browse.reveal(&request),
             // The connect in flight will retry this when it lands.
