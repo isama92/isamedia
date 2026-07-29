@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.16](https://github.com/isama92/isamedia/compare/v0.1.15...v0.1.16) - 2026-07-29
+
+### Added
+
+- *(jellyfin)* open the hovered movie/show in Radarr/Sonarr with u ([#45](https://github.com/isama92/isamedia/pull/45))
+
 ## [0.1.15](https://github.com/isama92/isamedia/compare/v0.1.14...v0.1.15) - 2026-07-24
 
 ### Other
