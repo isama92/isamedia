@@ -94,7 +94,7 @@ impl JellyfinApp {
         // response to an event, so otherwise artwork would wait for the next tick.
         // Registered here rather than on the Browse so it survives a re-login.
         let wake = sender.clone();
-        images.set_waker("jellyfin", Arc::new(move || wake.send(Msg::PosterReady)));
+        images.set_waker(sender.app(), Arc::new(move || wake.send(Msg::PosterReady)));
         let seen_reauth = reauth.load(Ordering::Relaxed);
         let overrides_path = LanguageOverrides::path_for(&config_path);
         let overrides = LanguageOverrides::load(&overrides_path);

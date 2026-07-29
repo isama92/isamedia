@@ -42,8 +42,9 @@ runs).
   Settings is the only tab. Each app owns its own keymap; press `?` in any
   tab for the always-accurate contextual help.
 - Posters are shown where there is room for them: the Jellyfin `i` info panel,
-  a show's seasons/episodes pages, and the Radarr movie detail page. Artwork is
-  fetched only from your own servers, never from a metadata site.
+  a Jellyfin show's seasons/episodes pages, the Radarr movie detail page, and a
+  Sonarr series' pages. Artwork is fetched only from your own servers, never from
+  a metadata site.
 - The Settings tab covers the theme and accent, poster rendering, backend credentials
   (Jellyfin, Radarr and Sonarr), and the Jellyfin language preferences. Each
   backend row also offers Remove, which clears the host from the config,
@@ -235,9 +236,9 @@ alone, so they look best on a light terminal.
 
 ### Posters
 
-Artwork appears in the Jellyfin `i` info panel, across a show's
-seasons/episodes/episode pages, and on the Radarr movie detail page. Lists stay
-text-only: at a three-row item height a poster is only about three columns wide,
+Artwork appears in the Jellyfin `i` info panel, across a Jellyfin show's
+seasons/episodes/episode pages, on the Radarr movie detail page, and across a
+Sonarr series' season/episode pages. Lists stay text-only: at a three-row item height a poster is only about three columns wide,
 which reads as a smudge, and taller rows would cost more entries per screen than
 the pictures are worth.
 

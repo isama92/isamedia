@@ -74,7 +74,7 @@ impl RadarrApp {
         // response to an event, so otherwise artwork would wait for the next tick.
         // Registered here rather than on the Browse so it survives a reconnect.
         let wake = sender.clone();
-        images.set_waker("radarr", Arc::new(move || wake.send(Msg::PosterReady)));
+        images.set_waker(sender.app(), Arc::new(move || wake.send(Msg::PosterReady)));
         Self {
             config,
             config_path,

@@ -78,11 +78,42 @@ impl ImageKey {
 /// session cookie. `/api/v3/mediacover/{id}/{file}` serves the identical bytes
 /// from a `[V3ApiController]`, where the key is the accepted credential.
 ///
-/// Any `UrlBase` prefix and cache-busting query survive the rewrite, and a
+/// Also asks for the pre-resized poster rather than the original. Both servers
+/// write posters at heights 500 and 250 next to the full-size file
+/// (`MediaCoverService.EnsureResizedCovers`), and `MediaCoverController` falls
+/// back to the full-size one when a resized sibling is missing, so this needs no
+/// client-side retry. The original is typically around 1000x1500 and a megabyte,
+/// where the widest slot the layout ever asks for is about 192x288 pixels, so the
+/// decoder was throwing away almost everything it downloaded. 500 rather than 250
+/// because 250 would be short of a tall terminal's slot.
+///
+/// Any `UrlBase` prefix and cache-busting query survive, and a
 /// `/MediaCoverProxy/...` path is deliberately left alone: it has no `/api/v3`
 /// equivalent, so lookup-result artwork is not reachable with an API key at all.
 fn api_cover_path(path: &str) -> String {
-    path.replacen("/MediaCover/", "/api/v3/mediacover/", 1)
+    /// One of the two heights both servers pre-render posters at.
+    const RESIZED_POSTER_HEIGHT: u16 = 500;
+
+    if !path.contains("/MediaCover/") {
+        // A proxy path, or a shape we do not recognise: leave it untouched rather
+        // than rewriting it onto a route that may not exist.
+        return path.to_string();
+    }
+    let routed = path.replacen("/MediaCover/", "/api/v3/mediacover/", 1);
+    let (before, query) = routed
+        .split_once('?')
+        .map_or((routed.as_str(), ""), |(before, query)| (before, query));
+    if let Some(stem) = before.strip_suffix("/poster.jpg") {
+        let mut resized = format!("{stem}/poster-{RESIZED_POSTER_HEIGHT}.jpg");
+        if !query.is_empty() {
+            resized.push('?');
+            resized.push_str(query);
+        }
+        return resized;
+    }
+    // A banner fallback or an unfamiliar filename: no resized sibling worth
+    // guessing at, and banners are already small.
+    routed
 }
 
 /// The poster for a Jellyfin item: show-level art, so an episode or season
@@ -216,7 +247,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             url,
-            "https://example.com/radarr/api/v3/mediacover/1/poster.jpg"
+            "https://example.com/radarr/api/v3/mediacover/1/poster-500.jpg"
         );
         assert!(!url.contains("/radarr/radarr/"));
     }
@@ -228,18 +259,33 @@ mod tests {
         // policy. Getting this wrong means every *arr poster silently 401s.
         assert_eq!(
             api_cover_path("/MediaCover/42/poster.jpg?lastWrite=637"),
-            "/api/v3/mediacover/42/poster.jpg?lastWrite=637"
+            "/api/v3/mediacover/42/poster-500.jpg?lastWrite=637"
         );
         // A UrlBase prefix survives, and only the first segment is rewritten.
         assert_eq!(
             api_cover_path("/radarr/MediaCover/7/poster.jpg"),
-            "/radarr/api/v3/mediacover/7/poster.jpg"
+            "/radarr/api/v3/mediacover/7/poster-500.jpg"
         );
         // A proxy path has no API equivalent, so it must be left untouched rather
         // than rewritten into a route that does not exist.
         assert_eq!(
             api_cover_path("/MediaCoverProxy/deadbeef/poster.jpg"),
             "/MediaCoverProxy/deadbeef/poster.jpg"
+        );
+    }
+
+    #[test]
+    fn a_non_poster_cover_is_routed_but_not_resized() {
+        // Only posters have a resized sibling worth naming. A banner is already
+        // small, and guessing at heights for cover types we do not request would
+        // just add 404s the server has to fall back from.
+        assert_eq!(
+            api_cover_path("/MediaCover/3/banner.jpg"),
+            "/api/v3/mediacover/3/banner.jpg"
+        );
+        assert_eq!(
+            api_cover_path("/MediaCover/3/something-else.png"),
+            "/api/v3/mediacover/3/something-else.png"
         );
     }
 

@@ -33,12 +33,26 @@ const MAX_DECODE_ALLOC: u64 = 64 << 20;
 
 /// The shared client for every poster request.
 ///
-/// No compression features: JPEG, PNG and WebP are already entropy-coded, so
-/// gzip would cost real CPU for a percent or two. Because reqwest is built
-/// without them it never sends `Accept-Encoding` either, so no server will
-/// compress a response we then cannot decode.
+/// Redirects are refused outright, and that is a security requirement rather than
+/// a tidiness one. `crate::net::resolve_local` constrains the URL we *build*, but
+/// reqwest's default policy follows up to ten hops, and on a cross-host hop it
+/// strips only `Authorization`, `Cookie`, `cookie2`, `Proxy-Authorization` and
+/// `WWW-Authenticate`. A custom header survives, so a 302 from Radarr or Sonarr
+/// would hand `X-Api-Key` — which grants full control of the instance — to
+/// whatever host the redirect named. Plain `http` is a supported (if warned
+/// about) setup, so that needs a network position, not a server compromise.
+///
+/// Nothing is lost: neither `/api/v3/mediacover/{id}/{file}` nor
+/// `/Items/{id}/Images/Primary` redirects. A 3xx now falls through the
+/// `!status.is_success()` arm below and is remembered as absent.
+///
+/// No compression features either: JPEG, PNG and WebP are already entropy-coded,
+/// so gzip would cost real CPU for a percent or two. Because reqwest is built
+/// without them it never sends `Accept-Encoding`, so no server will compress a
+/// response we then cannot decode.
 pub fn client() -> reqwest::Result<reqwest::Client> {
     reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(REQUEST_TIMEOUT)
         .connect_timeout(CONNECT_TIMEOUT)
         .build()
@@ -184,6 +198,87 @@ mod tests {
         // Fit letterboxes, so the result never exceeds the requested slot.
         assert!(protocol.size().width <= 6);
         assert!(protocol.size().height <= 4);
+    }
+
+    /// Serve one canned HTTP response on a loopback port and report what the
+    /// client sent. A hand-rolled listener rather than a mock crate: tokio's `net`
+    /// feature is already enabled, so this needs no new dependency, and CLAUDE.md
+    /// asks for a mock over reaching for the network.
+    async fn serve_once(response: &'static str) -> (String, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binding a loopback port");
+        let url = format!(
+            "http://{}/poster.jpg",
+            listener.local_addr().expect("local addr")
+        );
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accepting");
+            let mut buf = vec![0u8; 2048];
+            let read = socket.read(&mut buf).await.unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..read]).to_string();
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.flush().await;
+            request
+        });
+        (url, handle)
+    }
+
+    #[tokio::test]
+    async fn a_redirect_is_refused_rather_than_followed() {
+        // The security property: following this would forward X-Api-Key to
+        // wherever the Location header points, which for an *arr key means full
+        // control of the instance.
+        let (url, server) = serve_once(
+            "HTTP/1.1 302 Found\r\nLocation: http://evil.test/steal\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        let client = client().expect("building the poster client");
+
+        let result = fetch(&client, &url, ("X-Api-Key", "sekret-key")).await;
+
+        assert!(result.is_none(), "a redirect must not yield bytes");
+        let request = server.await.expect("server task");
+        assert!(
+            request.contains("sekret-key"),
+            "sanity: the key should reach the configured host"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_successful_body_is_returned_with_the_key_in_a_header() {
+        // The companion case, so the redirect test above cannot pass simply
+        // because `fetch` is broken.
+        let (url, server) = serve_once(
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Type: image/jpeg\r\n\r\nbytes",
+        )
+        .await;
+        let client = client().expect("building the poster client");
+
+        let result = fetch(&client, &url, ("X-Api-Key", "sekret-key")).await;
+
+        assert_eq!(result.as_deref(), Some(&b"bytes"[..]));
+        let request = server.await.expect("server task");
+        // Header names go on the wire lowercased, so compare case-insensitively.
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("x-api-key: sekret-key"),
+            "{request}"
+        );
+        // The credential travels as a header, never in the request line.
+        let request_line = request.lines().next().unwrap_or_default();
+        assert!(!request_line.contains("sekret-key"), "{request_line}");
+    }
+
+    #[tokio::test]
+    async fn an_error_status_is_not_mistaken_for_artwork() {
+        let (url, _server) =
+            serve_once("HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n").await;
+        let client = client().expect("building the poster client");
+        assert!(fetch(&client, &url, ("X-Api-Key", "k")).await.is_none());
     }
 
     #[test]

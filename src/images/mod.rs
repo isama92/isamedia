@@ -237,7 +237,11 @@ type Waker = Arc<dyn Fn() + Send + Sync>;
 enum Entry {
     /// A job is queued or running. Never evicted — dropping one would orphan the
     /// job and the next draw would queue it again, forever.
-    Pending,
+    ///
+    /// Carries the cancel generation that created it, so a job completing after a
+    /// mode flip can tell its own slot from one a newer draw has since queued for
+    /// the same poster.
+    Pending { cancel_gen: u64 },
     Ready {
         protocol: Arc<Protocol>,
         /// Logical clock stamp, for evicting the least recently drawn.
@@ -312,6 +316,12 @@ impl Images {
     /// Must be called after entering the alternate screen but *before* the input
     /// thread starts: detection writes a query to stdout and reads the reply from
     /// stdin, and the input thread owns stdin once it is running.
+    ///
+    /// The probe runs even when `mode` is `Off`, which looks like an obvious thing
+    /// to skip and is not: `Off` is switchable to `Auto` from the Settings tab at
+    /// runtime, and by then stdin belongs to the input thread, so this is the only
+    /// moment detection can happen at all. The cost is bounded at two seconds, and
+    /// only paid by a terminal that never answers.
     pub fn start(mode: ImageMode) -> Arc<Self> {
         // Bounded internally at two seconds, degrading to halfblocks. The error
         // arm matters: a console whose mode cannot be read must not stop isamedia
@@ -455,7 +465,7 @@ impl Images {
             }
             // Already queued or running: this is what makes fast scrolling cheap.
             // A row drawn forty times while its poster loads queues exactly once.
-            Some(Entry::Pending) => return None,
+            Some(Entry::Pending { .. }) => return None,
             Some(Entry::Absent { until }) if *until > Instant::now() => return None,
             // An expired negative entry: fall through and retry.
             Some(_) => {
@@ -465,7 +475,12 @@ impl Images {
         }
 
         let job = inner.build_job(app, key, size)?;
-        inner.entries.insert(cache_key, Entry::Pending);
+        inner.entries.insert(
+            cache_key,
+            Entry::Pending {
+                cancel_gen: job.cancel_gen,
+            },
+        );
         *inner.pending.entry(app).or_insert(0) += 1;
         #[cfg(test)]
         {
@@ -479,11 +494,7 @@ impl Images {
     }
 
     fn is_stale(&self, job: &Job) -> bool {
-        let inner = self.inner.lock().unwrap();
-        inner
-            .cancel
-            .get(&job.app)
-            .is_some_and(|counter| counter.load(Ordering::Relaxed) != job.cancel_gen)
+        self.inner.lock().unwrap().is_stale(job)
     }
 
     /// Resolve a pending entry back to vacant, so the next draw can retry it.
@@ -491,12 +502,18 @@ impl Images {
     /// left pending forever is the one way this cache can leak.
     fn abandon(&self, job: &Job) {
         let mut inner = self.inner.lock().unwrap();
+        if !inner.owns_slot(job) {
+            return;
+        }
         inner.entries.remove(&(job.key.clone(), job.size));
         inner.release_pending(job.app);
     }
 
     fn mark_absent(&self, job: &Job) {
         let mut inner = self.inner.lock().unwrap();
+        if !inner.owns_slot(job) {
+            return;
+        }
         let until = Instant::now() + absent_ttl(&job.key);
         inner
             .entries
@@ -509,6 +526,21 @@ impl Images {
         // triggers already sees the poster.
         let waker = {
             let mut inner = self.inner.lock().unwrap();
+            if !inner.owns_slot(job) {
+                return;
+            }
+            // Re-read the generation at the commit, not just before the encode.
+            // `is_stale` was checked before `spawn_blocking`, and the lock was
+            // released for the duration of it; `sync_mode` runs on the render
+            // thread under this same mutex, so it can have cleared the cache and
+            // swapped the picker in that window. Without this check the payload
+            // just encoded with the *old* picker would be inserted and served
+            // until eviction, because the cache key has no protocol component.
+            if inner.is_stale(job) {
+                inner.entries.remove(&(job.key.clone(), job.size));
+                inner.release_pending(job.app);
+                return;
+            }
             let used = inner.clock;
             inner.entries.insert(
                 (job.key.clone(), job.size),
@@ -530,6 +562,28 @@ impl Images {
 }
 
 impl Inner {
+    /// Whether the work this job represents is still wanted.
+    fn is_stale(&self, job: &Job) -> bool {
+        self.cancel
+            .get(&job.app)
+            .is_some_and(|counter| counter.load(Ordering::Relaxed) != job.cancel_gen)
+    }
+
+    /// Whether this job still owns the pending slot it created, and so may write
+    /// to it.
+    ///
+    /// Distinct from `is_stale`, which asks whether the *work* is still wanted.
+    /// This asks whether the *slot* is still ours. They come apart after a mode
+    /// flip: `sync_mode` clears every entry, a later draw queues a fresh job for
+    /// the same poster, and this job must then leave that newer entry alone rather
+    /// than resolving it on the newcomer's behalf.
+    fn owns_slot(&self, job: &Job) -> bool {
+        match self.entries.get(&(job.key.clone(), job.size)) {
+            Some(Entry::Pending { cancel_gen }) => *cancel_gen == job.cancel_gen,
+            _ => false,
+        }
+    }
+
     /// Notice a mode flip and rebuild for it. Called from every draw, so the
     /// Settings tab only has to set the global; the running apps need no code for
     /// the change at all.
@@ -654,6 +708,11 @@ async fn run_worker(images: Arc<Images>, mut jobs: mpsc::UnboundedReceiver<Job>)
     let client = match fetch::client() {
         Ok(client) => client,
         Err(err) => {
+            // The one hole in the "every exit path resolves its entry" invariant
+            // above: jobs queued from here on keep their `Entry::Pending` for the
+            // life of the process. Bounded at `MAX_PENDING` per app, and building a
+            // client only fails on a broken TLS setup, so the cost is that artwork
+            // never appears in a session where it was never going to work anyway.
             tracing::error!(%err, "could not build the poster http client; artwork disabled");
             return;
         }
@@ -871,7 +930,9 @@ mod tests {
         let images = ready_cache();
         let protocol = tiny_protocol();
         let mut inner = images.inner.lock().unwrap();
-        inner.entries.insert((cover(9_999), SIZE), Entry::Pending);
+        inner
+            .entries
+            .insert((cover(9_999), SIZE), Entry::Pending { cancel_gen: 0 });
         for n in 0..=(MAX_ENTRIES_HALFBLOCKS as u32) {
             inner.entries.insert(
                 (cover(n), SIZE),
@@ -897,7 +958,7 @@ mod tests {
         assert!(
             matches!(
                 inner.entries.get(&(cover(9_999), SIZE)),
-                Some(Entry::Pending)
+                Some(Entry::Pending { .. })
             ),
             "a pending entry must never be sacrificed to the budget"
         );
@@ -906,14 +967,17 @@ mod tests {
     /// A real encoded protocol. Halfblocks is pure cell writes, so this needs no
     /// terminal; the `Arc` is then cloned to fill the cache cheaply.
     fn tiny_protocol() -> Arc<Protocol> {
+        Arc::new(tiny_protocol_value())
+    }
+
+    /// The same, owned, for the paths that take a `Protocol` by value.
+    fn tiny_protocol_value() -> Protocol {
         let mut png = Vec::new();
         image::DynamicImage::new_rgb8(4, 6)
             .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
             .expect("encoding a test png");
-        Arc::new(
-            fetch::encode(&Picker::halfblocks(), &png, Size::new(2, 2))
-                .expect("halfblocks always encodes"),
-        )
+        fetch::encode(&Picker::halfblocks(), &png, Size::new(2, 2))
+            .expect("halfblocks always encodes")
     }
 
     fn far_future() -> Instant {
@@ -948,6 +1012,80 @@ mod tests {
             images.inner.lock().unwrap().enqueued,
             0,
             "a known-missing poster must not be re-requested on every scroll past it"
+        );
+    }
+
+    /// A job as the worker would hold it, for driving the resolution paths
+    /// directly. `Inner::sync_mode` can be exercised the same way without touching
+    /// the `CURRENT_MODE` global, which parallel test threads share.
+    fn job_for(images: &Images, app: AppId, key: &ImageKey, size: PosterSize) -> Job {
+        let mut inner = images.inner.lock().unwrap();
+        inner
+            .build_job(app, key, size)
+            .expect("a registered host yields a job")
+    }
+
+    #[test]
+    fn a_poster_superseded_during_its_encode_is_discarded_not_shown() {
+        // The race this guards: `is_stale` is checked before the encode, the lock
+        // is released for the duration of it, and the generation can move on in
+        // that window — a mode flip on the render thread, or plain navigation
+        // through `begin_fetch`. Without a re-check at the commit, a payload built
+        // for a view that is gone (and, after a flip, for the previous protocol)
+        // lands in the cache and is served until eviction, because the key has no
+        // protocol component.
+        let images = ready_cache();
+        let key = cover(1);
+        let counter = images.cancel_gen("radarr");
+        images.poster("radarr", &key, SIZE);
+        let job = job_for(&images, "radarr", &key, SIZE);
+
+        // The list under this poster was replaced while the encode was running.
+        counter.fetch_add(1, Ordering::Relaxed);
+        images.mark_ready(&job, tiny_protocol_value());
+
+        let inner = images.inner.lock().unwrap();
+        assert!(
+            !matches!(
+                inner.entries.get(&(key.clone(), SIZE)),
+                Some(Entry::Ready { .. })
+            ),
+            "a poster whose generation moved on must not be served"
+        );
+        // And the slot is released rather than left pending forever.
+        assert!(!inner.entries.contains_key(&(key, SIZE)));
+    }
+
+    #[test]
+    fn a_superseded_job_leaves_a_newer_pending_entry_alone() {
+        // After a flip clears the cache, a later draw queues its own job for the
+        // same poster. The older job must not resolve that newer slot on its
+        // behalf, or the newcomer is dropped and has to be requested again.
+        let images = ready_cache();
+        let key = cover(1);
+        images.cancel_gen("radarr");
+        images.poster("radarr", &key, SIZE);
+        let old_job = job_for(&images, "radarr", &key, SIZE);
+        {
+            let mut inner = images.inner.lock().unwrap();
+            // What the cache looks like once a flip cleared it and a newer draw
+            // queued its own job for the same poster.
+            inner
+                .entries
+                .insert((key.clone(), SIZE), Entry::Pending { cancel_gen: 7 });
+        }
+
+        images.abandon(&old_job);
+        images.mark_absent(&old_job);
+        images.mark_ready(&old_job, tiny_protocol_value());
+
+        let inner = images.inner.lock().unwrap();
+        assert!(
+            matches!(
+                inner.entries.get(&(key, SIZE)),
+                Some(Entry::Pending { cancel_gen: 7 })
+            ),
+            "the newer job's slot should survive an older job resolving"
         );
     }
 

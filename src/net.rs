@@ -69,15 +69,20 @@ pub fn resolve_local(host: &str, path: &str) -> Option<String> {
     if path.is_empty() {
         return None;
     }
+    // Server-rooted first, so a relative path whose *query* happens to contain
+    // "://" is not mistaken for an absolute URL. No current path does that, but
+    // misreading one would silently drop the poster.
+    if path.starts_with('/') {
+        return Some(format!("{origin}{path}"));
+    }
     if path.contains("://") {
         let candidate = self::origin(path).ok()?;
         return candidate
             .eq_ignore_ascii_case(&origin)
             .then(|| path.to_string());
     }
-    // A relative path must be server-rooted; anything else is not a shape
-    // these APIs produce, so treat it as unusable rather than guessing.
-    path.starts_with('/').then(|| format!("{origin}{path}"))
+    // Not a shape these APIs produce, so treat it as unusable rather than guessing.
+    None
 }
 
 /// True when the host uses unencrypted http://, so callers can warn that
@@ -215,5 +220,20 @@ mod tests {
         // scheme and authority, so the "//" only ever lands in the path.
         let resolved = resolve_local("https://example.com", "//evil.test/poster.jpg").unwrap();
         assert!(resolved.starts_with("https://example.com/"));
+    }
+
+    #[test]
+    fn resolve_local_reads_a_server_rooted_path_before_looking_for_a_scheme() {
+        // A relative path whose query happens to contain "://" must still be
+        // treated as relative. No current *arr path does this, but taking the
+        // absolute branch would fail `origin()` and silently drop the poster.
+        assert_eq!(
+            resolve_local(
+                "https://example.com",
+                "/MediaCover/1/poster.jpg?referer=https://example.org/x"
+            )
+            .unwrap(),
+            "https://example.com/MediaCover/1/poster.jpg?referer=https://example.org/x"
+        );
     }
 }
