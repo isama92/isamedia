@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.17](https://github.com/isama92/isamedia/compare/v0.1.16...v0.1.17) - 2026-07-29
+
+### Added
+
+- show posters in Jellyfin, Radarr and Sonarr ([#47](https://github.com/isama92/isamedia/pull/47))
+
 ## [0.1.16](https://github.com/isama92/isamedia/compare/v0.1.15...v0.1.16) - 2026-07-29
 
 ### Added
