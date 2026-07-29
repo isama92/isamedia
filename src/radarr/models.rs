@@ -6,8 +6,8 @@
 use serde::Deserialize;
 
 pub use crate::arr::models::{
-    Command, HistoryRecord, Language, MediaInfo, QualityProfile, QualityWrapper, QueueItem,
-    Release, RootFolder,
+    Command, HistoryRecord, Language, MediaCover, MediaInfo, QualityProfile, QualityWrapper,
+    QueueItem, Release, RootFolder,
 };
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -47,6 +47,9 @@ pub struct Movie {
     /// "announced" | "inCinemas" | "released".
     pub minimum_availability: Option<String>,
     pub root_folder_path: Option<String>,
+    /// Artwork references, on library movies and lookup hits alike. Read through
+    /// `poster_path`; resolve with `crate::net::resolve_local`.
+    pub images: Vec<MediaCover>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -79,6 +82,7 @@ pub struct MovieFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arr::models::poster_path;
 
     #[test]
     fn deserializes_movie_with_file_and_keyed_ratings() {
@@ -200,11 +204,22 @@ mod tests {
             "runtime": 167,
             "hasFile": false,
             "movieFileId": 0,
-            "ratings": { "tmdb": { "value": 8.2 } }
+            "ratings": { "tmdb": { "value": 8.2 } },
+            "images": [{
+                "coverType": "poster",
+                "url": "/MediaCoverProxy/f00ba7/poster.jpg",
+                "remoteUrl": "https://image.tmdb.org/t/p/original/dune2.jpg"
+            }]
         }"#;
         let movie: Movie = serde_json::from_str(raw).unwrap();
         assert_eq!(movie.id, 0);
         assert_eq!(movie.tmdb_id, Some(693134));
         assert_eq!(movie.year, Some(2024));
+        // Artwork for an unadded movie comes back as a proxy path on our own
+        // server, so the lookup list needs no third-party request.
+        assert_eq!(
+            poster_path(&movie.images),
+            Some("/MediaCoverProxy/f00ba7/poster.jpg")
+        );
     }
 }

@@ -18,12 +18,14 @@ use crate::apps::delete_prompt::{self, DeletePrompt};
 use crate::apps::downloads;
 use crate::apps::reveal::{self, RevealMiss, RevealOutcome, RevealRequest};
 use crate::event::AppSender;
+use crate::images::{Images, key as image_key};
 use crate::radarr::display::{self, MOVIE_SORTS, MovieSort, MovieStatus};
 use crate::radarr::{
     Client, Command, HistoryRecord, Movie, QualityProfile, QueueItem, Release, RootFolder,
 };
 use crate::ui::form::{Field, Form, FormEvent};
 use crate::ui::input::TextInput;
+use crate::ui::poster;
 use crate::ui::text::{truncate, wrap_text};
 use crate::ui::{help, list, prompt, theme};
 
@@ -262,13 +264,22 @@ pub struct Browse {
     spinner_frame: usize,
     /// Terminal height from the last draw, for page jumps and scroll clamps.
     last_height: u16,
+    /// Shared poster cache. Every lookup goes through it, so a repeated draw of
+    /// the same row costs one hash lookup rather than a request.
+    images: Arc<Images>,
 }
 
 impl Browse {
-    pub fn new(client: Client, sender: AppSender, gen_counter: Arc<AtomicU64>) -> Self {
+    pub fn new(
+        client: Client,
+        sender: AppSender,
+        gen_counter: Arc<AtomicU64>,
+        images: Arc<Images>,
+    ) -> Self {
         let mut browse = Self {
             client,
             sender,
+            images,
             level: Level::MovieList,
             all_movies: Vec::new(),
             filtered: Vec::new(),
@@ -378,6 +389,13 @@ impl Browse {
             self.notice = None;
         }
         self.has_fetched = true;
+        // The list these posters belong to is being replaced, so anything still
+        // in flight for it is no longer wanted. Deliberately here rather than on
+        // cursor movement: bumping on a scroll would cancel the very posters the
+        // scroll is trying to load.
+        self.images
+            .cancel_gen(self.sender.app())
+            .fetch_add(1, Ordering::Relaxed);
         self.fetch_gen = self.gen_counter.fetch_add(1, Ordering::Relaxed) + 1;
         self.fetch_gen
     }
@@ -2330,7 +2348,23 @@ impl Browse {
             let Level::MovieDetail { movie } = &self.level else {
                 return;
             };
-            let body = self.draw_movie_header(frame, area, movie);
+            // The poster column spans the whole detail area rather than just the
+            // two-line header band. Nothing is lost vertically that way: the text
+            // column keeps the full height for the overview and the file block,
+            // and the space below the poster simply stays blank. A header-height
+            // band would instead eat half the rows here, unlike the series headers
+            // which have a list underneath to protect.
+            let (slot, column) = if crate::images::enabled() {
+                poster::split(area, area.height, self.images.cell_px())
+            } else {
+                (None, area)
+            };
+            // Drawn before anything takes `frame.buffer_mut()`: the image widget
+            // needs the frame, and the text renderers hold the buffer to the end.
+            if let (Some(slot), Some(key)) = (slot, image_key::radarr(movie)) {
+                self.images.draw(frame, slot, self.sender.app(), &key);
+            }
+            let body = self.draw_movie_header(frame, column, movie);
             let text_width = body.width.saturating_sub(6) as usize;
 
             let overview_lines =

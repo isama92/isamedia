@@ -15,7 +15,31 @@ anyhow = "1.0.103"
 clap = { version = "4.6.1", features = ["derive"] }
 directories = "6.0.0"
 gethostname = "1.1.0"
+# Poster decoding. A direct dependency purely to pick the formats: ratatui-image
+# declares `image` with default-features = false, features = ["png"], and re-adds
+# the rest through its own `image-defaults` feature. Disabling its defaults (we
+# must, to drop chafa-dyn below) therefore leaves PNG as the only decoder, while
+# Jellyfin Primary images and *arr MediaCover files are JPEG — posters would
+# silently never appear. Cargo unifies features across the graph, so naming the
+# formats here fixes ratatui-image's copy too.
+#
+# Not `image-defaults`: image's own defaults are ["rayon", "default-formats"],
+# and rayon is a CPU-parallelism crate this I/O-bound app has no use for, while
+# default-formats drags in avif -> ravif.
+image = { version = "0.25.6", default-features = false, features = ["jpeg", "png", "webp"] }
 ratatui = "0.30.2"
+# Terminal graphics: kitty, iTerm2 and Sixel where available, unicode halfblocks
+# everywhere else. default-features = false drops `chafa-dyn`, which needs
+# pkg-config and a native libchafa and would break the Windows/macOS builds in
+# cross-os.yml. Halfblocks are blockier without chafa; that is the trade.
+#
+# This does pull rayon transitively (quantette -> icy_sixel), which the guideline
+# against CPU-parallelism crates would otherwise rule out. It is not a direct
+# dependency and not ours to choose: sixel support is unconditional in
+# ratatui-image, and the work rayon parallelises there is colour quantisation —
+# the one genuinely compute-bound thing this app now does. Dropping it would mean
+# dropping Sixel, and with it foot and xterm.
+ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 thiserror = "2.0.18"

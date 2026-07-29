@@ -11,10 +11,12 @@ use ratatui::widgets::Widget;
 
 use crate::apps::reveal::{ArrTargets, RevealKind, RevealRequest};
 use crate::event::AppSender;
+use crate::images::{Images, key as image_key};
 use crate::jellyfin::{
     Client, LibraryItemsQuery, MediaItem, display, library_scope, models::ItemKind,
 };
 use crate::ui::input::TextInput;
+use crate::ui::poster;
 use crate::ui::text::{truncate, wrap_text};
 use crate::ui::{help, list, prompt, theme};
 
@@ -446,6 +448,8 @@ pub struct Browse {
     spinner_frame: usize,
     /// Terminal height from the last draw, for jfsh-style page jumps.
     last_height: u16,
+    /// Shared poster cache; a repeated draw of the same row is one hash lookup.
+    images: Arc<Images>,
 }
 
 impl Browse {
@@ -454,10 +458,12 @@ impl Browse {
         sender: AppSender,
         gen_counter: Arc<AtomicU64>,
         arr: ArrTargets,
+        images: Arc<Images>,
     ) -> Self {
         let mut browse = Self {
             client,
             sender,
+            images,
             tab: Tab::Resume,
             all_items: Vec::new(),
             items: Vec::new(),
@@ -680,6 +686,13 @@ impl Browse {
         // asked for; a failure still reports on the notice row either way.
         self.reveal_progress = None;
         self.has_fetched = true;
+        // The list these posters belong to is being replaced, so anything still
+        // in flight for it is no longer wanted. Deliberately here rather than on
+        // cursor movement: bumping on a scroll would cancel the very posters the
+        // scroll is trying to load.
+        self.images
+            .cancel_gen(self.sender.app())
+            .fetch_add(1, Ordering::Relaxed);
         self.fetch_gen = self.gen_counter.fetch_add(1, Ordering::Relaxed) + 1;
         self.fetch_gen
     }
@@ -1722,14 +1735,13 @@ impl Browse {
     }
 
     fn draw_list(&self, frame: &mut Frame, area: Rect) {
-        let buf = frame.buffer_mut();
         if self.items.is_empty() {
             let message = if self.loading {
                 "  Loading..."
             } else {
                 "  No items."
             };
-            Line::styled(message, theme::dim()).render(area, buf);
+            Line::styled(message, theme::dim()).render(area, frame.buffer_mut());
             return;
         }
 
@@ -1741,6 +1753,11 @@ impl Browse {
         }
         let last = (first + items_per_page).min(self.items.len());
 
+        // No per-row artwork here: see the note in `crate::ui::poster`. At three
+        // rows per item a 2:3 poster is three columns wide, which reads as a
+        // smudge, and taller rows would cost more items per screen than the
+        // pictures are worth.
+        let buf = frame.buffer_mut();
         let text_width = area.width.saturating_sub(6) as usize;
         let mut y = area.y;
         for (i, item) in self.items.iter().enumerate().take(last).skip(first) {
@@ -1828,17 +1845,37 @@ impl Browse {
     /// The selected item's info: a title, the shared metadata line, genres, and
     /// the wrapped overview. Scrolls with the info-panel modal keys.
     fn draw_info(&mut self, frame: &mut Frame, area: Rect) {
-        let text_width = area.width.saturating_sub(4) as usize;
+        // The poster is pinned and does not scroll with the text. Two reasons:
+        // Sixel and iTerm2 cannot be partially clipped, so a scrolling poster
+        // would have to vanish whole the moment its top row left the viewport;
+        // and the artwork is the item's identity, which is the last thing to lose
+        // while reading its synopsis. Pinning also leaves the scroll arithmetic
+        // below untouched, since the text column keeps the full area height.
+        let (slot, text) = if crate::images::enabled() {
+            poster::split(area, area.height, self.images.cell_px())
+        } else {
+            (None, area)
+        };
+        let text_width = text.width.saturating_sub(4) as usize;
         // Build the owned lines first so the borrow of `self.items` is released
         // before we mutate `self.info_scroll` below.
-        let lines = {
+        let (lines, key) = {
             let Some(item) = self.items.get(self.cursor) else {
                 self.info_open = false;
                 return;
             };
             let overview = item.overview.as_deref().unwrap_or("No overview available.");
-            Self::detail_header_lines(item, overview, text_width)
+            (
+                Self::detail_header_lines(item, overview, text_width),
+                image_key::jellyfin(item),
+            )
         };
+
+        // Before `frame.buffer_mut()` below: the image widget needs the frame,
+        // and the text pass holds the buffer to the end of the function.
+        if let (Some(slot), Some(key)) = (slot, key) {
+            self.images.draw(frame, slot, self.sender.app(), &key);
+        }
 
         let buf = frame.buffer_mut();
         let total = lines.len();
@@ -1852,11 +1889,13 @@ impl Browse {
             .enumerate()
         {
             line.render(
-                Rect::new(area.x, area.y + row as u16, area.width.saturating_sub(1), 1),
+                Rect::new(text.x, text.y + row as u16, text.width.saturating_sub(1), 1),
                 buf,
             );
         }
         if total > height {
+            // Still `area`: the text column is flush with its right edge, so the
+            // scrollbar keeps landing on exactly the same physical column.
             list::draw_scrollbar(
                 buf,
                 area,
@@ -1876,8 +1915,26 @@ impl Browse {
         // and always keep at least a few rows for the bottom list.
         const OVERVIEW_MAX_CHARS: usize = 600;
         const MIN_LIST_ROWS: u16 = 4;
+        /// Bounds the band on a tall terminal, and so bounds what the poster
+        /// costs the list below when the overview is short. This is the dial that
+        /// prices artwork against season rows.
+        const POSTER_MAX_ROWS: u16 = 10;
 
-        let text_width = area.width.saturating_sub(4) as usize;
+        // The poster ends where the header band ends; the returned Rect stays
+        // full width. That keeps all six series sub-view renderers untouched —
+        // extending the column downwards would narrow every one of them, and one
+        // of them (`draw_episode_info`) scrolls, which brings back the clipping
+        // problem that `draw_info` pins its poster to avoid.
+        let budget = area
+            .height
+            .saturating_sub(MIN_LIST_ROWS)
+            .min(POSTER_MAX_ROWS);
+        let (slot, text) = if crate::images::enabled() {
+            poster::split(area, budget, self.images.cell_px())
+        } else {
+            (None, area)
+        };
+        let text_width = text.width.saturating_sub(4) as usize;
 
         let overview_raw = series
             .overview
@@ -1894,19 +1951,31 @@ impl Browse {
         // Trailing blank separates the header from the bottom list.
         lines.push(Line::from(""));
 
+        // Before `frame.buffer_mut()`, which the text pass holds to the end.
+        if let (Some(slot), Some(key)) = (slot, image_key::jellyfin(series)) {
+            self.images.draw(frame, slot, self.sender.app(), &key);
+        }
+
         let buf = frame.buffer_mut();
         let max_header = area.height.saturating_sub(MIN_LIST_ROWS).max(1) as usize;
-        let header_h = lines.len().min(max_header);
+        // Grow the band to the poster when the text is shorter, so a poster can
+        // never overrun into the list. `budget` is already bounded by
+        // `area.height - MIN_LIST_ROWS`, so the clamp cannot cut into it.
+        let poster_rows = slot.map_or(0, |slot| slot.height) as usize;
+        let header_h = lines.len().max(poster_rows).min(max_header);
         for (row, line) in lines.into_iter().take(header_h).enumerate() {
             line.render(
-                Rect::new(area.x, area.y + row as u16, area.width.saturating_sub(1), 1),
+                Rect::new(text.x, text.y + row as u16, text.width.saturating_sub(1), 1),
                 buf,
             );
         }
 
+        // The leftover Rect starts at the text column, not at `area.x`, so the
+        // seasons and episodes lists line up with the header text above them
+        // rather than tucking under the poster.
         let bottom = area.y + area.height;
         let top = (area.y + header_h as u16).min(bottom);
-        Rect::new(area.x, top, area.width, bottom.saturating_sub(top))
+        Rect::new(text.x, top, text.width, bottom.saturating_sub(top))
     }
 
     /// The seasons list (bottom region of the Seasons sub-view).

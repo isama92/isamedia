@@ -14,6 +14,7 @@ use ratatui::widgets::Widget;
 use crate::app::{AppId, MediaApp, ShellRequest};
 use crate::config::{Config, TrackPreference};
 use crate::event::AppSender;
+use crate::images::{self, ImageMode};
 use crate::ui::form::{Field, Form, FormEvent};
 use crate::ui::picker::{Picker, PickerEvent, PickerItem};
 use crate::ui::theme::{self, Theme};
@@ -27,20 +28,21 @@ mod field {
     pub const SECRET: FieldId = 2;
 }
 
-/// Which setting a row edits. Theme/Accent open a choice list; the backend
-/// rows open a URL + credentials form.
+/// Which setting a row edits. Theme/Accent/Images open a choice list; the
+/// backend rows open a URL + credentials form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Setting {
     Theme,
     Accent,
+    Images,
     TabOrder,
     Jellyfin,
     Radarr,
     Sonarr,
 }
 
-/// Open editor state for a choice list (Theme/Accent): which setting, and the
-/// cursor within its choices.
+/// Open editor state for a choice list (Theme/Accent/Images): which setting, and
+/// the cursor within its choices.
 struct Editing {
     setting: Setting,
     cursor: usize,
@@ -173,6 +175,7 @@ impl SettingsApp {
         if !theme::active_theme().accents().is_empty() {
             rows.push(Setting::Accent);
         }
+        rows.push(Setting::Images);
         rows.push(Setting::TabOrder);
         rows.extend([Setting::Jellyfin, Setting::Radarr, Setting::Sonarr]);
         rows
@@ -189,7 +192,7 @@ impl SettingsApp {
     /// the submenu for a backend (credentials, and once configured, remove).
     fn open(&mut self, setting: Setting) {
         match setting {
-            Setting::Theme | Setting::Accent => {
+            Setting::Theme | Setting::Accent | Setting::Images => {
                 self.editor = Editor::Choice(Editing {
                     setting,
                     cursor: current_choice_index(setting),
@@ -224,7 +227,7 @@ impl SettingsApp {
             }
             Setting::Radarr => !config.radarr.host.is_empty(),
             Setting::Sonarr => !config.sonarr.host.is_empty(),
-            Setting::Theme | Setting::Accent | Setting::TabOrder => false,
+            Setting::Theme | Setting::Accent | Setting::Images | Setting::TabOrder => false,
         }
     }
 
@@ -276,11 +279,24 @@ impl SettingsApp {
                     tracing::warn!(%err, "failed to persist accent");
                 }
             }
+            Setting::Images => {
+                let mode = ImageMode::ALL[choice];
+                // Unlike theme, this also has to drop cached artwork: encoded
+                // payloads are specific to the protocol they were built for. The
+                // running apps need no code for the flip — they ask for a poster
+                // every frame and simply start getting a different answer.
+                images::set_mode(mode);
+                let mut config = self.config.lock().unwrap();
+                config.images = mode;
+                if let Err(err) = config.save(&self.config_path) {
+                    tracing::warn!(%err, "failed to persist image mode");
+                }
+            }
             Setting::TabOrder | Setting::Jellyfin | Setting::Radarr | Setting::Sonarr => {}
         }
     }
 
-    /// Handle a key while a choice list (Theme/Accent) is open.
+    /// Handle a key while a choice list (Theme/Accent/Images) is open.
     fn on_choice_key(&mut self, key: KeyEvent) {
         let Editor::Choice(editing) = &self.editor else {
             return;
@@ -586,7 +602,7 @@ fn backend_host(setting: Setting, config: &Config) -> Option<&str> {
         Setting::Jellyfin => Some(&config.jellyfin.host),
         Setting::Radarr => Some(&config.radarr.host),
         Setting::Sonarr => Some(&config.sonarr.host),
-        Setting::Theme | Setting::Accent | Setting::TabOrder => None,
+        Setting::Theme | Setting::Accent | Setting::Images | Setting::TabOrder => None,
     }
 }
 
@@ -596,7 +612,7 @@ fn backend_label(setting: Setting) -> &'static str {
         Setting::Jellyfin => "Jellyfin",
         Setting::Radarr => "Radarr",
         Setting::Sonarr => "Sonarr",
-        Setting::Theme | Setting::Accent | Setting::TabOrder => "",
+        Setting::Theme | Setting::Accent | Setting::Images | Setting::TabOrder => "",
     }
 }
 
@@ -662,7 +678,7 @@ fn clear_backend_config(backend: Setting, config: &mut Config) {
         }
         Setting::Radarr => config.radarr.host.clear(),
         Setting::Sonarr => config.sonarr.host.clear(),
-        Setting::Theme | Setting::Accent | Setting::TabOrder => {}
+        Setting::Theme | Setting::Accent | Setting::Images | Setting::TabOrder => {}
     }
 }
 
@@ -680,7 +696,7 @@ fn delete_backend_secrets(backend: Setting) -> Result<(), String> {
         ],
         Setting::Radarr => &[crate::secrets::RADARR_API_KEY],
         Setting::Sonarr => &[crate::secrets::SONARR_API_KEY],
-        Setting::Theme | Setting::Accent | Setting::TabOrder => &[],
+        Setting::Theme | Setting::Accent | Setting::Images | Setting::TabOrder => &[],
     };
     let failures: Vec<String> = keys
         .iter()
@@ -703,7 +719,7 @@ fn secret_key(backend: Setting) -> &'static str {
         Setting::Jellyfin => crate::secrets::JELLYFIN_PASSWORD,
         Setting::Radarr => crate::secrets::RADARR_API_KEY,
         Setting::Sonarr => crate::secrets::SONARR_API_KEY,
-        Setting::Theme | Setting::Accent | Setting::TabOrder => "",
+        Setting::Theme | Setting::Accent | Setting::Images | Setting::TabOrder => "",
     }
 }
 
@@ -825,7 +841,7 @@ async fn validate_and_persist(
                     .map_err(|err| err.to_string())?;
             }
         }
-        Setting::Theme | Setting::Accent | Setting::TabOrder => {
+        Setting::Theme | Setting::Accent | Setting::Images | Setting::TabOrder => {
             return Err("not a backend".into());
         }
     }
@@ -855,6 +871,19 @@ fn setting_row(setting: Setting, selected: bool, host: Option<&str>) -> Line<'st
                 Style::new().fg(theme::accent_colors(accent).accent),
             ));
             spans.push(Span::styled(accent.title(), theme::dim()));
+        }
+        Setting::Images => {
+            // 9 columns like the labels above, so the value column lines up.
+            spans.push(Span::styled("Images   ", label_style));
+            let mode = images::mode();
+            // Name the detected protocol next to Auto: one line here answers
+            // "why does my poster look like that" with no debug flag needed.
+            let value = if mode == ImageMode::Auto {
+                format!("{}  ({})", mode.title(), images::detected_protocol())
+            } else {
+                mode.title().to_string()
+            };
+            spans.push(Span::styled(value, theme::dim()));
         }
         Setting::TabOrder => {
             spans.push(Span::styled("Tab order", label_style));
@@ -918,7 +947,15 @@ fn draw_editor(editing: &Editing, area: Rect, buf: &mut Buffer) {
                 })
                 .collect(),
         ),
-        // Only Theme/Accent open a choice list.
+        Setting::Images => (
+            "Images",
+            ImageMode::ALL
+                .iter()
+                .enumerate()
+                .map(|(i, mode)| choice_line(i == editing.cursor, None, mode.title()))
+                .collect(),
+        ),
+        // Only Theme/Accent/Images open a choice list.
         Setting::TabOrder | Setting::Jellyfin | Setting::Radarr | Setting::Sonarr => {
             ("", Vec::new())
         }
@@ -944,6 +981,7 @@ fn choice_count(setting: Setting) -> usize {
     match setting {
         Setting::Theme => Theme::ALL.len(),
         Setting::Accent => theme::active_theme().accents().len(),
+        Setting::Images => ImageMode::ALL.len(),
         Setting::TabOrder | Setting::Jellyfin | Setting::Radarr | Setting::Sonarr => 0,
     }
 }
@@ -959,6 +997,12 @@ fn current_choice_index(setting: Setting) -> usize {
             .accents()
             .iter()
             .position(|&a| a == theme::active_accent())
+            .unwrap_or(0),
+        // The live mode, not the stored one, so the editor opens on what is
+        // actually on screen — same reasoning as reading `active_theme` above.
+        Setting::Images => ImageMode::ALL
+            .iter()
+            .position(|&mode| mode == images::mode())
             .unwrap_or(0),
         Setting::TabOrder | Setting::Jellyfin | Setting::Radarr | Setting::Sonarr => 0,
     }
@@ -1051,7 +1095,9 @@ impl BackendEditor {
             ),
             Setting::Radarr => (config.radarr.host.clone(), None),
             Setting::Sonarr => (config.sonarr.host.clone(), None),
-            Setting::Theme | Setting::Accent | Setting::TabOrder => (String::new(), None),
+            Setting::Theme | Setting::Accent | Setting::Images | Setting::TabOrder => {
+                (String::new(), None)
+            }
         };
         let mut fields = vec![Field::text(field::HOST, "Host", host)];
         if let Some(username) = username {

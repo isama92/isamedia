@@ -18,6 +18,7 @@ use crate::apps::delete_prompt::{self, DeletePrompt};
 use crate::apps::downloads;
 use crate::apps::reveal::{self, RevealMiss, RevealOutcome, RevealRequest};
 use crate::event::AppSender;
+use crate::images::{Images, key as image_key};
 use crate::sonarr::display::{self, EpStatus, SERIES_SORTS, SeriesSort};
 use crate::sonarr::models::{EpisodeFile, Season};
 use crate::sonarr::{
@@ -25,6 +26,7 @@ use crate::sonarr::{
 };
 use crate::ui::form::{Field, Form, FormEvent};
 use crate::ui::input::TextInput;
+use crate::ui::poster;
 use crate::ui::text::{leader_line, truncate, wrap_text};
 use crate::ui::{help, list, prompt, theme};
 
@@ -352,13 +354,21 @@ pub struct Browse {
     spinner_frame: usize,
     /// Terminal height from the last draw, for page jumps and scroll clamps.
     last_height: u16,
+    /// Shared poster cache; a repeated draw of the same row is one hash lookup.
+    images: Arc<Images>,
 }
 
 impl Browse {
-    pub fn new(client: Client, sender: AppSender, gen_counter: Arc<AtomicU64>) -> Self {
+    pub fn new(
+        client: Client,
+        sender: AppSender,
+        gen_counter: Arc<AtomicU64>,
+        images: Arc<Images>,
+    ) -> Self {
         let mut browse = Self {
             client,
             sender,
+            images,
             level: Level::SeriesList,
             all_series: Vec::new(),
             filtered: Vec::new(),
@@ -476,6 +486,13 @@ impl Browse {
             self.notice = None;
         }
         self.has_fetched = true;
+        // The list these posters belong to is being replaced, so anything still
+        // in flight for it is no longer wanted. Deliberately here rather than on
+        // cursor movement: bumping on a scroll would cancel the very posters the
+        // scroll is trying to load.
+        self.images
+            .cancel_gen(self.sender.app())
+            .fetch_add(1, Ordering::Relaxed);
         self.fetch_gen = self.gen_counter.fetch_add(1, Ordering::Relaxed) + 1;
         self.fetch_gen
     }
@@ -2498,9 +2515,29 @@ impl Browse {
     fn draw_series_header(&self, frame: &mut Frame, area: Rect, series: &Series) -> Rect {
         const OVERVIEW_MAX_CHARS: usize = 600;
         const MIN_LIST_ROWS: u16 = 4;
+        /// Bounds the band on a tall terminal, so a short overview does not let
+        /// the poster eat rows the season list wants. See the Jellyfin twin.
+        const POSTER_MAX_ROWS: u16 = 10;
+
+        // The poster ends where the band ends and the returned Rect stays full
+        // width, so `draw_show`, `draw_episodes` and `draw_episode_detail` all
+        // need no changes.
+        let budget = area
+            .height
+            .saturating_sub(MIN_LIST_ROWS)
+            .min(POSTER_MAX_ROWS);
+        let (slot, text) = if crate::images::enabled() {
+            poster::split(area, budget, self.images.cell_px())
+        } else {
+            (None, area)
+        };
+        // Before `frame.buffer_mut()`, which the text pass holds to the end.
+        if let (Some(slot), Some(key)) = (slot, image_key::sonarr(series)) {
+            self.images.draw(frame, slot, self.sender.app(), &key);
+        }
 
         let buf = frame.buffer_mut();
-        let text_width = area.width.saturating_sub(6) as usize;
+        let text_width = text.width.saturating_sub(6) as usize;
 
         let overview_raw = series.overview.as_deref().unwrap_or_default();
         let overview = if overview_raw.chars().count() > OVERVIEW_MAX_CHARS {
@@ -2533,9 +2570,9 @@ impl Browse {
         let overview_truncated = overview_lines.len() > shown_overview;
 
         let mut y = area.y;
-        let mut line = |text: Line, y: &mut u16| {
+        let mut line = |line: Line, y: &mut u16| {
             if *y < area.y + area.height {
-                text.render(Rect::new(area.x, *y, area.width.saturating_sub(1), 1), buf);
+                line.render(Rect::new(text.x, *y, text.width.saturating_sub(1), 1), buf);
             }
             *y += 1;
         };
@@ -2573,8 +2610,17 @@ impl Browse {
         }
         y += 1;
 
+        // Grow the band to the poster when the text is shorter, so artwork can
+        // never overrun the list. `budget` is already bounded by
+        // `area.height - MIN_LIST_ROWS`, so this cannot starve it.
+        if let Some(slot) = slot {
+            y = y.max(area.y + slot.height);
+        }
+
+        // The leftover Rect starts at the text column so the season and episode
+        // lists line up with the header text rather than tucking under the poster.
         let bottom = area.y + area.height;
-        Rect::new(area.x, y.min(bottom), area.width, bottom.saturating_sub(y))
+        Rect::new(text.x, y.min(bottom), text.width, bottom.saturating_sub(y))
     }
 
     fn draw_show(&self, frame: &mut Frame, area: Rect) {

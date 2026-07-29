@@ -59,6 +59,15 @@ pub struct MediaItem {
     /// `tmdb_id`/`tvdb_id` rather than indexing, since the key casing has
     /// varied across server versions.
     pub provider_ids: Option<HashMap<String, String>>,
+    /// Image kind to cache-busting tag (`{"Primary": "a1b2..."}`). Returned by
+    /// default on every item, so unlike `Overview` it needs no `fields=`
+    /// request. Read it through `primary_image_tag` rather than indexing: the
+    /// key casing is server input, the same caveat as `ProviderIds`.
+    pub image_tags: Option<HashMap<String, String>>,
+    /// The *series* poster tag on an episode or season. Episodes carry their own
+    /// thumbnail in `ImageTags`, but the UI only ever shows show-level artwork,
+    /// so this is what an episode row resolves to.
+    pub series_primary_image_tag: Option<String>,
 }
 
 impl MediaItem {
@@ -81,6 +90,36 @@ impl MediaItem {
     /// TVDB id, as Sonarr keys its series. Same caveats as `tmdb_id`.
     pub fn tvdb_id(&self) -> Option<i64> {
         self.provider_id("Tvdb")?.parse().ok()
+    }
+
+    /// This item's own primary-image tag, ignoring key casing.
+    fn primary_image_tag(&self) -> Option<&str> {
+        self.image_tags
+            .as_ref()?
+            .iter()
+            .find(|(kind, _)| kind.eq_ignore_ascii_case("Primary"))
+            .map(|(_, tag)| tag.as_str())
+    }
+
+    /// The item id and image tag whose poster represents this item: `(id, tag)`.
+    ///
+    /// Anything with a parent series resolves to the *series*, so an episode row
+    /// in Resume or Next Up shows the show's poster rather than an episode
+    /// still. Keying on `series_id` rather than on `kind` also picks up seasons
+    /// for free, which matters because `ItemKind` has no `Season` variant and
+    /// they arrive as `Other`.
+    ///
+    /// The tag is optional on purpose: Jellyfin serves the image without one, so
+    /// an item whose `ImageTags` the server omitted is still worth a request.
+    /// The cost of being wrong is one 404, which the caller caches negatively.
+    pub fn poster_source(&self) -> Option<(&str, Option<&str>)> {
+        if let Some(series_id) = self.series_id.as_deref().filter(|id| !id.is_empty()) {
+            return Some((series_id, self.series_primary_image_tag.as_deref()));
+        }
+        if self.id.is_empty() {
+            return None;
+        }
+        Some((self.id.as_str(), self.primary_image_tag()))
     }
 }
 
@@ -315,6 +354,82 @@ mod tests {
         let item: MediaItem = serde_json::from_str(raw).unwrap();
         assert_eq!(item.tmdb_id(), Some(603));
         assert_eq!(item.tvdb_id(), Some(1234));
+    }
+
+    #[test]
+    fn poster_source_prefers_the_series_for_an_episode() {
+        // An episode's own ImageTags hold a still from the episode; the UI only
+        // ever shows show-level artwork, so the series must win.
+        let raw = r#"{
+            "Id": "ep1",
+            "Type": "Episode",
+            "SeriesId": "series9",
+            "ImageTags": {"Primary": "episodestill"},
+            "SeriesPrimaryImageTag": "seriesposter"
+        }"#;
+        let item: MediaItem = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            item.poster_source(),
+            Some(("series9", Some("seriesposter")))
+        );
+    }
+
+    #[test]
+    fn poster_source_falls_back_to_an_untagged_series() {
+        // SeriesPrimaryImageTag absent: still worth requesting, since the tag
+        // only busts caches.
+        let raw = r#"{"Id": "ep2", "Type": "Episode", "SeriesId": "series9"}"#;
+        let item: MediaItem = serde_json::from_str(raw).unwrap();
+        assert_eq!(item.poster_source(), Some(("series9", None)));
+    }
+
+    #[test]
+    fn poster_source_uses_a_season_s_parent_series() {
+        // Seasons have no ItemKind variant and arrive as Other, so keying on
+        // SeriesId rather than on kind is what makes them work.
+        let raw = r#"{
+            "Id": "season3",
+            "Type": "Season",
+            "SeriesId": "series9",
+            "SeriesPrimaryImageTag": "seriesposter"
+        }"#;
+        let item: MediaItem = serde_json::from_str(raw).unwrap();
+        assert_eq!(item.kind, ItemKind::Other);
+        assert_eq!(
+            item.poster_source(),
+            Some(("series9", Some("seriesposter")))
+        );
+    }
+
+    #[test]
+    fn poster_source_uses_the_item_itself_for_a_movie_or_series() {
+        let movie: MediaItem = serde_json::from_str(
+            r#"{"Id": "m1", "Type": "Movie", "ImageTags": {"Primary": "movieposter"}}"#,
+        )
+        .unwrap();
+        assert_eq!(movie.poster_source(), Some(("m1", Some("movieposter"))));
+
+        // Key casing is server input, same as ProviderIds.
+        let odd: MediaItem = serde_json::from_str(
+            r#"{"Id": "s1", "Type": "Series", "ImageTags": {"primary": "lowercased"}}"#,
+        )
+        .unwrap();
+        assert_eq!(odd.poster_source(), Some(("s1", Some("lowercased"))));
+
+        // No ImageTags at all: still attempt, tag-less.
+        let bare: MediaItem = serde_json::from_str(r#"{"Id": "m2", "Type": "Movie"}"#).unwrap();
+        assert_eq!(bare.poster_source(), Some(("m2", None)));
+    }
+
+    #[test]
+    fn poster_source_is_none_without_any_id() {
+        // Defensive: `id` is not Option, so a payload missing it defaults to "".
+        let item: MediaItem = serde_json::from_str(r#"{"Type": "Movie"}"#).unwrap();
+        assert_eq!(item.poster_source(), None);
+        // A blank SeriesId must not be mistaken for a parent either.
+        let blank: MediaItem =
+            serde_json::from_str(r#"{"Id": "ep3", "Type": "Episode", "SeriesId": ""}"#).unwrap();
+        assert_eq!(blank.poster_source(), Some(("ep3", None)));
     }
 
     #[test]

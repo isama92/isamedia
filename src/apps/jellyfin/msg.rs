@@ -58,4 +58,13 @@ pub enum Msg {
     },
     /// A background keyring write/delete failed; surfaced on the error line.
     KeyringError(String),
+    /// A poster finished loading into the shared image cache.
+    ///
+    /// Deliberately payload-free. The cache already holds the poster, and the
+    /// generation guard is applied on the producing side — a job for a superseded
+    /// view is dropped before it ever reaches the cache — so there is nothing here
+    /// to check for staleness. This message exists only because the shell redraws
+    /// in response to events: without it a landed poster would wait for the next
+    /// 250ms tick.
+    PosterReady,
 }

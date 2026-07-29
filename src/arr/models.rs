@@ -41,6 +41,46 @@ pub struct MediaInfo {
     pub run_time: Option<String>,
 }
 
+/// One artwork reference on a movie or series.
+///
+/// `remoteUrl` is deliberately absent. Both servers publish it alongside `url`,
+/// but it points at a metadata site's CDN, and isamedia only ever fetches
+/// artwork from the user's own machines. Nothing is lost by refusing it: for an
+/// item the server has not added yet, it rewrites `url` to a
+/// `/MediaCoverProxy/{hash}/{file}` path and fetches the upstream image itself.
+/// Not deserializing the field at all is a stronger guarantee than remembering
+/// never to read it.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct MediaCover {
+    /// "poster" | "fanart" | "banner" | "clearlogo" | "screenshot" | "headshot".
+    /// Left a `String` so a cover type we have not heard of cannot fail the
+    /// whole payload, the same reasoning as `Movie::status`.
+    pub cover_type: Option<String>,
+    /// A path on the configured server, already including its `UrlBase` — so it
+    /// joins onto `crate::net::origin`, never onto the normalized host. See
+    /// `crate::net::resolve_local`.
+    pub url: Option<String>,
+}
+
+/// The poster path from an artwork list, falling back to a banner for the rare
+/// item a server has no poster for. `None` when there is nothing usable.
+pub fn poster_path(images: &[MediaCover]) -> Option<&str> {
+    let by_type = |want: &str| {
+        images
+            .iter()
+            .filter(|cover| {
+                cover
+                    .cover_type
+                    .as_deref()
+                    .is_some_and(|kind| kind.eq_ignore_ascii_case(want))
+            })
+            .filter_map(|cover| cover.url.as_deref())
+            .find(|url| !url.trim().is_empty())
+    };
+    by_type("poster").or_else(|| by_type("banner"))
+}
+
 /// Envelope of the paginated endpoints (queue, Sonarr history).
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -156,6 +196,68 @@ pub struct Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn poster_path_picks_the_poster_whatever_the_order_or_casing() {
+        let images: Vec<MediaCover> = serde_json::from_str(
+            r#"[
+                {"coverType": "fanart", "url": "/MediaCover/1/fanart.jpg"},
+                {"coverType": "Poster", "url": "/MediaCover/1/poster.jpg?h=abc"},
+                {"coverType": "banner", "url": "/MediaCover/1/banner.jpg"}
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(poster_path(&images), Some("/MediaCover/1/poster.jpg?h=abc"));
+    }
+
+    #[test]
+    fn poster_path_falls_back_to_a_banner_then_gives_up() {
+        let banner_only: Vec<MediaCover> =
+            serde_json::from_str(r#"[{"coverType": "banner", "url": "/MediaCover/2/banner.jpg"}]"#)
+                .unwrap();
+        assert_eq!(poster_path(&banner_only), Some("/MediaCover/2/banner.jpg"));
+
+        let no_art: Vec<MediaCover> =
+            serde_json::from_str(r#"[{"coverType": "clearlogo", "url": "/x/logo.png"}]"#).unwrap();
+        assert_eq!(poster_path(&no_art), None);
+        assert_eq!(poster_path(&[]), None);
+    }
+
+    #[test]
+    fn media_cover_tolerates_unknown_types_and_missing_urls() {
+        // An unfamiliar cover type must not fail the whole movie payload, and a
+        // poster entry with no usable url must not shadow a later banner.
+        let images: Vec<MediaCover> = serde_json::from_str(
+            r#"[
+                {"coverType": "somethingNew", "url": "/x/new.jpg"},
+                {"coverType": "poster"},
+                {"coverType": "poster", "url": "   "},
+                {"coverType": "banner", "url": "/MediaCover/3/banner.jpg"}
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(images.len(), 4);
+        assert_eq!(poster_path(&images), Some("/MediaCover/3/banner.jpg"));
+    }
+
+    #[test]
+    fn media_cover_ignores_the_cdn_link_entirely() {
+        // remoteUrl is not a field, so it cannot be read by accident. The
+        // server-local url is the only thing that survives deserialization.
+        let images: Vec<MediaCover> = serde_json::from_str(
+            r#"[{
+                "coverType": "poster",
+                "url": "/MediaCoverProxy/deadbeef/poster.jpg",
+                "remoteUrl": "https://image.tmdb.org/t/p/original/abc.jpg"
+            }]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            poster_path(&images),
+            Some("/MediaCoverProxy/deadbeef/poster.jpg")
+        );
+        assert!(!format!("{images:?}").contains("tmdb.org"));
+    }
 
     #[test]
     fn deserializes_sonarr_queue_page() {

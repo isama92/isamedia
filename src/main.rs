@@ -4,6 +4,7 @@ mod arr;
 mod cli;
 mod config;
 mod event;
+mod images;
 mod jellyfin;
 mod lang;
 mod net;
@@ -38,21 +39,50 @@ async fn main() -> Result<()> {
     // Set the palette before the first draw so the initial frame is themed.
     crate::ui::theme::init(config.theme);
     crate::ui::theme::init_accent(config.accent);
+    // Likewise the poster mode, so `Off` reserves no space on the first frame.
+    crate::images::init(config.images);
+    let image_mode = config.images;
     let config = Arc::new(Mutex::new(config));
 
     let (tx, rx) = mpsc::unbounded_channel();
-    event::spawn_input_thread(tx.clone());
+    // Touches no stdio, so it is safe to start before the terminal is set up.
     event::spawn_tick_task(tx.clone());
-
-    let apps = apps::build_apps(config.clone(), config_path.clone(), tx);
-    let mut shell = Shell::new(apps, config, config_path, rx);
 
     // init() puts the terminal in raw mode + alternate screen and installs a
     // panic hook that restores it, so a crash never leaves the terminal broken.
+    // Moved ahead of the input thread for two reasons: the graphics query below
+    // has to read stdin, which that thread owns once running; and a panic between
+    // here and there previously had no restore hook installed.
     let mut terminal = ratatui::init();
+    // Draw one frame before probing the terminal. The probe waits up to two
+    // seconds on a terminal that never answers, and a blank alternate screen for
+    // that long reads as a hang.
+    terminal.draw(draw_startup_frame)?;
+    let images = crate::images::Images::start(image_mode);
+    event::spawn_input_thread(tx.clone());
+
+    let apps = apps::build_apps(config.clone(), config_path.clone(), tx, images);
+    let mut shell = Shell::new(apps, config, config_path, rx);
+
     let result = shell.run(&mut terminal).await;
     ratatui::restore();
     result
+}
+
+/// The one frame drawn before the terminal graphics probe, so a slow probe does
+/// not look like a hang. Intentionally minimal: the shell owns all real chrome.
+fn draw_startup_frame(frame: &mut ratatui::Frame) {
+    use ratatui::text::Line;
+    use ratatui::widgets::Widget;
+
+    let area = frame.area();
+    if area.height == 0 {
+        return;
+    }
+    Line::styled("  Starting isamedia...", crate::ui::theme::dim()).render(
+        ratatui::layout::Rect::new(area.x, area.y, area.width, 1),
+        frame.buffer_mut(),
+    );
 }
 
 fn init_logging(

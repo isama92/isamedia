@@ -41,6 +41,12 @@ impl Client {
         &self.transport.host
     }
 
+    /// The API key, so `crate::images` can authorise its own poster requests
+    /// without this module growing an artwork concern.
+    pub(crate) fn api_key(&self) -> &str {
+        self.transport.api_key()
+    }
+
     pub async fn get_series(&self) -> Result<Vec<Series>, Error> {
         self.transport
             .request(Method::GET, "/api/v3/series", &[], None)
