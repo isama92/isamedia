@@ -238,9 +238,9 @@ alone, so they look best on a light terminal.
 
 Artwork appears in the Jellyfin `i` info panel, across a Jellyfin show's
 seasons/episodes/episode pages, on the Radarr movie detail page, and across a
-Sonarr series' season/episode pages. Lists stay text-only: at a three-row item height a poster is only about three columns wide,
-which reads as a smudge, and taller rows would cost more entries per screen than
-the pictures are worth.
+Sonarr series' season/episode pages. Lists stay text-only: at a three-row item
+height a poster is only about three columns wide, which reads as a smudge, and
+taller rows would cost more entries per screen than the pictures are worth.
 
 At startup isamedia asks the terminal what it can do and uses the best of kitty
 graphics, iTerm2 inline images or Sixel, falling back to unicode half-blocks,
