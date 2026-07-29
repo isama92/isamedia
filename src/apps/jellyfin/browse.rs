@@ -9,6 +9,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 
+use crate::apps::reveal::{ArrTargets, RevealKind, RevealRequest};
 use crate::event::AppSender;
 use crate::jellyfin::{
     Client, LibraryItemsQuery, MediaItem, display, library_scope, models::ItemKind,
@@ -275,6 +276,87 @@ pub enum BrowseAction {
     Quit,
     /// Play this item; if it is an episode, play it within its series.
     Play(MediaItem),
+    /// Find this item in Radarr/Sonarr and open its page there. The app routes
+    /// it, since only the app knows the other tabs and can message them.
+    Reveal(RevealRequest),
+}
+
+/// What `u` acts on for a row. Decided from the row's shape alone, so the whole
+/// mapping is testable without a live `Browse` (and therefore without a client).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RevealPlan {
+    /// Reveal the item already in hand: the drilled-in show, or the hovered row.
+    Item(RevealKind),
+    /// Fetch the hovered episode's series first, for its TVDB id.
+    FetchSeries,
+    /// Nothing here has a counterpart to open.
+    Nothing,
+}
+
+impl RevealPlan {
+    /// The app this plan would open, for naming it in the help entry.
+    fn kind(self) -> Option<RevealKind> {
+        match self {
+            Self::Item(kind) => Some(kind),
+            Self::FetchSeries => Some(RevealKind::Series),
+            Self::Nothing => None,
+        }
+    }
+}
+
+/// Decide what `u` acts on. `in_series` means a show is drilled into, in which
+/// case every row (a season or an episode) belongs to that show rather than
+/// standing on its own.
+///
+/// Seasons and episodes always resolve to their series, since that is what
+/// Sonarr tracks. A hub episode needs its series fetched for the TVDB id, and
+/// one that cannot even name its series is refused outright: an episode's own
+/// `Tvdb` id lives in a different numbering space from a series id, so using it
+/// would happily open an unrelated show.
+fn reveal_plan(
+    arr: ArrTargets,
+    in_series: bool,
+    kind: ItemKind,
+    has_series_id: bool,
+) -> RevealPlan {
+    let plan = if in_series {
+        RevealPlan::Item(RevealKind::Series)
+    } else {
+        match kind {
+            ItemKind::Movie => RevealPlan::Item(RevealKind::Movie),
+            ItemKind::Series => RevealPlan::Item(RevealKind::Series),
+            ItemKind::Episode if has_series_id => RevealPlan::FetchSeries,
+            // A container, a stray video, or an episode adrift from its show.
+            _ => RevealPlan::Nothing,
+        }
+    };
+    match plan.kind() {
+        Some(kind) if arr.has(kind) => plan,
+        _ => RevealPlan::Nothing,
+    }
+}
+
+/// Help text for `u`, naming the app it opens so the hint is unambiguous when
+/// both backends are configured.
+fn reveal_help(kind: RevealKind) -> &'static str {
+    match kind {
+        RevealKind::Movie => "open in Radarr",
+        RevealKind::Series => "open in Sonarr",
+    }
+}
+
+/// The fields a reveal needs from a Jellyfin item: the external id the target
+/// app keys on, plus the title and year that stand in when there is no id.
+fn reveal_fields(item: &MediaItem, kind: RevealKind) -> (Option<i64>, String, Option<i32>) {
+    let external_id = match kind {
+        RevealKind::Movie => item.tmdb_id(),
+        RevealKind::Series => item.tvdb_id(),
+    };
+    (
+        external_id,
+        item.name.clone().unwrap_or_default(),
+        item.production_year,
+    )
 }
 
 /// Sub-position while drilled into a series (`current_series` is `Some`). The
@@ -332,6 +414,19 @@ pub struct Browse {
     /// Scroll offset into the info panel's wrapped text; clamped when drawing.
     info_scroll: u16,
 
+    /// Which arr tabs exist, so `u` is only offered where it can work. Kept as
+    /// a snapshot rather than a config handle: reaching Settings means leaving
+    /// this tab, so `activate` always refreshes it before the user can look.
+    arr: ArrTargets,
+    /// Generation of the latest `u` press; an outcome for an older one is
+    /// dropped rather than shown over a newer request's message.
+    reveal_gen: u64,
+    /// Progress line for a reveal that is out with another app. Kept apart from
+    /// `notice` so it can be dropped without disturbing an unrelated advisory:
+    /// only a *failed* reveal answers back, so a line left standing is the sole
+    /// trace of a jump that worked, and it has to be cleared on return.
+    reveal_progress: Option<String>,
+
     show_full_help: bool,
     loading: bool,
     pub error: Option<String>,
@@ -354,7 +449,12 @@ pub struct Browse {
 }
 
 impl Browse {
-    pub fn new(client: Client, sender: AppSender, gen_counter: Arc<AtomicU64>) -> Self {
+    pub fn new(
+        client: Client,
+        sender: AppSender,
+        gen_counter: Arc<AtomicU64>,
+        arr: ArrTargets,
+    ) -> Self {
         let mut browse = Self {
             client,
             sender,
@@ -377,6 +477,9 @@ impl Browse {
             sort_menu: None,
             info_open: false,
             info_scroll: 0,
+            arr,
+            reveal_gen: 0,
+            reveal_progress: None,
             show_full_help: false,
             loading: false,
             error: None,
@@ -406,6 +509,128 @@ impl Browse {
     /// app-level shortcuts like `s` must stay out of the way).
     pub fn input_focused(&self) -> bool {
         self.search_focused || self.filter_focused
+    }
+
+    /// Refreshed by the app on every activation, so a backend configured (or
+    /// removed) in Settings is reflected the moment this tab comes back.
+    pub fn set_arr_targets(&mut self, arr: ArrTargets) {
+        self.arr = arr;
+    }
+
+    /// What `u` would do with whatever is in focus. Single source of truth for
+    /// both the binding and its help entry, so the hint can never advertise a
+    /// key that does nothing.
+    fn current_reveal_plan(&self) -> RevealPlan {
+        let in_series = self.current_series.is_some();
+        match self.current_item() {
+            Some(item) => reveal_plan(self.arr, in_series, item.kind, item.series_id.is_some()),
+            // Inside a show whose episodes have not loaded yet there is no row,
+            // but the show itself is still the target.
+            None if in_series => reveal_plan(self.arr, true, ItemKind::Series, false),
+            None => RevealPlan::Nothing,
+        }
+    }
+
+    /// `u`: build the reveal for whatever is in focus. A hub episode is the one
+    /// case that cannot answer immediately — it carries only its series id, so
+    /// the series item is fetched first and the request goes out on arrival.
+    fn on_reveal_key(&mut self) -> Option<BrowseAction> {
+        match self.current_reveal_plan() {
+            RevealPlan::Item(kind) => {
+                let source = self.current_series.as_ref().or(self.current_item())?;
+                let (external_id, title, year) = reveal_fields(source, kind);
+                let reveal_gen = self.begin_reveal();
+                Some(BrowseAction::Reveal(RevealRequest {
+                    reveal_gen,
+                    origin: self.sender.app(),
+                    kind,
+                    external_id,
+                    title,
+                    year,
+                }))
+            }
+            RevealPlan::FetchSeries => {
+                let series_id = self.current_item()?.series_id.clone()?;
+                self.fetch_series_for_reveal(series_id);
+                None
+            }
+            RevealPlan::Nothing => None,
+        }
+    }
+
+    /// Allocate a generation for a `u` press. Drawn from the same shared counter
+    /// as fetches, so a reveal issued before a re-login can never collide with
+    /// one issued after it (a fresh `Browse` would otherwise restart at 0 and
+    /// let a stale outcome pass the staleness check).
+    fn begin_reveal(&mut self) -> u64 {
+        self.reveal_gen = self.gen_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        self.reveal_gen
+    }
+
+    /// Fetch the series behind a hub episode purely to read its TVDB id. Uses
+    /// its own generation rather than `fetch_gen`, so it neither cancels nor is
+    /// cancelled by a list fetch running alongside it.
+    fn fetch_series_for_reveal(&mut self, series_id: String) {
+        let reveal_gen = self.begin_reveal();
+        let client = self.client.clone();
+        let sender = self.sender.clone();
+        tokio::spawn(async move {
+            let result = client.get_item(&series_id).await.map(Box::new);
+            sender.send(Msg::RevealSeriesLoaded { reveal_gen, result });
+        });
+    }
+
+    /// The series behind a hub episode has landed: hand back the request the
+    /// app should now send. `None` when the press was superseded or the fetch
+    /// failed (a 401 is handled by the app, which owns re-authentication).
+    pub fn on_reveal_series_loaded(
+        &mut self,
+        reveal_gen: u64,
+        result: Result<Box<MediaItem>, crate::jellyfin::Error>,
+    ) -> Option<RevealRequest> {
+        if reveal_gen != self.reveal_gen {
+            return None; // superseded by a newer u
+        }
+        match result {
+            Ok(series) => {
+                let (external_id, title, year) = reveal_fields(&series, RevealKind::Series);
+                Some(RevealRequest {
+                    reveal_gen,
+                    origin: self.sender.app(),
+                    kind: RevealKind::Series,
+                    external_id,
+                    title,
+                    year,
+                })
+            }
+            Err(err) => {
+                self.error = Some(err.to_string());
+                None
+            }
+        }
+    }
+
+    /// Show that a reveal is out with another app, until it either lands the
+    /// user on that tab or answers back.
+    pub fn set_reveal_progress(&mut self, text: String) {
+        self.reveal_progress = Some(text);
+    }
+
+    /// Drop a progress line that has done its job. Called when this tab is
+    /// activated: a reveal that succeeded switched the user away without saying
+    /// so, and coming back to "looking up..." would describe nothing.
+    pub fn clear_reveal_progress(&mut self) {
+        self.reveal_progress = None;
+    }
+
+    /// Radarr/Sonarr could not open the item. Reported on the notice row rather
+    /// than the error row: nothing went wrong, the library just has no match.
+    pub fn on_reveal_failed(&mut self, reveal_gen: u64, reason: String) {
+        if reveal_gen != self.reveal_gen {
+            return; // the user has since asked for something else
+        }
+        self.reveal_progress = None;
+        self.notice = Some(reason);
     }
 
     /// Whether the user is inside any drill-down level; tab switching is
@@ -449,6 +674,11 @@ impl Browse {
         if self.has_fetched {
             self.notice = None;
         }
+        // A fetch means the list under the reveal is being replaced, so its
+        // progress line no longer describes anything on screen. Moving the cursor
+        // does not come through here, so the line can outlive the row it was
+        // asked for; a failure still reports on the notice row either way.
+        self.reveal_progress = None;
         self.has_fetched = true;
         self.fetch_gen = self.gen_counter.fetch_add(1, Ordering::Relaxed) + 1;
         self.fetch_gen
@@ -1229,6 +1459,11 @@ impl Browse {
                     });
                 }
             }
+            KeyCode::Char('u') => {
+                if let Some(action) = self.on_reveal_key() {
+                    return Some(action);
+                }
+            }
             KeyCode::Char('r') => self.fetch(),
             KeyCode::Char('?') => self.show_full_help = !self.show_full_help,
             KeyCode::Char('q') => return Some(BrowseAction::Quit),
@@ -1276,6 +1511,11 @@ impl Browse {
                     self.cursor = 0;
                     self.fetch();
                 }
+                KeyCode::Char('u') => {
+                    if let Some(action) = self.on_reveal_key() {
+                        return Some(action);
+                    }
+                }
                 KeyCode::Char('r') => self.fetch(),
                 KeyCode::Char('?') => self.show_full_help = !self.show_full_help,
                 KeyCode::Char('q') => return Some(BrowseAction::Quit),
@@ -1311,6 +1551,11 @@ impl Browse {
                 KeyCode::Esc | KeyCode::Backspace => {
                     self.series_view = SeriesView::Seasons;
                     self.cursor = 0;
+                }
+                KeyCode::Char('u') => {
+                    if let Some(action) = self.on_reveal_key() {
+                        return Some(action);
+                    }
                 }
                 KeyCode::Char('r') => self.fetch(),
                 KeyCode::Char('?') => self.show_full_help = !self.show_full_help,
@@ -1350,7 +1595,8 @@ impl Browse {
 
     pub fn draw(&mut self, frame: &mut Frame, area: Rect) {
         self.last_height = area.height;
-        let has_message = self.error.is_some() || self.notice.is_some();
+        let has_message =
+            self.error.is_some() || self.reveal_progress.is_some() || self.notice.is_some();
         let show_search = self.tab == Tab::Search && self.current_series.is_none();
         let help_height = if self.show_full_help {
             help::rows(&self.help_sections())
@@ -1375,6 +1621,8 @@ impl Browse {
         if let Some(error) = &self.error {
             Line::styled(format!("Error: {error}"), theme::error())
                 .render(rows[0], frame.buffer_mut());
+        } else if let Some(progress) = &self.reveal_progress {
+            Line::styled(progress.clone(), theme::accent()).render(rows[0], frame.buffer_mut());
         } else if let Some(notice) = &self.notice {
             Line::styled(notice.clone(), theme::accent()).render(rows[0], frame.buffer_mut());
         }
@@ -1894,33 +2142,34 @@ impl Browse {
             } else {
                 "help"
             };
-            return match self.series_view {
-                SeriesView::Seasons => vec![
-                    ("↑/↓", "move"),
-                    ("enter", "open season"),
-                    ("esc", "back"),
-                    ("r", "refresh"),
-                    ("?", help),
-                    ("q", "quit"),
-                ],
+            let mut entries = match self.series_view {
+                SeriesView::Seasons => {
+                    vec![("↑/↓", "move"), ("enter", "open season"), ("esc", "back")]
+                }
                 SeriesView::Episodes => vec![
                     ("↑/↓", "move"),
                     ("enter", "play"),
                     ("i", "info"),
                     ("w", "watched"),
                     ("esc", "back"),
-                    ("r", "refresh"),
-                    ("?", help),
-                    ("q", "quit"),
                 ],
-                SeriesView::EpisodeInfo => vec![
-                    ("↑/↓", "scroll"),
-                    ("←/→", "page"),
-                    ("g/G", "top/bottom"),
-                    ("i/esc", "close"),
-                    ("q", "quit"),
-                ],
+                // The episode info panel is modal; only its own keys apply.
+                SeriesView::EpisodeInfo => {
+                    return vec![
+                        ("↑/↓", "scroll"),
+                        ("←/→", "page"),
+                        ("g/G", "top/bottom"),
+                        ("i/esc", "close"),
+                        ("q", "quit"),
+                    ];
+                }
             };
+            // Anywhere inside a show, `u` opens the show itself.
+            if let Some(kind) = self.current_reveal_plan().kind() {
+                entries.push(("u", reveal_help(kind)));
+            }
+            entries.extend([("r", "refresh"), ("?", help), ("q", "quit")]);
+            return entries;
         }
         let mut entries = Vec::new();
         if self.drilled_in() {
@@ -1943,6 +2192,9 @@ impl Browse {
                 .is_some_and(|item| item.kind == ItemKind::Episode)
         {
             entries.push(("o", "open show"));
+        }
+        if let Some(kind) = self.current_reveal_plan().kind() {
+            entries.push(("u", reveal_help(kind)));
         }
         if self.tab == Tab::Search && self.current_series.is_none() {
             entries.push(("/", "search"));
@@ -2017,6 +2269,106 @@ impl Browse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const BOTH_ARRS: ArrTargets = ArrTargets {
+        radarr: true,
+        sonarr: true,
+    };
+
+    #[test]
+    fn reveal_plan_maps_item_kinds() {
+        let plan = |kind, has_series_id| reveal_plan(BOTH_ARRS, false, kind, has_series_id);
+        assert_eq!(
+            plan(ItemKind::Movie, false),
+            RevealPlan::Item(RevealKind::Movie)
+        );
+        assert_eq!(
+            plan(ItemKind::Series, false),
+            RevealPlan::Item(RevealKind::Series)
+        );
+        assert_eq!(plan(ItemKind::Episode, true), RevealPlan::FetchSeries);
+        // Containers and stray videos have no counterpart.
+        for kind in [
+            ItemKind::BoxSet,
+            ItemKind::CollectionFolder,
+            ItemKind::Video,
+        ] {
+            assert_eq!(plan(kind, false), RevealPlan::Nothing);
+        }
+    }
+
+    #[test]
+    fn an_episode_without_a_series_id_reveals_nothing() {
+        // Falling through to the episode itself would read the *episode's* Tvdb
+        // id as a series id and open an unrelated show.
+        assert_eq!(
+            reveal_plan(BOTH_ARRS, false, ItemKind::Episode, false),
+            RevealPlan::Nothing
+        );
+    }
+
+    #[test]
+    fn inside_a_show_every_row_reveals_the_show() {
+        // A season row is not an item at all, and an episode row belongs to the
+        // show; both target the series.
+        for kind in [ItemKind::Episode, ItemKind::Series, ItemKind::Other] {
+            assert_eq!(
+                reveal_plan(BOTH_ARRS, true, kind, false),
+                RevealPlan::Item(RevealKind::Series)
+            );
+        }
+    }
+
+    #[test]
+    fn reveal_plan_respects_unconfigured_backends() {
+        let sonarr_only = ArrTargets {
+            radarr: false,
+            sonarr: true,
+        };
+        assert_eq!(
+            reveal_plan(sonarr_only, false, ItemKind::Movie, false),
+            RevealPlan::Nothing
+        );
+        assert_eq!(
+            reveal_plan(sonarr_only, false, ItemKind::Series, false),
+            RevealPlan::Item(RevealKind::Series)
+        );
+        let radarr_only = ArrTargets {
+            radarr: true,
+            sonarr: false,
+        };
+        assert_eq!(
+            reveal_plan(radarr_only, false, ItemKind::Episode, true),
+            RevealPlan::Nothing
+        );
+        assert_eq!(
+            reveal_plan(ArrTargets::default(), true, ItemKind::Series, false),
+            RevealPlan::Nothing
+        );
+    }
+
+    #[test]
+    fn reveal_fields_reads_the_id_the_target_app_keys_on() {
+        let item = MediaItem {
+            name: Some("Dune".into()),
+            production_year: Some(2021),
+            provider_ids: Some(
+                [("Tmdb".to_string(), "438631".to_string())]
+                    .into_iter()
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        assert_eq!(
+            reveal_fields(&item, RevealKind::Movie),
+            (Some(438631), "Dune".to_string(), Some(2021))
+        );
+        // Sonarr keys on TVDB, which this item has no id for.
+        assert_eq!(
+            reveal_fields(&item, RevealKind::Series),
+            (None, "Dune".to_string(), Some(2021))
+        );
+    }
 
     #[test]
     fn tab_cycle_wraps() {

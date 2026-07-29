@@ -15,10 +15,14 @@ pub fn modified_char(key: &KeyEvent) -> bool {
 
 pub type AppId = &'static str;
 
-/// Things an app can ask the shell to do in response to a key.
+/// Things an app can ask the shell to do in response to a key or a message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellRequest {
     Quit,
+    /// Make this app the active tab. Asked for by the app that is being jumped
+    /// to (not the one jumping away), because only it knows whether it found
+    /// the item; the shell ignores a target whose tab is hidden.
+    Focus(AppId),
 }
 
 /// One selectable app in the top tab bar (Jellyfin, Sonarr, Radarr).
@@ -58,9 +62,12 @@ pub trait MediaApp {
 
     fn on_key(&mut self, key: KeyEvent) -> Option<ShellRequest>;
 
-    /// A message sent by one of this app's background tasks. The payload is
-    /// whatever the app's own tasks sent; downcast and ignore foreign types.
-    fn on_event(&mut self, payload: Box<dyn Any + Send>);
+    /// A message sent by one of this app's background tasks, or by a sibling
+    /// app addressing this one. The payload is type-erased; downcast and ignore
+    /// foreign types. Returns a request for the same reason `on_key` does: work
+    /// that finishes asynchronously may need the shell to act, e.g. a reveal
+    /// that only knows it succeeded once its library has loaded.
+    fn on_event(&mut self, payload: Box<dyn Any + Send>) -> Option<ShellRequest>;
 
     fn on_tick(&mut self) {}
 

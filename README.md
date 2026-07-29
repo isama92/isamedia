@@ -120,6 +120,7 @@ below cover the common cases.
 | `enter` / `space` | play, or open a series / season |
 | `w` | toggle watched |
 | `i` | info panel |
+| `u` | jump to the highlighted movie/show in Radarr/Sonarr; only offered when that backend is set up, and an episode or season opens its show |
 | `v` | open the sort menu (in a collection) |
 | `s` | stop playback |
 | `y` / `n` | confirm / cancel the replace-playback prompt |

@@ -35,6 +35,14 @@ pub enum Msg {
         fetch_gen: u64,
         result: Result<Box<MediaItem>, Error>,
     },
+    /// Same fetch as `SeriesLoaded`, but issued by `u` on a hub episode purely
+    /// to read the series' TVDB id. Kept separate because the two do different
+    /// things with the item (drill in versus send a reveal) and count their own
+    /// generations, so one cannot cancel the other.
+    RevealSeriesLoaded {
+        reveal_gen: u64,
+        result: Result<Box<MediaItem>, Error>,
+    },
     /// Result of a watched/unwatched toggle; `fetch_gen` is the view
     /// generation the toggle was issued from, so a result landing after the
     /// user moved to another tab or series is dropped.

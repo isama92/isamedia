@@ -14,6 +14,7 @@ use ratatui::text::Line;
 use ratatui::widgets::Widget;
 
 use crate::app::{AppId, MediaApp, ShellRequest};
+use crate::apps::reveal::{ArrTargets, RevealFailed, RevealRequest};
 use crate::config::{Config, LanguageOverrides};
 use crate::event::AppSender;
 use crate::jellyfin::{Client, Credentials, MediaItem};
@@ -203,6 +204,29 @@ impl JellyfinApp {
         }
     }
 
+    /// Which arr tabs are configured, tested exactly as their own
+    /// `is_configured` does, so `u` is offered for a backend precisely when its
+    /// tab exists to be switched to.
+    fn arr_targets(&self) -> ArrTargets {
+        let config = self.config.lock().unwrap();
+        ArrTargets {
+            radarr: !config.radarr.host.is_empty(),
+            sonarr: !config.sonarr.host.is_empty(),
+        }
+    }
+
+    /// Hand a reveal to the app that can open it. That app owns the library, so
+    /// it decides whether the item is there: it either asks the shell for focus
+    /// or answers with a `RevealFailed`, which lands back here on the tab the
+    /// user is still looking at.
+    fn send_reveal(&mut self, request: RevealRequest) {
+        let (target, app_title) = (request.kind.app_id(), request.kind.app_title());
+        self.sender.send_to(target, request);
+        if let Screen::Browse(browse) = &mut self.screen {
+            browse.set_reveal_progress(format!("looking up in {app_title}..."));
+        }
+    }
+
     fn spawn_connect(&mut self, mut creds: Credentials, use_stored_secrets: bool) {
         self.auth_gen += 1;
         let auth_gen = self.auth_gen;
@@ -325,7 +349,9 @@ impl JellyfinApp {
                         .map(|(h, u, p)| (h.as_str(), u.as_str(), p.as_str())),
                 );
                 let plain_http = crate::jellyfin::url::is_plain_http(&client.host);
-                let mut browse = Browse::new(client, self.sender.clone(), self.browse_gen.clone());
+                let arr = self.arr_targets();
+                let mut browse =
+                    Browse::new(client, self.sender.clone(), self.browse_gen.clone(), arr);
                 if plain_http {
                     // The login form warns about this too, but auto-login
                     // (stored host + token) never shows the form.
@@ -379,6 +405,17 @@ impl MediaApp for JellyfinApp {
     }
 
     fn activate(&mut self) {
+        // Configuring or removing a backend means visiting the Settings tab,
+        // which means leaving this one, so refreshing here is enough to keep the
+        // `u` hint in step with which arr tabs actually exist.
+        let arr = self.arr_targets();
+        if let Screen::Browse(browse) = &mut self.screen {
+            browse.set_arr_targets(arr);
+            // Back from a jump that worked (a failed one reports back instead),
+            // so the "looking up..." line has nothing left to describe.
+            browse.clear_reveal_progress();
+        }
+
         if let Screen::Boot = self.screen {
             // The save that (re-)configured this backend also bumped the
             // reauth signal; consume it, or the next activate would reconnect
@@ -483,6 +520,10 @@ impl MediaApp for JellyfinApp {
                     }
                     None
                 }
+                Some(BrowseAction::Reveal(request)) => {
+                    self.send_reveal(request);
+                    None
+                }
                 None => None,
             },
         }
@@ -494,14 +535,26 @@ impl MediaApp for JellyfinApp {
         }
     }
 
-    fn on_event(&mut self, payload: Box<dyn Any + Send>) {
-        let Ok(msg) = payload.downcast::<Msg>() else {
-            return;
+    fn on_event(&mut self, payload: Box<dyn Any + Send>) -> Option<ShellRequest> {
+        let msg = match payload.downcast::<Msg>() {
+            Ok(msg) => msg,
+            // Not one of this app's own messages. The only other payload it
+            // accepts is Radarr/Sonarr reporting that a reveal found nothing;
+            // anything else is a foreign type and ignored.
+            Err(payload) => {
+                if let Ok(failed) = payload.downcast::<RevealFailed>() {
+                    let RevealFailed { reveal_gen, reason } = *failed;
+                    if let Screen::Browse(browse) = &mut self.screen {
+                        browse.on_reveal_failed(reveal_gen, reason);
+                    }
+                }
+                return None;
+            }
         };
         match *msg {
             Msg::AuthDone { auth_gen, result } => {
                 if auth_gen != self.auth_gen {
-                    return;
+                    return None;
                 }
                 self.on_auth_done(result);
             }
@@ -543,9 +596,29 @@ impl MediaApp for JellyfinApp {
                     self.on_session_expired();
                 }
             }
+            Msg::RevealSeriesLoaded { reveal_gen, result } => {
+                // A 401 is handled here rather than in the browse, which has no
+                // say over re-authentication; every other outcome (including a
+                // stale generation) is the browse's to judge.
+                if matches!(result, Err(crate::jellyfin::Error::Unauthorized)) {
+                    self.on_session_expired();
+                } else {
+                    // Take the request before sending it: the browse borrow has
+                    // to end first, since sending touches the whole app.
+                    let request = match &mut self.screen {
+                        Screen::Browse(browse) => {
+                            browse.on_reveal_series_loaded(reveal_gen, result)
+                        }
+                        _ => None,
+                    };
+                    if let Some(request) = request {
+                        self.send_reveal(request);
+                    }
+                }
+            }
             Msg::Player { player_gen, event } => {
                 if player_gen != self.player_gen {
-                    return; // event from a player that was replaced
+                    return None; // event from a player that was replaced
                 }
                 self.on_player_event(event);
             }
@@ -556,6 +629,9 @@ impl MediaApp for JellyfinApp {
                 }
             }
         }
+        // Jellyfin never jumps the user to another tab of its own accord; the
+        // app being revealed into asks for focus itself.
+        None
     }
 
     fn on_quit(&mut self) -> bool {
