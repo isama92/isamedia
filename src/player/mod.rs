@@ -127,11 +127,18 @@ impl PlayerHandle {
         let _ = self.cmd_tx.send(PlayerCommand::Stop);
     }
 
-    /// Hand this player's ordering gate to the one replacing it, arming its
-    /// deadline now. Only meaningful once `stop()` has been called, since the
-    /// gate resolves when this player's task ends; pass it straight to `spawn`
-    /// and never await it on the render thread.
-    pub fn take_gate(&mut self) -> Option<ReportGate> {
+    /// Stop this player and take the gate that orders its replacement's reports
+    /// behind its own, arming the deadline now.
+    ///
+    /// Consuming, because the gate only resolves once this handle's task ends and
+    /// `stop()` is what makes that happen: taking a gate without stopping would
+    /// silently hold the new player's reports for the full grace while this one
+    /// kept playing. Dropping the handle here is safe, the stop is already queued
+    /// and tokio still delivers it after the sender is gone.
+    ///
+    /// Pass the result straight to `spawn`; never await it on the render thread.
+    pub fn stop_and_take_gate(mut self) -> Option<ReportGate> {
+        self.stop();
         self.finished.take().map(ReportGate::armed)
     }
 }
@@ -168,10 +175,12 @@ pub fn spawn(
         // after the report flush inside `run`, so the next player unblocks at
         // the right moment on every exit path below, panics included.
         let _finished_tx = finished_tx;
-        // `run` takes the gate only once it has a reporter to hold behind it.
-        // Anything left here means this player never reported at all, and
-        // dropping it would let the *next* player report while the one we
-        // replaced is still flushing, so it is honoured before this task ends.
+        // `run` takes the gate when it creates the reporter that waits on it, so
+        // anything left here means it returned before getting that far (a failed
+        // episode fetch below, or mpv never starting). Honouring the leftover
+        // keeps the chain intact for a player started while this task is still
+        // winding down: dropping it would release that player's own gate while
+        // the one we replaced is still flushing.
         let mut after = after;
         // `None` means playback never started; the event explaining why has
         // already been emitted.
@@ -214,8 +223,12 @@ pub fn spawn(
             )
             .await;
         }
+        // Emitted before the wait below, so the UI is never held behind another
+        // player's reports. The app drops this player's handle on Exited, which
+        // drops the gate with it, so honouring the leftover only orders a
+        // replacement started before Exited was processed -- which is the only
+        // case that can be racing us anyway.
         emit(PlayerEvent::Exited);
-        // Emitted first: the UI is never held behind another player's reports.
         if let Some(after) = after {
             after.wait().await;
         }

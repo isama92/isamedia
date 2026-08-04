@@ -232,16 +232,24 @@ enum Report {
 /// surface the expired session; the reporter itself keeps draining.
 ///
 /// `after` orders this playback's reports behind those of the player it
-/// replaced. It is awaited here rather than anywhere on the playback path
-/// because mpv is already playing by then: the wait costs nothing the user can
-/// see, and the coalescing below absorbs whatever backlog it builds up.
+/// replaced. It is awaited on this task rather than anywhere on the playback
+/// path because mpv is already playing by then: the wait overlaps mpv's own
+/// startup, and the coalescing below absorbs whatever backlog it builds up.
+///
+/// The wait happens before the first `recv`, not before the first send, so a
+/// reporter that never receives a report still owes it to whoever follows.
+/// Skipping it there would let this player's task end, and so release the gate
+/// it handed on, while the player it replaced was still flushing.
 fn spawn_reporter(
     client: Client,
     unauthorized_tx: mpsc::UnboundedSender<()>,
-    mut after: Option<ReportGate>,
+    after: Option<ReportGate>,
 ) -> (mpsc::UnboundedSender<Report>, tokio::task::JoinHandle<()>) {
     let (tx, mut rx) = mpsc::unbounded_channel::<Report>();
     let task = tokio::spawn(async move {
+        if let Some(after) = after {
+            after.wait().await;
+        }
         let mut signalled = false;
         let mut signal_unauthorized = |unauthorized: bool| {
             if unauthorized && !signalled {
@@ -251,11 +259,6 @@ fn spawn_reporter(
             }
         };
         while let Some(mut report) = rx.recv().await {
-            // Waited for on the first report rather than up front, so a
-            // playback that never reports (mpv failed to start) never waits.
-            if let Some(after) = after.take() {
-                after.wait().await;
-            }
             while let Ok(next) = rx.try_recv() {
                 match (&report, &next) {
                     (Report::Progress { item_id: a, .. }, Report::Progress { item_id: b, .. })
@@ -324,6 +327,17 @@ impl Ipc {
         tracing::debug!(command = %ipc::redact_secrets(encoded.trim_end()), "mpv send");
         self.writer.write_all(encoded.as_bytes()).await
     }
+}
+
+/// When to stop waiting for queued reports to flush after mpv is gone.
+///
+/// Measured from the report gate's deadline while that is still ahead: a
+/// reporter waiting on the player we replaced cannot send anything before then,
+/// so a window starting at `now` would close first and abandon this player's own
+/// final stopped report. `REPORT_GATE_GRACE <= QUIT_GRACE` keeps the sum inside
+/// `SHUTDOWN_BUDGET`, so a dead server still cannot hold shutdown hostage.
+fn flush_deadline(gate_deadline: Option<Instant>, now: Instant) -> Instant {
+    gate_deadline.unwrap_or(now).max(now) + REPORT_FLUSH_GRACE
 }
 
 /// What mpv is asked to play: the whole series for an episode, a single entry
@@ -817,13 +831,7 @@ pub(super) async fn run(
     // The socket is removed by `_socket_guard` when this function returns.
 
     // Let queued reports (typically the final stopped) land before the caller
-    // emits Exited and the UI refetches watch state. The window runs from the
-    // report gate's deadline rather than from now: a reporter still waiting on
-    // the player we replaced cannot send anything yet, so a window starting
-    // here would always close first and abandon it, losing this player's own
-    // final stopped report. `REPORT_GATE_GRACE <= QUIT_GRACE` keeps the sum
-    // inside SHUTDOWN_BUDGET, so a dead server still cannot hold shutdown
-    // hostage.
+    // emits Exited and the UI refetches watch state.
     //
     // Dropping the join handle detaches the reporter rather than aborting it, so
     // a report against a slow server still lands, late, instead of being lost.
@@ -831,10 +839,7 @@ pub(super) async fn run(
     // the gate its own player opens: ordering for the next player holds only
     // while the flush stays inside this window.
     drop(report_tx);
-    let flush_from = gate_deadline
-        .unwrap_or_else(Instant::now)
-        .max(Instant::now());
-    if tokio::time::timeout_at(flush_from + REPORT_FLUSH_GRACE, reporter)
+    if tokio::time::timeout_at(flush_deadline(gate_deadline, Instant::now()), reporter)
         .await
         .is_err()
     {
@@ -851,6 +856,25 @@ mod tests {
         // The shell's drain deadline uses SHUTDOWN_BUDGET; it must cover the
         // supervisor's own worst case so a slow quit is not abandoned mid-flush.
         assert!(SHUTDOWN_BUDGET >= QUIT_GRACE + REPORT_FLUSH_GRACE);
+    }
+
+    #[test]
+    fn flush_window_outlasts_the_report_gate() {
+        let early = Instant::now();
+        let later = early + Duration::from_secs(30);
+
+        // Gate still ahead of the flush: the window has to outlast it, or a
+        // reporter that cannot send yet is abandoned before it ever could.
+        assert_eq!(
+            flush_deadline(Some(later), early),
+            later + REPORT_FLUSH_GRACE
+        );
+        // Gate already passed, and the ungated case: unchanged behaviour.
+        assert_eq!(
+            flush_deadline(Some(early), later),
+            later + REPORT_FLUSH_GRACE
+        );
+        assert_eq!(flush_deadline(None, later), later + REPORT_FLUSH_GRACE);
     }
 
     #[test]
@@ -1184,6 +1208,36 @@ mod tests {
         reporter.await.unwrap();
 
         assert_eq!(*requests.lock().unwrap(), ["/Sessions/Playing"]);
+    }
+
+    #[tokio::test]
+    async fn a_reporter_with_nothing_to_report_still_waits_for_the_gate() {
+        let (addr, _requests) = stub_server().await;
+        let client = stub_client(addr).await;
+        let (unauthorized_tx, _unauthorized_rx) = mpsc::unbounded_channel::<()>();
+
+        // Held open: the player this one replaced is still flushing.
+        let (gate_tx, gate_rx) = tokio::sync::oneshot::channel();
+        let (tx, mut reporter) = spawn_reporter(
+            client,
+            unauthorized_tx,
+            Some(gate(gate_rx, Duration::from_secs(30))),
+        );
+
+        // This playback reports nothing at all: mpv connected but died before
+        // reaching start-file, so the queue closes empty.
+        drop(tx);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), &mut reporter)
+                .await
+                .is_err(),
+            "the gate is owed even with nothing to report: ending here would \
+             release the gate this player handed on while the player it \
+             replaced is still flushing"
+        );
+
+        drop(gate_tx);
+        reporter.await.unwrap();
     }
 
     #[tokio::test]

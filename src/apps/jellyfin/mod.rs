@@ -493,12 +493,11 @@ impl MediaApp for JellyfinApp {
                     // Order the two playbacks' reports: the outgoing player's
                     // final Stopped has to reach the server before the incoming
                     // player's Start, or restarting the same item leaves the old
-                    // position as its resume point. Dropping `old` here is safe,
-                    // Stop is already queued and tokio still delivers it.
-                    let after = self.player.take().and_then(|mut old| {
-                        old.stop();
-                        old.take_gate()
-                    });
+                    // position as its resume point.
+                    let after = self
+                        .player
+                        .take()
+                        .and_then(PlayerHandle::stop_and_take_gate);
                     self.start_playback(item, after);
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') => {
