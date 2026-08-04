@@ -15,7 +15,7 @@ use crate::lang;
 
 use super::ipc::{self, IpcStream};
 use super::ticks::{seconds_to_ticks, ticks_to_seconds};
-use super::{PlayerCommand, PlayerEvent, TrackKind, override_key};
+use super::{PlayerCommand, PlayerEvent, ReportGate, TrackKind, override_key};
 
 const PROGRESS_REPORT_INTERVAL: Duration = Duration::from_secs(3);
 /// How long to wait for `mpv --version` to answer. A wedged mpv wrapper script
@@ -28,6 +28,16 @@ const QUIT_GRACE: Duration = Duration::from_secs(5);
 /// to flush after mpv is gone, bounded so a dead server cannot hold shutdown
 /// hostage.
 const REPORT_FLUSH_GRACE: Duration = Duration::from_secs(5);
+/// How long an incoming player's reporter waits for the player it replaced to
+/// finish before it starts reporting anyway.
+///
+/// Must stay `<= QUIT_GRACE`: the flush below is measured from this deadline,
+/// so a longer gate would push `Exited` past `SHUTDOWN_BUDGET` and the shell
+/// would abandon the *new* player mid-flush, losing its final stopped report.
+/// `gate_grace_fits_the_shutdown_budget` guards that. Five seconds is already
+/// far more than the real spread: an outgoing mpv exits in well under a second
+/// and its last one or two reports are a round trip each.
+pub(super) const REPORT_GATE_GRACE: Duration = QUIT_GRACE;
 
 /// Worst-case time the supervisor needs after being told to stop: wait for mpv
 /// to obey `quit` (`QUIT_GRACE`), then flush the final report
@@ -220,9 +230,15 @@ enum Report {
 /// outage (enqueue every 3s, 30s timeout per attempt) cannot grow the queue.
 /// A 401 is signalled (once) over `unauthorized_tx` so the supervisor can
 /// surface the expired session; the reporter itself keeps draining.
+///
+/// `after` orders this playback's reports behind those of the player it
+/// replaced. It is awaited here rather than anywhere on the playback path
+/// because mpv is already playing by then: the wait costs nothing the user can
+/// see, and the coalescing below absorbs whatever backlog it builds up.
 fn spawn_reporter(
     client: Client,
     unauthorized_tx: mpsc::UnboundedSender<()>,
+    mut after: Option<ReportGate>,
 ) -> (mpsc::UnboundedSender<Report>, tokio::task::JoinHandle<()>) {
     let (tx, mut rx) = mpsc::unbounded_channel::<Report>();
     let task = tokio::spawn(async move {
@@ -235,6 +251,11 @@ fn spawn_reporter(
             }
         };
         while let Some(mut report) = rx.recv().await {
+            // Waited for on the first report rather than up front, so a
+            // playback that never reports (mpv failed to start) never waits.
+            if let Some(after) = after.take() {
+                after.wait().await;
+            }
             while let Ok(next) = rx.try_recv() {
                 match (&report, &next) {
                     (Report::Progress { item_id: a, .. }, Report::Progress { item_id: b, .. })
@@ -305,15 +326,27 @@ impl Ipc {
     }
 }
 
+/// What mpv is asked to play: the whole series for an episode, a single entry
+/// otherwise, plus which entry the user actually picked. `index` means nothing
+/// without `items`, so the two travel together.
+pub(super) struct Playlist {
+    pub items: Vec<MediaItem>,
+    pub index: usize,
+}
+
 pub(super) async fn run(
     client: Client,
-    items: Vec<MediaItem>,
-    index: usize,
+    playlist: Playlist,
     skip_types: Vec<String>,
     prefs: LanguagePrefs,
     mut cmd_rx: mpsc::UnboundedReceiver<PlayerCommand>,
+    // Taken, not consumed: an early return below happens before there is a
+    // reporter to hold behind the gate, and the caller then honours what is
+    // left so the next player is not released early.
+    after: &mut Option<ReportGate>,
     emit: &(impl Fn(PlayerEvent) + Send + Sync),
 ) {
+    let Playlist { items, index } = playlist;
     let old_mpv = is_old_mpv().await;
 
     // Random per-run id for the IPC endpoint. A guessable name (time XOR pid)
@@ -468,7 +501,9 @@ pub(super) async fn run(
     let (unauthorized_tx, mut unauthorized_rx) = mpsc::unbounded_channel::<()>();
     let mut session_expired = false;
 
-    let (report_tx, reporter) = spawn_reporter(client.clone(), unauthorized_tx.clone());
+    let gate_deadline = after.as_ref().map(|gate| gate.deadline);
+    let (report_tx, reporter) =
+        spawn_reporter(client.clone(), unauthorized_tx.clone(), after.take());
     // Media segment fetches land here; tagged with the item id so a result
     // arriving after an auto-advance is dropped instead of applied.
     let (seg_tx, mut seg_rx) =
@@ -781,11 +816,25 @@ pub(super) async fn run(
     let _ = child.wait().await;
     // The socket is removed by `_socket_guard` when this function returns.
 
-    // Let queued reports (typically the final stopped) land before the
-    // caller emits Exited and the UI refetches watch state; bounded so a
-    // dead server cannot hold shutdown hostage.
+    // Let queued reports (typically the final stopped) land before the caller
+    // emits Exited and the UI refetches watch state. The window runs from the
+    // report gate's deadline rather than from now: a reporter still waiting on
+    // the player we replaced cannot send anything yet, so a window starting
+    // here would always close first and abandon it, losing this player's own
+    // final stopped report. `REPORT_GATE_GRACE <= QUIT_GRACE` keeps the sum
+    // inside SHUTDOWN_BUDGET, so a dead server still cannot hold shutdown
+    // hostage.
+    //
+    // Dropping the join handle detaches the reporter rather than aborting it, so
+    // a report against a slow server still lands, late, instead of being lost.
+    // The cost is that such a reporter outlives this function and so outlives
+    // the gate its own player opens: ordering for the next player holds only
+    // while the flush stays inside this window.
     drop(report_tx);
-    if tokio::time::timeout(REPORT_FLUSH_GRACE, reporter)
+    let flush_from = gate_deadline
+        .unwrap_or_else(Instant::now)
+        .max(Instant::now());
+    if tokio::time::timeout_at(flush_from + REPORT_FLUSH_GRACE, reporter)
         .await
         .is_err()
     {
@@ -802,6 +851,15 @@ mod tests {
         // The shell's drain deadline uses SHUTDOWN_BUDGET; it must cover the
         // supervisor's own worst case so a slow quit is not abandoned mid-flush.
         assert!(SHUTDOWN_BUDGET >= QUIT_GRACE + REPORT_FLUSH_GRACE);
+    }
+
+    #[test]
+    fn gate_grace_fits_the_shutdown_budget() {
+        // The flush window starts at the gate's deadline, so the worst case
+        // after a stop is max(QUIT_GRACE, REPORT_GATE_GRACE) + REPORT_FLUSH_GRACE.
+        // A gate longer than the quit grace would push that past the budget
+        // above and lose the new player's own final report.
+        assert!(REPORT_GATE_GRACE <= QUIT_GRACE);
     }
 
     #[test]
@@ -954,5 +1012,203 @@ mod tests {
             classify_selection(TrackKind::Audio, Some(&serde_json::json!(false)), &tracks),
             None
         );
+    }
+
+    /// The path of every request the stub received, in arrival order.
+    type Requests = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+    /// Minimal loopback HTTP server that records request paths and answers 204.
+    ///
+    /// Enough to observe the reporter's request *order* without a mock
+    /// framework, and without the default test run touching the network: the
+    /// only address involved is 127.0.0.1 on an ephemeral port.
+    async fn stub_server() -> (std::net::SocketAddr, Requests) {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests: Requests = Default::default();
+        let recorded = requests.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let recorded = recorded.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    // Read the head, then the body it declares: answering
+                    // before the client finished writing would surface as a
+                    // transport error instead of a report.
+                    loop {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(read) => request.extend_from_slice(&buf[..read]),
+                        }
+                        let Some(head_end) = request.windows(4).position(|w| w == b"\r\n\r\n")
+                        else {
+                            continue;
+                        };
+                        let head = String::from_utf8_lossy(&request[..head_end]);
+                        if request.len() - head_end - 4 >= content_length(&head) {
+                            recorded.lock().unwrap().push(request_path(&head));
+                            break;
+                        }
+                    }
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                        .await;
+                });
+            }
+        });
+        (addr, requests)
+    }
+
+    fn content_length(head: &str) -> usize {
+        head.lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .and_then(|(_, value)| value.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// `POST /Sessions/Playing HTTP/1.1` -> `/Sessions/Playing`.
+    fn request_path(head: &str) -> String {
+        let target = head
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or_default();
+        match target.split_once('?') {
+            Some((path, _)) => path.to_string(),
+            None => target.to_string(),
+        }
+    }
+
+    /// A stored token short-circuits `connect`'s authentication request, so
+    /// building this never talks to anything, stub included.
+    async fn stub_client(addr: std::net::SocketAddr) -> Client {
+        Client::connect(crate::jellyfin::Credentials {
+            host: format!("http://{addr}"),
+            username: String::new(),
+            password: String::new(),
+            device: "test".into(),
+            device_id: "test-device".into(),
+            version: "0.0.0".into(),
+            token: "test-token".into(),
+            user_id: "test-user".into(),
+        })
+        .await
+        .unwrap()
+    }
+
+    /// A gate with an injected deadline, so the tests never wait out the real
+    /// `REPORT_GATE_GRACE`.
+    fn gate(done: tokio::sync::oneshot::Receiver<()>, within: Duration) -> ReportGate {
+        ReportGate {
+            done,
+            deadline: Instant::now() + within,
+        }
+    }
+
+    #[tokio::test]
+    async fn reports_wait_for_the_replaced_player() {
+        let (addr, requests) = stub_server().await;
+        let client = stub_client(addr).await;
+        let (unauthorized_tx, _unauthorized_rx) = mpsc::unbounded_channel::<()>();
+
+        let (gate_tx, gate_rx) = tokio::sync::oneshot::channel();
+        let (old_tx, old) = spawn_reporter(client.clone(), unauthorized_tx.clone(), None);
+        let (new_tx, new) = spawn_reporter(
+            client,
+            unauthorized_tx,
+            // Long enough that only the gate opening can release this reporter.
+            Some(gate(gate_rx, Duration::from_secs(30))),
+        );
+
+        // The replacing player reports first and gets a real head start, as it
+        // does when the outgoing mpv is slow to obey `quit`. Ungated, its Start
+        // would be at the server long before the outgoing Stopped is even
+        // queued: a loopback round trip is well under a millisecond.
+        new_tx
+            .send(Report::Start {
+                item_id: "item".into(),
+                ticks: 30,
+            })
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "the gate should still be holding the replacing player's report"
+        );
+
+        old_tx
+            .send(Report::Stopped {
+                item_id: "item".into(),
+                ticks: 9_000,
+            })
+            .unwrap();
+        drop(old_tx);
+        old.await.unwrap(); // the outgoing Stopped has landed...
+        drop(gate_tx); // ...and its task ended, which opens the gate.
+        drop(new_tx);
+        new.await.unwrap();
+
+        // Reversed, the server would keep the old position as the resume point.
+        assert_eq!(
+            *requests.lock().unwrap(),
+            ["/Sessions/Playing/Stopped", "/Sessions/Playing"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dropped_gate_releases_reports() {
+        let (addr, requests) = stub_server().await;
+        let client = stub_client(addr).await;
+        let (unauthorized_tx, _unauthorized_rx) = mpsc::unbounded_channel::<()>();
+
+        // A player whose task ended without reporting anything (a failed
+        // episode fetch, a panic) must not silence the one replacing it.
+        let (gate_tx, gate_rx) = tokio::sync::oneshot::channel();
+        drop(gate_tx);
+
+        let (tx, reporter) = spawn_reporter(
+            client,
+            unauthorized_tx,
+            Some(gate(gate_rx, Duration::from_secs(30))),
+        );
+        tx.send(Report::Start {
+            item_id: "item".into(),
+            ticks: 0,
+        })
+        .unwrap();
+        drop(tx);
+        reporter.await.unwrap();
+
+        assert_eq!(*requests.lock().unwrap(), ["/Sessions/Playing"]);
+    }
+
+    #[tokio::test]
+    async fn an_elapsed_gate_gives_up_on_ordering() {
+        let (addr, requests) = stub_server().await;
+        let client = stub_client(addr).await;
+        let (unauthorized_tx, _unauthorized_rx) = mpsc::unbounded_channel::<()>();
+
+        // Held open for the whole test: a wedged player that never finishes.
+        let (_gate_tx, gate_rx) = tokio::sync::oneshot::channel();
+
+        let (tx, reporter) = spawn_reporter(
+            client,
+            unauthorized_tx,
+            Some(gate(gate_rx, Duration::from_millis(50))),
+        );
+        tx.send(Report::Start {
+            item_id: "item".into(),
+            ticks: 0,
+        })
+        .unwrap();
+        drop(tx);
+        reporter.await.unwrap();
+
+        // Reported unordered rather than not at all.
+        assert_eq!(*requests.lock().unwrap(), ["/Sessions/Playing"]);
     }
 }

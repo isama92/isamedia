@@ -116,7 +116,9 @@ impl JellyfinApp {
         }
     }
 
-    fn start_playback(&mut self, item: MediaItem) {
+    /// `after` is the gate of the playback being replaced, if any; see
+    /// `player::ReportGate`.
+    fn start_playback(&mut self, item: MediaItem, after: Option<player::ReportGate>) {
         let Screen::Browse(browse) = &self.screen else {
             return;
         };
@@ -133,7 +135,7 @@ impl JellyfinApp {
         self.player_gen += 1;
         let player_gen = self.player_gen;
         let sender = self.sender.clone();
-        let handle = player::spawn(client, item, skip_types, prefs, move |event| {
+        let handle = player::spawn(client, item, skip_types, prefs, after, move |event| {
             sender.send(Msg::Player { player_gen, event });
         });
         self.player = Some(handle);
@@ -488,10 +490,16 @@ impl MediaApp for JellyfinApp {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                     let item = self.pending_play.take().unwrap();
-                    if let Some(old) = self.player.take() {
+                    // Order the two playbacks' reports: the outgoing player's
+                    // final Stopped has to reach the server before the incoming
+                    // player's Start, or restarting the same item leaves the old
+                    // position as its resume point. Dropping `old` here is safe,
+                    // Stop is already queued and tokio still delivers it.
+                    let after = self.player.take().and_then(|mut old| {
                         old.stop();
-                    }
-                    self.start_playback(item);
+                        old.take_gate()
+                    });
+                    self.start_playback(item, after);
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') => {
                     self.pending_play = None;
@@ -546,7 +554,8 @@ impl MediaApp for JellyfinApp {
                     if self.player.is_some() {
                         self.pending_play = Some(item);
                     } else {
-                        self.start_playback(item);
+                        // Nothing is playing, so there is nothing to order behind.
+                        self.start_playback(item, None);
                     }
                     None
                 }
