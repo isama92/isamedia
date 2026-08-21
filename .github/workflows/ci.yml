@@ -39,7 +39,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cache cargo build
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
           # Only main writes the shared cache; PRs restore from it so branch
           # builds do not each mint an entry and thrash the 10 GB cache limit.
