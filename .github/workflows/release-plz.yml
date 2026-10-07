@@ -39,7 +39,7 @@ jobs:
       # PR is merged). No crates.io publish because Cargo.toml sets
       # publish = false.
       - name: Run release-plz
-        uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
+        uses: release-plz/action@b8d6b54b02889ff2ae2bb82e8b57c3a8fc1683a5 # v0.5.139
         with:
           config: .github/release-plz.toml
         env:
