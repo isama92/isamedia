@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.19](https://github.com/isama92/isamedia/compare/v0.1.18...v0.1.19) - 2026-10-07
+
+### Other
+
+- bump toml from 1.1.3+spec-1.1.0 to 1.1.6+spec-1.1.0 ([#64](https://github.com/isama92/isamedia/pull/64))
+- bump release-plz/action from 0.5.131 to 0.5.139 ([#67](https://github.com/isama92/isamedia/pull/67))
+- bump uuid from 1.24.0 to 1.26.0 ([#62](https://github.com/isama92/isamedia/pull/62))
+- bump Swatinem/rust-cache from e18b497796c12c097a38f9edb9d0641fb99eee32 to f0d9c3887740aee45f6153b24b3a6b815192ec16 ([#59](https://github.com/isama92/isamedia/pull/59))
+
 ## [0.1.18](https://github.com/isama92/isamedia/compare/v0.1.17...v0.1.18) - 2026-08-04
 
 ### Fixed
